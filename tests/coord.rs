@@ -142,7 +142,10 @@ fn reserve_allows_same_actor_overlap() {
     )
     .unwrap();
     let s = reducer::replay_store(&store).unwrap();
-    assert!(s.was_accepted(n2.as_str()), "same-actor overlap must be allowed");
+    assert!(
+        s.was_accepted(n2.as_str()),
+        "same-actor overlap must be allowed"
+    );
 }
 
 #[test]
@@ -158,14 +161,7 @@ fn a4_begin_race_exactly_one_succeeds() {
 
     let h1 = thread::spawn(move || {
         Command::new(bin)
-            .args([
-                "begin",
-                &id_a,
-                "--paths",
-                "src/auth/",
-                "--actor",
-                "alpha",
-            ])
+            .args(["begin", &id_a, "--paths", "src/auth/", "--actor", "alpha"])
             .current_dir(&dir)
             .output()
             .unwrap()
@@ -215,7 +211,12 @@ fn a4_begin_race_exactly_one_succeeds() {
         .values()
         .filter(|r| r.is_active(&now))
         .collect();
-    assert_eq!(live.len(), 1, "expected 1 live reservation, got {}", live.len());
+    assert_eq!(
+        live.len(),
+        1,
+        "expected 1 live reservation, got {}",
+        live.len()
+    );
 
     let bead = &state.beads[&id];
     assert!(bead.claim.is_some(), "winner must have published a claim");
@@ -240,14 +241,7 @@ fn begin_compensates_when_claim_fails() {
     // bob begins on a free path. reserve should succeed; claim should fail
     // (alice still holds it). bob's reserve_open must be compensated.
     let begin = Command::new(bin)
-        .args([
-            "begin",
-            &id,
-            "--paths",
-            "src/parser/",
-            "--actor",
-            "bob",
-        ])
+        .args(["begin", &id, "--paths", "src/parser/", "--actor", "bob"])
         .current_dir(td.path())
         .output()
         .unwrap();
@@ -347,14 +341,7 @@ fn who_has_finds_overlapping_holders() {
     let bin = mote_bin();
 
     let _ = Command::new(bin)
-        .args([
-            "reserve",
-            "src/auth/",
-            "--issue",
-            &id,
-            "--actor",
-            "alice",
-        ])
+        .args(["reserve", "src/auth/", "--issue", &id, "--actor", "alice"])
         .current_dir(td.path())
         .output()
         .unwrap();
@@ -375,7 +362,10 @@ fn who_has_finds_overlapping_holders() {
         .output()
         .unwrap();
     let s2 = String::from_utf8(wh2.stdout).unwrap();
-    assert!(s2.contains("no live"), "expected 'no live' for unrelated path: {s2}");
+    assert!(
+        s2.contains("no live"),
+        "expected 'no live' for unrelated path: {s2}"
+    );
 }
 
 #[test]
@@ -386,14 +376,7 @@ fn cli_smoke_done_compound() {
     let bin = mote_bin();
 
     let _ = Command::new(bin)
-        .args([
-            "begin",
-            &id,
-            "--paths",
-            "src/auth/",
-            "--actor",
-            "alice",
-        ])
+        .args(["begin", &id, "--paths", "src/auth/", "--actor", "alice"])
         .current_dir(td.path())
         .output()
         .unwrap();
@@ -427,6 +410,11 @@ fn cli_smoke_done_compound() {
 // Defensive: confirm scalar-set unused-import warning doesn't actually appear.
 #[allow(dead_code)]
 fn _unused() -> ScalarSet {
-    let _ = make_create("a".into(), "b".into(), ScalarSet::default(), Timestamp::now());
+    let _ = make_create(
+        "a".into(),
+        "b".into(),
+        ScalarSet::default(),
+        Timestamp::now(),
+    );
     ScalarSet::default()
 }

@@ -88,7 +88,13 @@ fn a10_two_replays_produce_identical_state() {
     .unwrap();
     publish::publish_op(
         &store,
-        &make_tag(true, "alice".into(), a.clone(), "backend".into(), Timestamp::now()),
+        &make_tag(
+            true,
+            "alice".into(),
+            a.clone(),
+            "backend".into(),
+            Timestamp::now(),
+        ),
     )
     .unwrap();
     publish::publish_op(
@@ -262,5 +268,8 @@ fn a10_two_replays_produce_identical_state() {
         .filter(|e| !e.accepted)
         .map(|e| e.kind.as_str())
         .collect();
-    assert!(rejects.contains(&"patch"), "expected stale patch in history: {rejects:?}");
+    assert!(
+        rejects.contains(&"patch"),
+        "expected stale patch in history: {rejects:?}"
+    );
 }

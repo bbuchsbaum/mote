@@ -33,6 +33,16 @@ developer plus a few local agents doing tiny task updates:
   local/         # convenience state (e.g. actor identity); not source of truth
 ```
 
+### Repository policy
+
+For normal single-workstation use, keep `.mote/` out of git and treat it like
+local coordination state. Add `.mote/` to the host repository's `.gitignore`
+unless you have explicitly decided to version the op log.
+
+If the task history matters, back up `.mote/ops/`; those immutable operation
+files are the source of truth. Do not hand-edit op files. Use `mote fsck` or
+`mote doctor` when you suspect storage damage.
+
 Every mutation:
 
 1. write `tmp/<name>.json` with `O_CREAT|O_EXCL`, fsync the file
@@ -74,6 +84,8 @@ All three planes share the same publication mechanism and reducer.
 ```sh
 # Initialize a store in the current directory.
 mote init
+mote actor set alice
+mote actor show
 
 # Issue plane.
 mote new "Fix auth bug" -p 1 --tag backend
@@ -108,6 +120,7 @@ mote done    bd-... --note "shipped"
 mote board
 
 # Diagnostics.
+mote doctor
 mote fsck --clean-tmp
 ```
 
@@ -140,12 +153,34 @@ target/release/mote --version
 
 Requires Rust 1.85+ (edition 2024).
 
+## Install / Update
+
+Install the current GitHub version directly:
+
+```sh
+cargo install --git https://github.com/bbuchsbaum/mote --locked
+```
+
+Update an existing install:
+
+```sh
+cargo install --git https://github.com/bbuchsbaum/mote --force --locked
+```
+
+Install from a local checkout:
+
+```sh
+cargo install --path . --locked
+```
+
 ## Limitations (v0.2)
 
 - POSIX local filesystems only. No Windows. No NFS.
 - No glob-style reservation paths.
 - No git integration; use `git worktree add` when two agents really need
   separate `HEAD`/index. Reservations are explicitly advisory, not enforced.
+- No distributed sync protocol. Versioning `.mote/` in git is a manual policy
+  decision, not the default operational mode.
 - No snapshots; replay-from-scratch is the v0.2 read path.
 
 ## Project layout
@@ -154,4 +189,5 @@ Requires Rust 1.85+ (edition 2024).
 - `mote_prd.md`, `mote_coordination_addendum.md` — historical design rationale
 - `src/` — Rust crate
 - `tests/` — integration tests (storage, issue plane, notes/ready, claims/msgs,
-  coordination, replay determinism)
+  coordination, replay determinism, crash/failpoint, property, JSON-output, and
+  stress coverage)

@@ -31,11 +31,7 @@ use crate::repo::Store;
 /// bytes), then publishes via the Maildir protocol.
 ///
 /// Returns the assigned op name on success.
-pub fn publish_value(
-    store: &Store,
-    mut op_value: Value,
-    ts: Timestamp,
-) -> MoteResult<OpName> {
+pub fn publish_value(store: &Store, mut op_value: Value, ts: Timestamp) -> MoteResult<OpName> {
     {
         let obj = op_value
             .as_object_mut()

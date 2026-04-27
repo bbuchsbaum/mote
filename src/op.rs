@@ -533,6 +533,7 @@ pub fn make_release(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn make_msg_send(
     actor: String,
     msg_id: String,
@@ -723,10 +724,20 @@ mod tests {
 
     #[test]
     fn op_kind_names() {
-        let add = make_tag(true, "a".into(), "bd-1".into(), "x".into(),
-            "2026-04-20T18:24:55Z".parse().unwrap());
-        let rem = make_tag(false, "a".into(), "bd-1".into(), "x".into(),
-            "2026-04-20T18:24:55Z".parse().unwrap());
+        let add = make_tag(
+            true,
+            "a".into(),
+            "bd-1".into(),
+            "x".into(),
+            "2026-04-20T18:24:55Z".parse().unwrap(),
+        );
+        let rem = make_tag(
+            false,
+            "a".into(),
+            "bd-1".into(),
+            "x".into(),
+            "2026-04-20T18:24:55Z".parse().unwrap(),
+        );
         assert_eq!(add.kind_name(), "tag_add");
         assert_eq!(rem.kind_name(), "tag_remove");
     }

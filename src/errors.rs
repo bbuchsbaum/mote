@@ -11,7 +11,11 @@ pub enum MoteError {
     StoreNotFound(PathBuf),
     StoreAlreadyInitialized(PathBuf),
     InvalidOpName(String),
-    HashMismatch { file: String, expected: String, got: String },
+    HashMismatch {
+        file: String,
+        expected: String,
+        got: String,
+    },
     DuplicateOp(String),
     ActorUnresolved,
     Rejected(String),
@@ -29,12 +33,18 @@ impl fmt::Display for MoteError {
         match self {
             MoteError::Io(e) => write!(f, "io error: {e}"),
             MoteError::Json(e) => write!(f, "json error: {e}"),
-            MoteError::StoreNotFound(p) => write!(f, "store not found: walked up from {}", p.display()),
+            MoteError::StoreNotFound(p) => {
+                write!(f, "store not found: walked up from {}", p.display())
+            }
             MoteError::StoreAlreadyInitialized(p) => {
                 write!(f, "store already initialized at {}", p.display())
             }
             MoteError::InvalidOpName(s) => write!(f, "invalid op filename: {s}"),
-            MoteError::HashMismatch { file, expected, got } => {
+            MoteError::HashMismatch {
+                file,
+                expected,
+                got,
+            } => {
                 write!(f, "hash mismatch in {file}: expected {expected}, got {got}")
             }
             MoteError::DuplicateOp(s) => write!(f, "duplicate op id: {s}"),

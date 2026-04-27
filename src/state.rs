@@ -182,7 +182,7 @@ impl State {
         bead.deps.iter().all(|(parent_id, _)| {
             self.beads
                 .get(parent_id)
-                .map_or(true, |p| p.is_deleted() || p.status == Status::Closed)
+                .is_none_or(|p| p.is_deleted() || p.status == Status::Closed)
         })
     }
 
@@ -202,10 +202,7 @@ impl State {
             if !self.is_ready(b) {
                 return false;
             }
-            match &b.claim {
-                Some(c) if c.is_live(now_ts) && c.claimed_by != actor => false,
-                _ => true,
-            }
+            !matches!(&b.claim, Some(c) if c.is_live(now_ts) && c.claimed_by != actor)
         })
     }
 

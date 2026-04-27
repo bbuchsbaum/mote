@@ -82,7 +82,9 @@ pub fn run(store: &Store, clean_tmp: bool) -> MoteResult<FsckReport> {
         let bytes_for_hash = canonical::encode(&value);
         let recomputed = ids::hash6(&bytes_for_hash);
         if recomputed != parts.hash {
-            report.bad_hash.push((name.clone(), parts.hash.clone(), recomputed));
+            report
+                .bad_hash
+                .push((name.clone(), parts.hash.clone(), recomputed));
         }
 
         // Op-shape check: bytes parse as JSON, but do they match a known kind?

@@ -31,13 +31,7 @@ where
                     let entity = op.entity().map(str::to_string);
                     state.push_history(
                         entity.as_deref(),
-                        HistoryEntry::rejected(
-                            &op_id,
-                            op.kind_name(),
-                            op.actor(),
-                            op.ts(),
-                            reason,
-                        ),
+                        HistoryEntry::rejected(&op_id, op.kind_name(), op.actor(), op.ts(), reason),
                     );
                     continue;
                 }
@@ -118,8 +112,19 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
     }
 }
 
-fn reject(state: &mut State, entity: &str, op_id: &str, kind: &str, actor: &str, ts: &str, reason: String) {
-    state.push_history(Some(entity), HistoryEntry::rejected(op_id, kind, actor, ts, reason));
+fn reject(
+    state: &mut State,
+    entity: &str,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    reason: String,
+) {
+    state.push_history(
+        Some(entity),
+        HistoryEntry::rejected(op_id, kind, actor, ts, reason),
+    );
 }
 
 fn accept(state: &mut State, entity: &str, op_id: &str, kind: &str, actor: &str, ts: &str) {
@@ -129,19 +134,43 @@ fn accept(state: &mut State, entity: &str, op_id: &str, kind: &str, actor: &str,
 fn apply_create(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, o: CreateOp) {
     let CreateOp { entity, set, .. } = o;
     if state.beads.contains_key(&entity) {
-        reject(state, &entity, op_id, kind, actor, ts, format!("entity {entity} already exists"));
+        reject(
+            state,
+            &entity,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("entity {entity} already exists"),
+        );
         return;
     }
     let title = match &set.title {
         Some(t) if !t.is_empty() => t.clone(),
         _ => {
-            reject(state, &entity, op_id, kind, actor, ts, "create requires non-empty title".into());
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "create requires non-empty title".into(),
+            );
             return;
         }
     };
     if let Some(p) = set.priority {
         if !(0..=3).contains(&p) {
-            reject(state, &entity, op_id, kind, actor, ts, format!("priority {p} out of 0..=3"));
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("priority {p} out of 0..=3"),
+            );
             return;
         }
     }
@@ -153,7 +182,9 @@ fn apply_create(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &st
     // Always set defaults on absent fields, with their clock = op_id (so a
     // future patch can target them with `expect.<field> = create_op_id`).
     for f in &["title", "status", "priority", "body"] {
-        clock.entry((*f).to_string()).or_insert_with(|| op_id.to_string());
+        clock
+            .entry((*f).to_string())
+            .or_insert_with(|| op_id.to_string());
     }
     if set.assignee.is_some() {
         clock.insert("assignee".to_string(), op_id.to_string());
@@ -180,15 +211,36 @@ fn apply_create(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &st
 }
 
 fn apply_patch(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, o: PatchOp) {
-    let PatchOp { entity, expect, set, .. } = o;
+    let PatchOp {
+        entity,
+        expect,
+        set,
+        ..
+    } = o;
     let bead = match state.beads.get_mut(&entity) {
         Some(b) if !b.is_deleted() => b,
         Some(_) => {
-            reject(state, &entity, op_id, kind, actor, ts, format!("entity {entity} is deleted"));
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {entity} is deleted"),
+            );
             return;
         }
         None => {
-            reject(state, &entity, op_id, kind, actor, ts, format!("entity {entity} does not exist"));
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {entity} does not exist"),
+            );
             return;
         }
     };
@@ -198,14 +250,14 @@ fn apply_patch(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
         match bead.clock.get(field) {
             Some(current) if current == expected => {}
             Some(current) => {
-                let reason = format!(
-                    "stale: field `{field}` clock is {current}, expected {expected}"
-                );
+                let reason =
+                    format!("stale: field `{field}` clock is {current}, expected {expected}");
                 reject(state, &entity, op_id, kind, actor, ts, reason);
                 return;
             }
             None => {
-                let reason = format!("stale: field `{field}` has never been written, expected {expected}");
+                let reason =
+                    format!("stale: field `{field}` has never been written, expected {expected}");
                 reject(state, &entity, op_id, kind, actor, ts, reason);
                 return;
             }
@@ -214,7 +266,15 @@ fn apply_patch(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
 
     if let Some(p) = set.priority {
         if !(0..=3).contains(&p) {
-            reject(state, &entity, op_id, kind, actor, ts, format!("priority {p} out of 0..=3"));
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("priority {p} out of 0..=3"),
+            );
             return;
         }
     }
@@ -246,21 +306,76 @@ fn apply_scalar_set(bead: &mut Bead, op_id: &str, set: &ScalarSet) {
     }
 }
 
-fn apply_tag(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, o: TagOp, add: bool) {
+fn apply_tag(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: TagOp,
+    add: bool,
+) {
     let TagOp { entity, tag, .. } = o;
     let bead = match state.beads.get_mut(&entity) {
         Some(b) if !b.is_deleted() => b,
-        Some(_) => { reject(state, &entity, op_id, kind, actor, ts, "entity is deleted".into()); return; }
-        None => { reject(state, &entity, op_id, kind, actor, ts, format!("entity {entity} does not exist")); return; }
+        Some(_) => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "entity is deleted".into(),
+            );
+            return;
+        }
+        None => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {entity} does not exist"),
+            );
+            return;
+        }
     };
-    if add { bead.tags.insert(tag); } else { bead.tags.remove(&tag); }
+    if add {
+        bead.tags.insert(tag);
+    } else {
+        bead.tags.remove(&tag);
+    }
     accept(state, &entity, op_id, kind, actor, ts);
 }
 
-fn apply_dep(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, o: DepOp, add: bool) {
-    let DepOp { entity, parent, dep_kind, .. } = o;
+fn apply_dep(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: DepOp,
+    add: bool,
+) {
+    let DepOp {
+        entity,
+        parent,
+        dep_kind,
+        ..
+    } = o;
     if entity == parent {
-        reject(state, &entity, op_id, kind, actor, ts, "self-dependency forbidden".into());
+        reject(
+            state,
+            &entity,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "self-dependency forbidden".into(),
+        );
         return;
     }
     // For `dep_add` the parent must exist AND not be deleted (we can't add a
@@ -269,39 +384,99 @@ fn apply_dep(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, 
     // even after the parent has been deleted.
     let parent_present = state.beads.contains_key(&parent);
     if !parent_present {
-        reject(state, &entity, op_id, kind, actor, ts, format!("parent {parent} does not exist"));
+        reject(
+            state,
+            &entity,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("parent {parent} does not exist"),
+        );
         return;
     }
     if add {
-        let parent_alive = state
-            .beads
-            .get(&parent)
-            .map_or(false, |b| !b.is_deleted());
+        let parent_alive = state.beads.get(&parent).is_some_and(|b| !b.is_deleted());
         if !parent_alive {
-            reject(state, &entity, op_id, kind, actor, ts, format!("parent {parent} is deleted"));
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("parent {parent} is deleted"),
+            );
             return;
         }
     }
     let bead = match state.beads.get_mut(&entity) {
         Some(b) if !b.is_deleted() => b,
-        Some(_) => { reject(state, &entity, op_id, kind, actor, ts, "entity is deleted".into()); return; }
-        None => { reject(state, &entity, op_id, kind, actor, ts, format!("entity {entity} does not exist")); return; }
+        Some(_) => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "entity is deleted".into(),
+            );
+            return;
+        }
+        None => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {entity} does not exist"),
+            );
+            return;
+        }
     };
     let edge = (parent, dep_kind);
-    if add { bead.deps.insert(edge); } else { bead.deps.remove(&edge); }
+    if add {
+        bead.deps.insert(edge);
+    } else {
+        bead.deps.remove(&edge);
+    }
     accept(state, &entity, op_id, kind, actor, ts);
 }
 
 fn apply_note(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, o: NoteOp) {
-    let NoteOp { entity, note_kind, text, .. } = o;
+    let NoteOp {
+        entity,
+        note_kind,
+        text,
+        ..
+    } = o;
     if !validate_note_kind(&note_kind) {
-        reject(state, &entity, op_id, kind, actor, ts, format!("invalid note_kind: {note_kind}"));
+        reject(
+            state,
+            &entity,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("invalid note_kind: {note_kind}"),
+        );
         return;
     }
     let bead = match state.beads.get_mut(&entity) {
         Some(b) => b,
         None => {
-            reject(state, &entity, op_id, kind, actor, ts, format!("entity {entity} does not exist"));
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {entity} does not exist"),
+            );
             return;
         }
     };
@@ -319,8 +494,30 @@ fn apply_close(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
     let CloseOp { entity, expect, .. } = o;
     let bead = match state.beads.get_mut(&entity) {
         Some(b) if !b.is_deleted() => b,
-        Some(_) => { reject(state, &entity, op_id, kind, actor, ts, "entity is deleted".into()); return; }
-        None => { reject(state, &entity, op_id, kind, actor, ts, format!("entity {entity} does not exist")); return; }
+        Some(_) => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "entity is deleted".into(),
+            );
+            return;
+        }
+        None => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {entity} does not exist"),
+            );
+            return;
+        }
     };
     if bead.status == Status::Closed {
         // Idempotent no-op.
@@ -331,12 +528,21 @@ fn apply_close(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
         match bead.clock.get(field) {
             Some(current) if current == expected => {}
             Some(current) => {
-                let reason = format!("stale close: `{field}` clock is {current}, expected {expected}");
+                let reason =
+                    format!("stale close: `{field}` clock is {current}, expected {expected}");
                 reject(state, &entity, op_id, kind, actor, ts, reason);
                 return;
             }
             None => {
-                reject(state, &entity, op_id, kind, actor, ts, format!("stale close: `{field}` never written"));
+                reject(
+                    state,
+                    &entity,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    format!("stale close: `{field}` never written"),
+                );
                 return;
             }
         }
@@ -375,15 +581,39 @@ fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
 
     match decision {
         Decision::EntityDeleted => {
-            reject(state, &entity, op_id, kind, actor, ts, "entity is deleted".into());
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "entity is deleted".into(),
+            );
             return;
         }
         Decision::EntityMissing => {
-            reject(state, &entity, op_id, kind, actor, ts, format!("entity {entity} does not exist"));
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {entity} does not exist"),
+            );
             return;
         }
         Decision::Held(holder) => {
-            reject(state, &entity, op_id, kind, actor, ts, format!("claim still held by {holder}"));
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("claim still held by {holder}"),
+            );
             return;
         }
         Decision::Accept => {}
@@ -392,7 +622,15 @@ fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
     let lease_until_ts = match compute_lease_until(ts, ttl_s) {
         Ok(s) => s,
         Err(e) => {
-            reject(state, &entity, op_id, kind, actor, ts, format!("bad ttl: {e}"));
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("bad ttl: {e}"),
+            );
             return;
         }
     };
@@ -407,15 +645,35 @@ fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
 }
 
 fn apply_release(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, o: ReleaseOp) {
-    let ReleaseOp { entity, expect_claim, .. } = o;
+    let ReleaseOp {
+        entity,
+        expect_claim,
+        ..
+    } = o;
     let bead = match state.beads.get_mut(&entity) {
         Some(b) if !b.is_deleted() => b,
         Some(_) => {
-            reject(state, &entity, op_id, kind, actor, ts, "entity is deleted".into());
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "entity is deleted".into(),
+            );
             return;
         }
         None => {
-            reject(state, &entity, op_id, kind, actor, ts, format!("entity {entity} does not exist"));
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {entity} does not exist"),
+            );
             return;
         }
     };
@@ -423,7 +681,15 @@ fn apply_release(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
     let claim = match &bead.claim {
         Some(c) => c.clone(),
         None => {
-            reject(state, &entity, op_id, kind, actor, ts, "no active claim to release".into());
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "no active claim to release".into(),
+            );
             return;
         }
     };
@@ -438,7 +704,10 @@ fn apply_release(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
             kind,
             actor,
             ts,
-            format!("release rejected: held by {}, expect_claim mismatch", claim.claimed_by),
+            format!(
+                "release rejected: held by {}, expect_claim mismatch",
+                claim.claimed_by
+            ),
         );
         return;
     }
@@ -469,9 +738,26 @@ fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &
 
     if !validate_msg_kind(&msg_kind) {
         if let Some(e) = bind_entity {
-            reject(state, e, op_id, kind, actor, ts, format!("invalid msg_kind: {msg_kind}"));
+            reject(
+                state,
+                e,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("invalid msg_kind: {msg_kind}"),
+            );
         } else {
-            state.push_history(None, HistoryEntry::rejected(op_id, kind, actor, ts, format!("invalid msg_kind: {msg_kind}")));
+            state.push_history(
+                None,
+                HistoryEntry::rejected(
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    format!("invalid msg_kind: {msg_kind}"),
+                ),
+            );
         }
         return;
     }
@@ -486,7 +772,15 @@ fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &
     }
     if let Some(e) = bind_entity {
         if !state.beads.contains_key(e) {
-            reject(state, e, op_id, kind, actor, ts, format!("entity {e} does not exist"));
+            reject(
+                state,
+                e,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {e} does not exist"),
+            );
             return;
         }
     }
@@ -531,7 +825,9 @@ fn apply_msg_ack(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
         let reason = "self-ack of own send is not allowed".to_string();
         match bind_entity.as_deref() {
             Some(e) => reject(state, e, op_id, kind, actor, ts, reason),
-            None => state.push_history(None, HistoryEntry::rejected(op_id, kind, actor, ts, reason)),
+            None => {
+                state.push_history(None, HistoryEntry::rejected(op_id, kind, actor, ts, reason))
+            }
         }
         return;
     }
@@ -539,7 +835,9 @@ fn apply_msg_ack(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
         let reason = format!("msg {msg_id} addressed to {}, not {}", msg.to, actor);
         match bind_entity.as_deref() {
             Some(e) => reject(state, e, op_id, kind, actor, ts, reason),
-            None => state.push_history(None, HistoryEntry::rejected(op_id, kind, actor, ts, reason)),
+            None => {
+                state.push_history(None, HistoryEntry::rejected(op_id, kind, actor, ts, reason))
+            }
         }
         return;
     }
@@ -547,7 +845,9 @@ fn apply_msg_ack(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
         let reason = format!("msg {msg_id} already acked");
         match bind_entity.as_deref() {
             Some(e) => reject(state, e, op_id, kind, actor, ts, reason),
-            None => state.push_history(None, HistoryEntry::rejected(op_id, kind, actor, ts, reason)),
+            None => {
+                state.push_history(None, HistoryEntry::rejected(op_id, kind, actor, ts, reason))
+            }
         }
         return;
     }
@@ -555,7 +855,10 @@ fn apply_msg_ack(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
     msg.ack_op_id = Some(op_id.to_string());
     msg.ack_ts = Some(ts.to_string());
 
-    state.push_history(bind_entity.as_deref(), HistoryEntry::accepted(op_id, kind, actor, ts));
+    state.push_history(
+        bind_entity.as_deref(),
+        HistoryEntry::accepted(op_id, kind, actor, ts),
+    );
 }
 
 fn apply_reserve_open(
@@ -599,7 +902,7 @@ fn apply_reserve_open(
         );
         return;
     }
-    if !state.beads.get(&entity).map_or(false, |b| !b.is_deleted()) {
+    if state.beads.get(&entity).is_none_or(|b| b.is_deleted()) {
         reject(
             state,
             &entity,
@@ -692,7 +995,11 @@ fn first_overlap_reason(
             continue;
         }
         for p_new in new_paths {
-            for p_held in r.paths.iter().filter(|p| !r.closed_paths.contains(p.as_str())) {
+            for p_held in r
+                .paths
+                .iter()
+                .filter(|p| !r.closed_paths.contains(p.as_str()))
+            {
                 if crate::paths::overlap(p_new, p_held) {
                     return Some(format!(
                         "path conflict: `{p_new}` overlaps `{p_held}` held by {} (rv {})",
@@ -800,8 +1107,30 @@ fn apply_delete(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &st
     let DeleteOp { entity, .. } = o;
     let bead = match state.beads.get_mut(&entity) {
         Some(b) if !b.is_deleted() => b,
-        Some(_) => { reject(state, &entity, op_id, kind, actor, ts, "entity already deleted".into()); return; }
-        None => { reject(state, &entity, op_id, kind, actor, ts, format!("entity {entity} does not exist")); return; }
+        Some(_) => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "entity already deleted".into(),
+            );
+            return;
+        }
+        None => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {entity} does not exist"),
+            );
+            return;
+        }
     };
     bead.deleted_at_ts = Some(ts.to_string());
     accept(state, &entity, op_id, kind, actor, ts);
@@ -819,23 +1148,38 @@ mod tests {
         // Serialize, build name, set op field, re-serialize.
         let ts: jiff::Timestamp = op.ts().parse().unwrap();
         let mut value: Value = serde_json::to_value(&op).unwrap();
-        value.as_object_mut().unwrap().insert("op".into(), Value::String(String::new()));
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("op".into(), Value::String(String::new()));
         let bytes_for_hash = canonical::encode(&value);
         let name = ids::build_op_name(ts, &bytes_for_hash);
-        value.as_object_mut().unwrap().insert("op".into(), Value::String(name.as_str().into()));
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("op".into(), Value::String(name.as_str().into()));
         let bytes = canonical::encode(&value);
         (format!("{}.json", name.as_str()), bytes)
     }
 
-    fn ts_at(s: &str) -> jiff::Timestamp { s.parse().unwrap() }
+    fn ts_at(s: &str) -> jiff::Timestamp {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn create_then_patch_disjoint_fields_succeeds() {
         let t1 = ts_at("2026-04-20T18:24:55.000001Z");
         let t2 = ts_at("2026-04-20T18:24:55.000002Z");
 
-        let create = make_create("alice".into(), "bd-1".into(),
-            ScalarSet { title: Some("hi".into()), ..Default::default() }, t1);
+        let create = make_create(
+            "alice".into(),
+            "bd-1".into(),
+            ScalarSet {
+                title: Some("hi".into()),
+                ..Default::default()
+            },
+            t1,
+        );
         let (n1, b1) = pack(create);
 
         // Need create_op_id to construct expect for patch.
@@ -843,8 +1187,16 @@ mod tests {
 
         let mut expect = BTreeMap::new();
         expect.insert("priority".into(), create_op_id.clone());
-        let patch = make_patch("bob".into(), "bd-1".into(), expect,
-            ScalarSet { priority: Some(1), ..Default::default() }, t2);
+        let patch = make_patch(
+            "bob".into(),
+            "bd-1".into(),
+            expect,
+            ScalarSet {
+                priority: Some(1),
+                ..Default::default()
+            },
+            t2,
+        );
         let (n2, b2) = pack(patch);
 
         let state = replay([(n1.clone(), b1), (n2.clone(), b2)]);
@@ -859,17 +1211,40 @@ mod tests {
         let t2 = ts_at("2026-04-20T18:24:55.000002Z");
         let t3 = ts_at("2026-04-20T18:24:55.000003Z");
 
-        let create = make_create("alice".into(), "bd-1".into(),
-            ScalarSet { title: Some("t".into()), ..Default::default() }, t1);
+        let create = make_create(
+            "alice".into(),
+            "bd-1".into(),
+            ScalarSet {
+                title: Some("t".into()),
+                ..Default::default()
+            },
+            t1,
+        );
         let (n1, b1) = pack(create);
         let create_op_id = n1.strip_suffix(".json").unwrap().to_string();
 
         let mut expect = BTreeMap::new();
         expect.insert("status".into(), create_op_id);
-        let p1 = make_patch("a".into(), "bd-1".into(), expect.clone(),
-            ScalarSet { status: Some(Status::Doing), ..Default::default() }, t2);
-        let p2 = make_patch("b".into(), "bd-1".into(), expect,
-            ScalarSet { status: Some(Status::Blocked), ..Default::default() }, t3);
+        let p1 = make_patch(
+            "a".into(),
+            "bd-1".into(),
+            expect.clone(),
+            ScalarSet {
+                status: Some(Status::Doing),
+                ..Default::default()
+            },
+            t2,
+        );
+        let p2 = make_patch(
+            "b".into(),
+            "bd-1".into(),
+            expect,
+            ScalarSet {
+                status: Some(Status::Blocked),
+                ..Default::default()
+            },
+            t3,
+        );
         let (n2, b2) = pack(p1);
         let (n3, b3) = pack(p2);
 
@@ -890,16 +1265,33 @@ mod tests {
     fn dep_self_dependency_rejected() {
         let t1 = ts_at("2026-04-20T18:24:55.000001Z");
         let t2 = ts_at("2026-04-20T18:24:55.000002Z");
-        let create = make_create("a".into(), "bd-1".into(),
-            ScalarSet { title: Some("t".into()), ..Default::default() }, t1);
-        let dep = make_dep(true, "a".into(), "bd-1".into(), "bd-1".into(), "blocks".into(), t2);
+        let create = make_create(
+            "a".into(),
+            "bd-1".into(),
+            ScalarSet {
+                title: Some("t".into()),
+                ..Default::default()
+            },
+            t1,
+        );
+        let dep = make_dep(
+            true,
+            "a".into(),
+            "bd-1".into(),
+            "bd-1".into(),
+            "blocks".into(),
+            t2,
+        );
         let (n1, b1) = pack(create);
         let (n2, b2) = pack(dep);
         let state = replay([(n1, b1), (n2.clone(), b2)]);
         let id = n2.strip_suffix(".json").unwrap();
         assert!(!state.was_accepted(id));
         let reason = state.rejection_reason(id).unwrap_or_default();
-        assert!(reason.contains("self"), "expected reason about self-dep, got: {reason:?}");
+        assert!(
+            reason.contains("self"),
+            "expected reason about self-dep, got: {reason:?}"
+        );
     }
 
     #[test]
@@ -907,8 +1299,15 @@ mod tests {
         let t1 = ts_at("2026-04-20T18:24:55.000001Z");
         let t2 = ts_at("2026-04-20T18:24:55.000002Z");
         let t3 = ts_at("2026-04-20T18:24:55.000003Z");
-        let create = make_create("a".into(), "bd-1".into(),
-            ScalarSet { title: Some("t".into()), ..Default::default() }, t1);
+        let create = make_create(
+            "a".into(),
+            "bd-1".into(),
+            ScalarSet {
+                title: Some("t".into()),
+                ..Default::default()
+            },
+            t1,
+        );
         let tag1 = make_tag(true, "a".into(), "bd-1".into(), "x".into(), t2);
         let tag2 = make_tag(true, "a".into(), "bd-1".into(), "x".into(), t3);
         let (n1, b1) = pack(create);
@@ -924,14 +1323,29 @@ mod tests {
     fn replay_is_deterministic() {
         let t1 = ts_at("2026-04-20T18:24:55.000001Z");
         let t2 = ts_at("2026-04-20T18:24:55.000002Z");
-        let create = make_create("a".into(), "bd-1".into(),
-            ScalarSet { title: Some("t".into()), ..Default::default() }, t1);
+        let create = make_create(
+            "a".into(),
+            "bd-1".into(),
+            ScalarSet {
+                title: Some("t".into()),
+                ..Default::default()
+            },
+            t1,
+        );
         let (n1, b1) = pack(create);
         let create_op_id = n1.strip_suffix(".json").unwrap().to_string();
         let mut expect = BTreeMap::new();
         expect.insert("title".into(), create_op_id);
-        let patch = make_patch("a".into(), "bd-1".into(), expect,
-            ScalarSet { title: Some("t2".into()), ..Default::default() }, t2);
+        let patch = make_patch(
+            "a".into(),
+            "bd-1".into(),
+            expect,
+            ScalarSet {
+                title: Some("t2".into()),
+                ..Default::default()
+            },
+            t2,
+        );
         let (n2, b2) = pack(patch);
 
         let s1 = replay([(n1.clone(), b1.clone()), (n2.clone(), b2.clone())]);

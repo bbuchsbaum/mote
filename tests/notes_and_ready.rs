@@ -7,7 +7,7 @@ use std::thread;
 use jiff::Timestamp;
 use tempfile::TempDir;
 
-use mote::op::{ScalarSet, Status, make_close, make_create, make_dep, make_note};
+use mote::op::{ScalarSet, Status, make_close, make_create, make_dep};
 use mote::{publish, reducer, repo::Store};
 
 fn mote_bin() -> &'static str {
@@ -37,7 +37,10 @@ fn a8_concurrent_notes_all_accept() {
         .output()
         .unwrap();
     assert!(new_out.status.success(), "new failed");
-    let id = String::from_utf8(new_out.stdout).unwrap().trim().to_string();
+    let id = String::from_utf8(new_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Spawn 5 concurrent `mote note` invocations on the same bead.
     let mut handles = Vec::new();
@@ -74,9 +77,17 @@ fn a8_concurrent_notes_all_accept() {
     let store = Store::open(&td.path().join(".mote")).unwrap();
     let state = reducer::replay_store(&store).unwrap();
     let bead = &state.beads[&id];
-    assert_eq!(bead.notes.len(), 5, "expected 5 notes, got {}", bead.notes.len());
+    assert_eq!(
+        bead.notes.len(),
+        5,
+        "expected 5 notes, got {}",
+        bead.notes.len()
+    );
 
-    let history = state.history.get(&id).expect("history must contain entries");
+    let history = state
+        .history
+        .get(&id)
+        .expect("history must contain entries");
     let accepted_notes = history
         .iter()
         .filter(|e| e.kind == "note" && e.accepted)
@@ -100,14 +111,28 @@ fn note_invalid_kind_is_rejected_at_cli() {
         .current_dir(td.path())
         .output()
         .unwrap();
-    let id = String::from_utf8(new_out.stdout).unwrap().trim().to_string();
+    let id = String::from_utf8(new_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     let bad = Command::new(bin)
-        .args(["note", &id, "--kind", "rationale", "txt", "--actor", "alice"])
+        .args([
+            "note",
+            &id,
+            "--kind",
+            "rationale",
+            "txt",
+            "--actor",
+            "alice",
+        ])
         .current_dir(td.path())
         .output()
         .unwrap();
-    assert!(!bad.status.success(), "expected failure for invalid note_kind");
+    assert!(
+        !bad.status.success(),
+        "expected failure for invalid note_kind"
+    );
     let stderr = String::from_utf8(bad.stderr).unwrap();
     assert!(
         stderr.contains("invalid note_kind"),
@@ -129,11 +154,7 @@ fn ready_computation_dep_graph() {
             ..Default::default()
         };
         s.status = Some(status);
-        publish::publish_op(
-            &store,
-            &make_create("tester".into(), id.into(), s, ts),
-        )
-        .unwrap()
+        publish::publish_op(&store, &make_create("tester".into(), id.into(), s, ts)).unwrap()
     };
 
     let _na = mk_create("bd-A", Status::Open, ts0);
@@ -182,10 +203,22 @@ fn ready_computation_dep_graph() {
     let state = reducer::replay_store(&store).unwrap();
     let ready_ids: Vec<&str> = state.ready_beads().map(|b| b.id.as_str()).collect();
 
-    assert!(ready_ids.contains(&"bd-A"), "A should be ready: {ready_ids:?}");
-    assert!(ready_ids.contains(&"bd-C"), "C should be ready (parent closed): {ready_ids:?}");
-    assert!(!ready_ids.contains(&"bd-B"), "B should NOT be ready (parent open): {ready_ids:?}");
-    assert!(!ready_ids.contains(&"bd-Z"), "Z should NOT be ready (status closed): {ready_ids:?}");
+    assert!(
+        ready_ids.contains(&"bd-A"),
+        "A should be ready: {ready_ids:?}"
+    );
+    assert!(
+        ready_ids.contains(&"bd-C"),
+        "C should be ready (parent closed): {ready_ids:?}"
+    );
+    assert!(
+        !ready_ids.contains(&"bd-B"),
+        "B should NOT be ready (parent open): {ready_ids:?}"
+    );
+    assert!(
+        !ready_ids.contains(&"bd-Z"),
+        "Z should NOT be ready (status closed): {ready_ids:?}"
+    );
 }
 
 #[test]
@@ -252,6 +285,9 @@ fn ready_cli_command_returns_expected_set() {
         .output()
         .unwrap();
     let lr = String::from_utf8(ls_ready.stdout).unwrap();
-    assert!(lr.contains(&child), "ls --ready should also list child: {lr}");
+    assert!(
+        lr.contains(&child),
+        "ls --ready should also list child: {lr}"
+    );
     assert!(!lr.contains(&parent));
 }

@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use mote::cli::{run, Cli};
+use mote::cli::{Cli, run};
 use mote::errors::MoteError;
 
 fn main() {

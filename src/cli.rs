@@ -1,6 +1,7 @@
 //! Clap definitions and dispatcher.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -48,6 +49,12 @@ pub struct Cli {
 pub enum Command {
     /// Initialize a `.mote/` store in the current directory
     Init,
+
+    /// Manage the local actor identity in `.mote/local/actor`
+    Actor {
+        #[command(subcommand)]
+        cmd: ActorCmd,
+    },
 
     /// Create a new bead
     New {
@@ -235,6 +242,9 @@ pub enum Command {
     /// Compact overview of board state
     Board,
 
+    /// Check store layout, actor identity, and op-log health
+    Doctor,
+
     /// Verify op-file hashes; with --clean-tmp, remove stale tmp/ entries
     Fsck {
         #[arg(long)]
@@ -243,8 +253,18 @@ pub enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum ActorCmd {
+    /// Persist an actor identity in `.mote/local/actor`
+    Set { actor: String },
+    /// Show the actor identity that would be used for this invocation
+    Show,
+    /// Remove the persisted local actor identity
+    Clear,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum DepCmd {
-    /// Add a dependency edge: <child> is blocked by <parent>
+    /// Add a dependency edge: `child` is blocked by `parent`
     Add {
         child: String,
         parent: String,
@@ -295,6 +315,9 @@ pub enum MsgCmd {
 pub fn run(cli: Cli) -> MoteResult<i32> {
     match cli.command {
         Command::Init => cmd_init(cli.quiet),
+        Command::Actor { cmd } => {
+            cmd_actor(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
+        }
         Command::New {
             title,
             priority,
@@ -342,7 +365,13 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             id,
             note_kind,
             text,
-        } => cmd_note(cli.actor.as_deref(), cli.store.as_deref(), id, note_kind, text),
+        } => cmd_note(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            id,
+            note_kind,
+            text,
+        ),
         Command::History {
             id,
             include_rejected,
@@ -351,38 +380,68 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         Command::Tag { cmd } => cmd_tag(cli.actor.as_deref(), cli.store.as_deref(), cmd),
         Command::Close { id } => cmd_close(cli.actor.as_deref(), cli.store.as_deref(), id),
         Command::Delete { id } => cmd_delete(cli.actor.as_deref(), cli.store.as_deref(), id),
-        Command::Claim { id, ttl } => cmd_claim(cli.actor.as_deref(), cli.store.as_deref(), id, ttl),
+        Command::Claim { id, ttl } => {
+            cmd_claim(cli.actor.as_deref(), cli.store.as_deref(), id, ttl)
+        }
         Command::Release { id } => cmd_release(cli.actor.as_deref(), cli.store.as_deref(), id),
         Command::Msg { cmd } => cmd_msg(cli.actor.as_deref(), cli.store.as_deref(), cmd),
-        Command::Inbox { issue, from, kind } => {
-            cmd_inbox(cli.actor.as_deref(), cli.store.as_deref(), cli.json, issue, from, kind)
-        }
-        Command::Reserve { paths, issue, ttl } => {
-            cmd_reserve(cli.actor.as_deref(), cli.store.as_deref(), paths, issue, ttl)
-        }
+        Command::Inbox { issue, from, kind } => cmd_inbox(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            issue,
+            from,
+            kind,
+        ),
+        Command::Reserve { paths, issue, ttl } => cmd_reserve(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            paths,
+            issue,
+            ttl,
+        ),
         Command::Unreserve { rv, paths } => {
             cmd_unreserve(cli.actor.as_deref(), cli.store.as_deref(), rv, paths)
         }
-        Command::Preflight { issue, paths } => {
-            cmd_preflight(cli.actor.as_deref(), cli.store.as_deref(), cli.json, issue, paths)
-        }
+        Command::Preflight { issue, paths } => cmd_preflight(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            issue,
+            paths,
+        ),
         Command::Begin {
             id,
             paths,
             note,
             ttl,
-        } => cmd_begin(cli.actor.as_deref(), cli.store.as_deref(), id, paths, note, ttl),
+        } => cmd_begin(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            id,
+            paths,
+            note,
+            ttl,
+        ),
         Command::Handoff {
             id,
             to,
             note,
             release,
-        } => cmd_handoff(cli.actor.as_deref(), cli.store.as_deref(), id, to, note, release),
+        } => cmd_handoff(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            id,
+            to,
+            note,
+            release,
+        ),
         Command::Done { id, note } => {
             cmd_done(cli.actor.as_deref(), cli.store.as_deref(), id, note)
         }
         Command::WhoHas { path } => cmd_who_has(cli.store.as_deref(), cli.json, path),
         Command::Board => cmd_board(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
+        Command::Doctor => cmd_doctor(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
         Command::Fsck { clean_tmp } => cmd_fsck(cli.store.as_deref(), cli.json, clean_tmp),
     }
 }
@@ -406,6 +465,121 @@ fn cmd_init(quiet: bool) -> MoteResult<i32> {
     Ok(0)
 }
 
+fn cmd_actor(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    cmd: ActorCmd,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let actor_path = store.local_dir().join("actor");
+
+    match cmd {
+        ActorCmd::Set { actor } => {
+            let actor = normalize_actor(&actor)?;
+            fs::create_dir_all(store.local_dir())?;
+            fs::write(&actor_path, format!("{actor}\n"))?;
+
+            if json_mode {
+                let v = serde_json::json!({
+                    "actor": actor,
+                    "source": "local",
+                    "path": actor_path.display().to_string(),
+                });
+                println!("{}", serde_json::to_string(&v)?);
+            } else {
+                println!("{actor}");
+            }
+            Ok(0)
+        }
+        ActorCmd::Show => {
+            let resolved = resolve_actor_with_source(&store, actor_flag)?;
+            if json_mode {
+                let v = serde_json::json!({
+                    "actor": resolved.actor,
+                    "source": resolved.source,
+                });
+                println!("{}", serde_json::to_string(&v)?);
+            } else {
+                println!("{} ({})", resolved.actor, resolved.source);
+            }
+            Ok(0)
+        }
+        ActorCmd::Clear => {
+            match fs::remove_file(&actor_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            if json_mode {
+                let v = serde_json::json!({
+                    "cleared": true,
+                    "path": actor_path.display().to_string(),
+                });
+                println!("{}", serde_json::to_string(&v)?);
+            } else {
+                println!("cleared {}", actor_path.display());
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn normalize_actor(actor: &str) -> MoteResult<String> {
+    let actor = actor.trim();
+    if actor.is_empty() {
+        return Err(MoteError::Invalid("actor must be non-empty".into()));
+    }
+    if actor.chars().any(|c| c == '\0' || c == '\n' || c == '\r') {
+        return Err(MoteError::Invalid(
+            "actor must be a single-line string".into(),
+        ));
+    }
+    Ok(actor.to_string())
+}
+
+struct ActorResolution {
+    actor: String,
+    source: &'static str,
+}
+
+fn resolve_actor_with_source(
+    store: &Store,
+    actor_flag: Option<&str>,
+) -> MoteResult<ActorResolution> {
+    if let Some(s) = actor_flag {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(ActorResolution {
+                actor: s.to_string(),
+                source: "flag",
+            });
+        }
+    }
+    if let Ok(s) = std::env::var("MOTE_ACTOR") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(ActorResolution {
+                actor: s.to_string(),
+                source: "env",
+            });
+        }
+    }
+    let actor_file = store.local_dir().join("actor");
+    if actor_file.is_file() {
+        let s = fs::read_to_string(&actor_file)?;
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(ActorResolution {
+                actor: s.to_string(),
+                source: "local",
+            });
+        }
+    }
+    Err(MoteError::ActorUnresolved)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_new(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
@@ -444,7 +618,13 @@ fn cmd_new(
 
     let mut tag_names = Vec::new();
     for t in &tags {
-        let op = make_tag(true, actor.clone(), bead_id.clone(), t.clone(), Timestamp::now());
+        let op = make_tag(
+            true,
+            actor.clone(),
+            bead_id.clone(),
+            t.clone(),
+            Timestamp::now(),
+        );
         tag_names.push(publish::publish_op(&store, &op)?);
     }
     let mut dep_names = Vec::new();
@@ -612,7 +792,10 @@ fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResul
             println!("assignee: {a}");
         }
         if !bead.tags.is_empty() {
-            println!("tags:     {}", bead.tags.iter().cloned().collect::<Vec<_>>().join(", "));
+            println!(
+                "tags:     {}",
+                bead.tags.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
         }
         if !bead.deps.is_empty() {
             print!("deps:     ");
@@ -639,6 +822,7 @@ fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResul
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_ls(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
@@ -842,11 +1026,7 @@ fn cmd_note(
     verify_accept(&store, &name)
 }
 
-fn cmd_dep(
-    actor_flag: Option<&str>,
-    store_flag: Option<&Path>,
-    cmd: DepCmd,
-) -> MoteResult<i32> {
+fn cmd_dep(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: DepCmd) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let (add, child, parent, kind) = match cmd {
@@ -866,11 +1046,7 @@ fn cmd_dep(
     verify_accept(&store, &name)
 }
 
-fn cmd_tag(
-    actor_flag: Option<&str>,
-    store_flag: Option<&Path>,
-    cmd: TagCmd,
-) -> MoteResult<i32> {
+fn cmd_tag(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: TagCmd) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let (add, id, tag) = match cmd {
@@ -931,7 +1107,14 @@ fn cmd_claim(
         .filter(|c| c.claimed_by == actor)
         .map(|c| c.claim_clock.clone());
 
-    let op = make_claim(actor.clone(), id, actor, ttl_s, expect_claim, Timestamp::now());
+    let op = make_claim(
+        actor.clone(),
+        id,
+        actor,
+        ttl_s,
+        expect_claim,
+        Timestamp::now(),
+    );
     let name = publish::publish_op(&store, &op)?;
     verify_accept(&store, &name)
 }
@@ -1000,9 +1183,11 @@ fn cmd_inbox(
     let filtered: Vec<&crate::state::MsgRecord> = messages
         .into_iter()
         .filter(|m| {
-            issue.as_deref().map_or(true, |i| m.entity.as_deref() == Some(i))
-                && from.as_deref().map_or(true, |f| m.from == f)
-                && kind.as_deref().map_or(true, |k| m.msg_kind == k)
+            issue
+                .as_deref()
+                .is_none_or(|i| m.entity.as_deref() == Some(i))
+                && from.as_deref().is_none_or(|f| m.from == f)
+                && kind.as_deref().is_none_or(|k| m.msg_kind == k)
         })
         .collect();
 
@@ -1122,7 +1307,10 @@ fn cmd_preflight(
         }
     }
 
-    let issue_status = state.beads.get(&issue).map(|b| b.status.as_str().to_string());
+    let issue_status = state
+        .beads
+        .get(&issue)
+        .map(|b| b.status.as_str().to_string());
     let claim_holder = state
         .beads
         .get(&issue)
@@ -1314,7 +1502,13 @@ fn cmd_done(
 
     // Completion note (note_kind=note). Best effort.
     let text = note.unwrap_or_else(|| "done".into());
-    let note_op = make_note(actor.clone(), id.clone(), "note".into(), text, Timestamp::now());
+    let note_op = make_note(
+        actor.clone(),
+        id.clone(),
+        "note".into(),
+        text,
+        Timestamp::now(),
+    );
     let note_name = publish::publish_op(&store, &note_op)?;
 
     // Close (with expect.status). MUST be accepted for `done` to mean closed.
@@ -1327,6 +1521,11 @@ fn cmd_done(
     if let Some(c) = bead.clock.get("status") {
         expect.insert("status".to_string(), c.clone());
     }
+    // Test-only hook: widen the read-modify-write window so a competing
+    // `mote set ... status=...` from another actor can land between this
+    // observation and the close publish, deterministically reproducing a
+    // stale-clock race. No effect when the env var is unset.
+    maybe_test_sleep("MOTE_TEST_DELAY_BEFORE_CLOSE_MS");
     let close = make_close(actor.clone(), id.clone(), expect, Timestamp::now());
     let close_name = publish::publish_op(&store, &close)?;
     let state_post_close = reducer::replay_store(&store)?;
@@ -1381,11 +1580,7 @@ fn cmd_done(
     Ok(0)
 }
 
-fn cmd_who_has(
-    store_flag: Option<&Path>,
-    json_mode: bool,
-    path: String,
-) -> MoteResult<i32> {
+fn cmd_who_has(store_flag: Option<&Path>, json_mode: bool, path: String) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let state = reducer::replay_store(&store)?;
     let now = ids::format_rfc3339(Timestamp::now());
@@ -1453,7 +1648,7 @@ fn cmd_board(
     }
     let active_claims: Vec<&Bead> = state
         .live_beads()
-        .filter(|b| b.claim.as_ref().map_or(false, |c| c.is_live(&now)))
+        .filter(|b| b.claim.as_ref().is_some_and(|c| c.is_live(&now)))
         .collect();
     let active_reservations: Vec<_> = state
         .reservations
@@ -1491,13 +1686,20 @@ fn cmd_board(
         }
         println!("claims:       {} active", active_claims.len());
         for b in &active_claims {
-            let holder = b.claim.as_ref().map(|c| c.claimed_by.as_str()).unwrap_or("?");
+            let holder = b
+                .claim
+                .as_ref()
+                .map(|c| c.claimed_by.as_str())
+                .unwrap_or("?");
             println!("  {} ({}, by {holder})", b.id, b.status.as_str());
         }
         println!("reservations: {} active", active_reservations.len());
         for r in &active_reservations {
             let live = r.live_paths().join(", ");
-            println!("  {} by {} on {}: {}", r.reservation_id, r.actor, r.entity, live);
+            println!(
+                "  {} by {} on {}: {}",
+                r.reservation_id, r.actor, r.entity, live
+            );
         }
         println!("inbox:        {inbox_count} unacked");
     }
@@ -1517,30 +1719,152 @@ fn verify_accept(store: &Store, name: &ids::OpName) -> MoteResult<i32> {
     }
 }
 
+fn cmd_doctor(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+
+    let root_ok = store.root().is_dir();
+    let ops_ok = store.ops_dir().is_dir();
+    let tmp_ok = store.tmp_dir().is_dir();
+    let local_ok = store.local_dir().is_dir();
+    let layout_ok = root_ok && ops_ok && tmp_ok && local_ok;
+
+    let (schema_version, format_ok, format_error) = match store.read_format() {
+        Ok(format) => (
+            Some(format.schema_version),
+            format.schema_version == 1,
+            None::<String>,
+        ),
+        Err(e) => (None, false, Some(e.to_string())),
+    };
+
+    let actor = match resolve_actor_with_source(&store, actor_flag) {
+        Ok(actor) => Some(actor),
+        Err(MoteError::ActorUnresolved) => None,
+        Err(e) => return Err(e),
+    };
+
+    let (fsck_report, fsck_error) = if ops_ok && tmp_ok {
+        match fsck::run(&store, false) {
+            Ok(report) => (Some(report), None::<String>),
+            Err(e) => (None, Some(e.to_string())),
+        }
+    } else {
+        (
+            None,
+            Some("ops/ or tmp/ directory is missing; fsck not run".into()),
+        )
+    };
+    let fsck_clean = fsck_report.as_ref().is_some_and(|r| r.is_clean());
+    let storage_ok = layout_ok && format_ok && fsck_error.is_none() && fsck_clean;
+    let actor_ok = actor.is_some();
+    let ok = storage_ok && actor_ok;
+
+    if json_mode {
+        let v = serde_json::json!({
+            "ok": ok,
+            "store_root": store.root().display().to_string(),
+            "layout": {
+                "root": root_ok,
+                "ops": ops_ok,
+                "tmp": tmp_ok,
+                "local": local_ok,
+            },
+            "format": {
+                "ok": format_ok,
+                "schema_version": schema_version,
+                "error": format_error,
+            },
+            "actor_ok": actor_ok,
+            "actor": actor.as_ref().map(|a| a.actor.as_str()),
+            "actor_source": actor.as_ref().map(|a| a.source),
+            "fsck_clean": fsck_clean,
+            "fsck_error": fsck_error,
+            "fsck": fsck_report.as_ref().map(fsck_report_json),
+        });
+        println!("{}", serde_json::to_string(&v)?);
+    } else {
+        println!("store:  {}", store.root().display());
+        match (format_ok, schema_version, format_error.as_deref()) {
+            (true, Some(version), _) => println!("format: ok (schema_version {version})"),
+            (_, Some(version), _) => println!("format: bad schema_version {version}"),
+            (_, _, Some(error)) => println!("format: bad ({error})"),
+            _ => println!("format: bad"),
+        }
+        println!("layout: {}", if layout_ok { "ok" } else { "bad" });
+        if !layout_ok {
+            println!("  root:  {root_ok}");
+            println!("  ops:   {ops_ok}");
+            println!("  tmp:   {tmp_ok}");
+            println!("  local: {local_ok}");
+        }
+        match &actor {
+            Some(actor) => println!("actor:  {} ({})", actor.actor, actor.source),
+            None => println!("actor:  unresolved"),
+        }
+        match (&fsck_report, &fsck_error) {
+            (Some(report), _) if report.is_clean() => {
+                println!(
+                    "fsck:   clean ({} ops, {} tmp entries)",
+                    report.ops_checked, report.tmp_total
+                );
+            }
+            (Some(report), _) => {
+                println!(
+                    "fsck:   bad ({} ops, {} bad filenames, {} bad json, {} bad hashes, {} bad shapes)",
+                    report.ops_checked,
+                    report.bad_filename.len(),
+                    report.bad_json.len(),
+                    report.bad_hash.len(),
+                    report.bad_op_shape.len(),
+                );
+            }
+            (_, Some(error)) => println!("fsck:   not run ({error})"),
+            _ => println!("fsck:   not run"),
+        }
+    }
+
+    Ok(if !storage_ok {
+        4
+    } else if !actor_ok {
+        3
+    } else {
+        0
+    })
+}
+
+fn fsck_report_json(report: &fsck::FsckReport) -> serde_json::Value {
+    let bad_hash_json: Vec<_> = report
+        .bad_hash
+        .iter()
+        .map(|(f, w, g)| serde_json::json!({"file": f, "expected": w, "got": g}))
+        .collect();
+    let bad_shape_json: Vec<_> = report
+        .bad_op_shape
+        .iter()
+        .map(|(f, e)| serde_json::json!({"file": f, "error": e}))
+        .collect();
+
+    serde_json::json!({
+        "ops_checked": report.ops_checked,
+        "bad_filename": report.bad_filename,
+        "bad_json": report.bad_json,
+        "bad_hash": bad_hash_json,
+        "bad_op_shape": bad_shape_json,
+        "tmp_total": report.tmp_total,
+        "tmp_cleaned": report.tmp_cleaned,
+    })
+}
+
 fn cmd_fsck(store_flag: Option<&Path>, json_mode: bool, clean_tmp: bool) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let report = fsck::run(&store, clean_tmp)?;
 
     if json_mode {
-        let bad_hash_json: Vec<_> = report
-            .bad_hash
-            .iter()
-            .map(|(f, w, g)| serde_json::json!({"file": f, "expected": w, "got": g}))
-            .collect();
-        let bad_shape_json: Vec<_> = report
-            .bad_op_shape
-            .iter()
-            .map(|(f, e)| serde_json::json!({"file": f, "error": e}))
-            .collect();
-        let v = serde_json::json!({
-            "ops_checked": report.ops_checked,
-            "bad_filename": report.bad_filename,
-            "bad_json": report.bad_json,
-            "bad_hash": bad_hash_json,
-            "bad_op_shape": bad_shape_json,
-            "tmp_total": report.tmp_total,
-            "tmp_cleaned": report.tmp_cleaned,
-        });
+        let v = fsck_report_json(&report);
         println!("{}", serde_json::to_string(&v)?);
     } else {
         println!("ops checked: {}", report.ops_checked);
@@ -1578,6 +1902,21 @@ fn cmd_fsck(store_flag: Option<&Path>, json_mode: bool, clean_tmp: bool) -> Mote
 
     Ok(if report.is_clean() { 0 } else { 4 })
 }
+
+/// Test-only race-window widener. In debug/test builds, sleeps `<env var>`
+/// milliseconds when the named env var is set. Used by integration tests to
+/// widen compound command read-modify-write windows.
+#[cfg(debug_assertions)]
+fn maybe_test_sleep(var: &str) {
+    if let Ok(s) = std::env::var(var) {
+        if let Ok(ms) = s.parse::<u64>() {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn maybe_test_sleep(_var: &str) {}
 
 fn open_store(override_path: Option<&Path>) -> MoteResult<Store> {
     if let Some(p) = override_path {

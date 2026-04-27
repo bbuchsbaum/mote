@@ -123,7 +123,10 @@ fn a6_msg_send_inbox_ack_round_trip() {
         "msg send failed: stderr={}",
         String::from_utf8_lossy(&send_out.stderr)
     );
-    let msg_id = String::from_utf8(send_out.stdout).unwrap().trim().to_string();
+    let msg_id = String::from_utf8(send_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     assert!(msg_id.starts_with("msg-"), "expected msg-... got {msg_id}");
 
     // bob inbox lists the message.
@@ -144,7 +147,10 @@ fn a6_msg_send_inbox_ack_round_trip() {
         .output()
         .unwrap();
     let sa = String::from_utf8(inbox_alice.stdout).unwrap();
-    assert!(!sa.contains(&msg_id), "alice should not see her own send: {sa}");
+    assert!(
+        !sa.contains(&msg_id),
+        "alice should not see her own send: {sa}"
+    );
 
     // self-ack by alice (the sender) must fail.
     let bad_ack = Command::new(bin)
@@ -271,10 +277,7 @@ fn claim_release_round_trip_via_cli() {
 
     let store = Store::open(&td.path().join(".mote")).unwrap();
     let state = reducer::replay_store(&store).unwrap();
-    let claim_state = state.beads[&id]
-        .claim
-        .as_ref()
-        .expect("must have claim");
+    let claim_state = state.beads[&id].claim.as_ref().expect("must have claim");
     assert_eq!(claim_state.claimed_by, "bob");
 }
 
@@ -305,7 +308,10 @@ fn ready_excludes_foreign_claimed() {
         .ready_beads_for("bob", &now)
         .map(|b| b.id.as_str())
         .collect();
-    assert!(!bob_ready.contains(&id.as_str()), "bob should not see foreign-claimed bead");
+    assert!(
+        !bob_ready.contains(&id.as_str()),
+        "bob should not see foreign-claimed bead"
+    );
 
     // ready_beads_for("alice", now) still includes it (her own claim).
     let alice_ready: Vec<&str> = state

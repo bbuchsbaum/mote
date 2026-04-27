@@ -102,10 +102,7 @@ mod tests {
     #[test]
     fn nested_objects_and_arrays() {
         let v = json!({"z": {"y": 1, "x": 2}, "a": [3, 2, 1]});
-        assert_eq!(
-            encode(&v),
-            br#"{"a":[3,2,1],"z":{"x":2,"y":1}}"#
-        );
+        assert_eq!(encode(&v), br#"{"a":[3,2,1],"z":{"x":2,"y":1}}"#);
     }
 
     #[test]
@@ -142,10 +139,8 @@ mod tests {
 
     #[test]
     fn round_trip_is_idempotent() {
-        let v: Value = serde_json::from_str(
-            r#"{"b":1,"a":[2,3,{"d":4,"c":5}],"s":"x\ty"}"#,
-        )
-        .unwrap();
+        let v: Value =
+            serde_json::from_str(r#"{"b":1,"a":[2,3,{"d":4,"c":5}],"s":"x\ty"}"#).unwrap();
         let bytes = encode(&v);
         let v2: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(encode(&v2), bytes);

@@ -43,12 +43,7 @@ fn a1_concurrent_creates_via_processes() {
         let dir = td.path().to_path_buf();
         handles.push(thread::spawn(move || -> String {
             let out = Command::new(bin)
-                .args([
-                    "new",
-                    &format!("title-{i}"),
-                    "--actor",
-                    &format!("a{i}"),
-                ])
+                .args(["new", &format!("title-{i}"), "--actor", &format!("a{i}")])
                 .current_dir(&dir)
                 .output()
                 .unwrap();
@@ -64,11 +59,21 @@ fn a1_concurrent_creates_via_processes() {
     let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
     let unique: HashSet<&String> = ids.iter().collect();
-    assert_eq!(unique.len(), 20, "expected 20 unique bead ids, got {}", unique.len());
+    assert_eq!(
+        unique.len(),
+        20,
+        "expected 20 unique bead ids, got {}",
+        unique.len()
+    );
 
     let store = Store::open(&td.path().join(".mote")).unwrap();
     let op_files = store.list_op_filenames().unwrap();
-    assert_eq!(op_files.len(), 20, "expected 20 op files, got {}", op_files.len());
+    assert_eq!(
+        op_files.len(),
+        20,
+        "expected 20 op files, got {}",
+        op_files.len()
+    );
 
     let state = reducer::replay_store(&store).unwrap();
     assert_eq!(state.beads.len(), 20);
@@ -210,10 +215,7 @@ fn a9_history_include_rejected_via_cli() {
         .unwrap();
     assert!(out_full.status.success());
     let s_full = String::from_utf8(out_full.stdout).unwrap();
-    assert!(
-        s_full.contains("REJECT"),
-        "expected REJECT line:\n{s_full}"
-    );
+    assert!(s_full.contains("REJECT"), "expected REJECT line:\n{s_full}");
     assert!(
         s_full.contains("stale"),
         "expected 'stale' in reason:\n{s_full}"
@@ -238,7 +240,10 @@ fn cli_smoke_new_set_show_ls_close() {
         "stderr: {}",
         String::from_utf8_lossy(&new_out.stderr)
     );
-    let id = String::from_utf8(new_out.stdout).unwrap().trim().to_string();
+    let id = String::from_utf8(new_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     assert!(id.starts_with("bd-"));
 
     let set_out = Command::new(bin)
