@@ -144,24 +144,28 @@ If unresolved, mutating commands exit with code 3.
 - `3` — invalid command, validation error, or actor identity unresolved
 - `4` — repository / storage error
 
-## Build
-
-```sh
-cargo build --release
-target/release/mote --version
-```
-
-Requires Rust 1.85+ (edition 2024).
-
 ## Install / Update
 
-Install the current GitHub version directly:
+Requires macOS or Linux and Rust 1.85+ with `cargo` on your `PATH`.
+If `cargo` is not installed, install Rust first from <https://rustup.rs/>.
 
 ```sh
 cargo install --git https://github.com/bbuchsbaum/mote --locked
+mote --version
 ```
 
-Update an existing install:
+`cargo install` places binaries in `~/.cargo/bin` by default. If `mote` is not
+found after install, make sure `~/.cargo/bin` is on your `PATH`.
+
+First run inside a project:
+
+```sh
+mote init
+mote actor set alice
+mote doctor
+```
+
+Update an existing install later:
 
 ```sh
 cargo install --git https://github.com/bbuchsbaum/mote --force --locked
@@ -172,6 +176,17 @@ Install from a local checkout:
 ```sh
 cargo install --path . --locked
 ```
+
+## Build
+
+For development builds from a checkout:
+
+```sh
+cargo build --release
+target/release/mote --version
+```
+
+Requires Rust 1.85+ (edition 2024).
 
 ## Limitations (v0.2)
 
