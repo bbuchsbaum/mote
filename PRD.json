@@ -1,0 +1,484 @@
+{
+  "$schema_note": "Working PRD for the 'mote' issue+coordination tracker. Hand-edited; not bound to a JSON schema. Update this file (not tribal knowledge) when scope changes.",
+  "meta": {
+    "name": "mote",
+    "binary": "mote",
+    "version": "0.2.0-draft",
+    "language": "rust",
+    "edition": "2024",
+    "license_intent": "MIT or Apache-2.0",
+    "store_dir": ".mote",
+    "format_file": ".mote/FORMAT.json",
+    "format_schema_version": 1,
+    "tagline": "Immutable op-maildir for one developer plus a few local agents.",
+    "consolidates": ["mote_prd.md", "mote_coordination_addendum.md"],
+    "consolidates_note": "This file is the authoritative working spec. The two source documents are kept as historical design rationale; any conflict between them and this file resolves to this file."
+  },
+
+  "thesis": {
+    "what_we_are_solving": "Lightweight task + coordination tracking for a single workstation where one human and several local agents make tiny concurrent edits.",
+    "what_we_are_NOT_solving": "Distributed multi-writer task graphs, server-mode databases, federation, cross-machine sync, or anything Beads/Dolt aim at.",
+    "why_op_maildir": [
+      "Truth = create-only files. Writers never edit, truncate, or merge.",
+      "State = pure deterministic replay over filename-sorted ops.",
+      "Snapshots are disposable derived caches, never the source of truth.",
+      "Claims are TTL leases, not lock files.",
+      "Path coordination is advisory reservations, not real FS locks and not git skip-worktree."
+    ],
+    "what_we_avoid_by_construction": [
+      "embedded single-writer DB contention",
+      "external server/daemon lifecycle",
+      "lock files on the main path",
+      "manual stale-lock cleanup heuristics",
+      "multi-step write transactions that can deadlock against themselves",
+      "any mutable cache that matters for correctness",
+      "the core re-entering itself via hooks"
+    ]
+  },
+
+  "design_principles": [
+    "Create-only publication: every mutation is a brand-new file in tmp/ then link()-ed into ops/.",
+    "Per-field clocks beat whole-row versions: scalar conflicts are deterministic, unrelated edits never collide.",
+    "Sets and append-only logs over scalars wherever possible (tags, deps, notes, messages).",
+    "Tombstones over hard-delete: stable IDs are worth more than literal deletion.",
+    "Rejected ops are retained as part of the audit trail; conflicts are visible, not silent.",
+    "Compound CLI commands publish a sequence of independent atomic ops; the CLI is responsible for compensating publishes on partial failure.",
+    "No daemon, no background task, no hook re-entry, no mutable shared cache."
+  ],
+
+  "non_goals_v1": [
+    "Windows support (link() semantics + dir fsync portability).",
+    "Network filesystems / NFS (Maildir requires same local FS).",
+    "Cross-machine sync, federation, or replication.",
+    "Built-in git integration (commits, hooks, post-merge triggers).",
+    "Background snapshotting or compaction.",
+    "An always-on daemon or watcher process.",
+    "A query language beyond fixed CLI flags.",
+    "Git index manipulation, sparse-checkout flags, or automatic worktree creation.",
+    "Glob-style reservation paths (only exact-file or directory-prefix forms in v0.2).",
+    "Reservation `base_rev` capture (deferred to v0.3)."
+  ],
+
+  "platform": {
+    "os_v1": ["macOS", "Linux"],
+    "filesystem": "POSIX local FS only. Same FS for tmp/ and ops/ is required (link() across FS is undefined-to-failing).",
+    "min_rust_msrv": "1.85",
+    "external_deps_intent": [
+      "anyhow — error context for the CLI",
+      "blake3 — content hash for filename suffix",
+      "clap (derive) — CLI",
+      "jiff — UTC timestamps with microsecond precision",
+      "rand — random 4-hex suffix in op filenames",
+      "serde + serde_json — op (de)serialization",
+      "ulid — bead / reservation / message ids",
+      "tempfile (dev only) — integration tests"
+    ],
+    "in_tree": [
+      "Canonical JSON encoder (small RFC 8785-compatible subset; no external crate dependency)."
+    ]
+  },
+
+  "storage": {
+    "layout": {
+      ".mote/FORMAT.json": "schema/version + settings; written by `mote init`",
+      ".mote/tmp/": "Maildir-style staging; only `mote fsck --clean-tmp` removes stragglers",
+      ".mote/ops/": "immutable published ops, source of truth",
+      ".mote/local/": "convenience state (e.g. `actor` file). Not source of truth."
+    },
+    "format_json": {
+      "schema_version": 1,
+      "store_id": "<ULID, written at init>",
+      "created_at": "<RFC3339 UTC>",
+      "default_ttl_s": { "claim": 1800, "reservation": 3600 }
+    },
+    "write_protocol": [
+      "1. Build op struct; serialize to canonical JSON bytes.",
+      "2. Compute filename: <ts>-p<pid>-c<counter>-r<rand4>-h<hash6>.",
+      "3. Open .mote/tmp/<name>.json with O_CREAT|O_EXCL|O_WRONLY (mode 0600).",
+      "4. Write bytes; fsync(tmp_fd); close(tmp_fd).",
+      "5. link(.mote/tmp/<name>.json, .mote/ops/<name>.json). Errors on EEXIST -> hard fail (no silent overwrite).",
+      "6. Open .mote/ops/ as a directory; fsync(dir_fd); close(dir_fd). Required because fsync(file) does not durably commit the directory entry.",
+      "7. unlink(.mote/tmp/<name>.json). If unlink fails, log and continue: tmp/ debris is not a correctness issue."
+    ],
+    "op_naming": {
+      "format": "<UTC_ISO_microsec>-p<pid>-c<counter4hex>-r<rand4hex>-h<hash6hex>.json",
+      "example": "20260420T182455.124583Z-p4312-c0007-r7f3a-h6b9d0.json",
+      "fields": {
+        "timestamp": "UTC ISO-8601 basic compact form, microsecond precision, sortable lexicographically (e.g. 20260420T182455.124583Z)",
+        "pid": "process id, decimal, zero-padded to 4 chars min",
+        "counter": "per-process monotonic counter starting at 0 each process; 4 hex chars",
+        "rand": "4 hex chars from a CSPRNG",
+        "hash": "first 6 hex chars (3 BLAKE3 bytes) over the canonical JSON of the op WITH the `op` field set to the empty string. Computable before being embedded; verifier recomputes identically."
+      },
+      "op_id": "the filename without the .json suffix"
+    },
+    "canonical_json": "Sorted keys (lexicographic by UTF-16 code units, equivalent to byte order for ASCII keys), no insignificant whitespace, UTF-8 output. Implementation lives in-tree; we only emit booleans, integers, strings, arrays, and objects, so the full RFC 8785 number-canonicalization rules are not exercised.",
+    "ids": {
+      "bead_id": "bd-<ULID>  e.g. bd-01JXYZABCDEFGHJKMNPQRSTVWX",
+      "reservation_id": "rv-<ULID>  e.g. rv-01JV5YQ4P0QF5X1W1Y6T2V8H9A",
+      "msg_id": "msg-<ULID>  e.g. msg-01JV6ZR5Q1RG6Y2X2Z7U3W9JBC",
+      "actor": "Free-form short string, e.g. 'claude-fixer' or 'bbuchsbaum'. Resolved in this exact order: 1) --actor CLI flag, 2) MOTE_ACTOR env var, 3) .mote/local/actor file. No FORMAT.json fallback. No global config file in v1. If unresolved, mutating commands exit with code 3."
+    },
+    "reading_state_v1": "Scan .mote/ops/ once, sort filenames lexicographically, replay deterministically into an in-memory state struct. No snapshots, no inotify."
+  },
+
+  "data_model": {
+    "bead": {
+      "scalar_fields_with_clocks": ["title", "status", "priority", "body", "assignee"],
+      "set_fields": ["tags", "deps"],
+      "append_only": ["notes", "incoming_msgs"],
+      "tombstone": "deleted_at (set by `delete` op)"
+    },
+    "field_kinds": {
+      "title":    { "type": "string", "required_at_create": true },
+      "status":   { "type": "enum",   "values": ["open", "doing", "blocked", "review", "closed"], "default": "open" },
+      "priority": { "type": "int",    "values": [0, 1, 2, 3], "default": 2, "convention": "0 = highest" },
+      "body":     { "type": "string", "default": "", "rule": "Canonical summary only. Agent chatter belongs in notes, not body." },
+      "assignee": { "type": "string?", "rule": "Distinct from `claimed_by`. Assignee is intent (who should do it); claim is current TTL lease." },
+      "tags":     { "type": "set<string>" },
+      "deps":     { "type": "set<bead_id, kind=blocks>", "rule": "Cycles are accepted but `ready` won't fire on a node in a cycle of open beads." }
+    },
+    "derived_state_per_bead": {
+      "_clock": "{ field_name -> op_id_of_last_accepted_writer }",
+      "claim":  "{ claimed_by, claim_clock, lease_until }",
+      "tombstone": "deleted_at | null"
+    }
+  },
+
+  "planes": {
+    "issue": {
+      "purpose": "Small mutable scalars + sets + append-only notes describing each bead.",
+      "ops": ["create", "patch", "tag_add", "tag_remove", "dep_add", "dep_remove", "note", "close", "delete"]
+    },
+    "path": {
+      "purpose": "Advisory TTL-bounded reservations over repo-relative paths so agents do not stomp each other's edits.",
+      "ops": ["reserve_open", "reserve_close"],
+      "modes_v0_2": ["exclusive"],
+      "path_forms_v0_2": ["exact file path", "directory prefix (trailing slash)"],
+      "normalization_rules": [
+        "Repo-relative only; absolute paths are rejected.",
+        "No `..` components; reject the op outright.",
+        "Use `/` as the separator internally regardless of host OS.",
+        "Trailing slash means directory prefix.",
+        "No symlink resolution; treat paths as lexical strings.",
+        "No globs in v0.2."
+      ],
+      "overlap_rule": "Two paths overlap iff one is a prefix of the other under directory-component semantics. 'src/auth/' overlaps 'src/auth/token.rs' and 'src/auth/'; 'src/auth/' does NOT overlap 'src/authn/'.",
+      "compound_paths_in_one_op": "If a single reserve_open lists both an exact file and a containing directory, treat both atoms as one logical reservation: all atoms must be free at op ts; otherwise the whole op is rejected.",
+      "boundary_with_git": "Reservations are advisory; agents are expected to honor them. They are NOT real FS locks and NOT git skip-worktree (which is documented as for sparse checkout and may be overwritten on merge/rebase). For genuine HEAD/index isolation, use a git worktree — that boundary is intentional and out of scope for mote."
+    },
+    "message": {
+      "purpose": "Tiny direct agent-to-agent messages with a single-step ack, forming a per-actor inbox.",
+      "ops": ["msg_send", "msg_ack"]
+    }
+  },
+
+  "op_envelope": {
+    "v": "schema version (currently 1)",
+    "op": "op id (string equal to the filename without .json)",
+    "ts": "RFC3339 UTC timestamp with microsecond precision; MUST equal the timestamp embedded in the filename",
+    "actor": "the actor publishing this op",
+    "kind": "one of: create | patch | tag_add | tag_remove | dep_add | dep_remove | note | claim | release | close | delete | reserve_open | reserve_close | msg_send | msg_ack"
+  },
+
+  "op_kinds": {
+    "create": {
+      "fields": {
+        "entity": "bd-<ULID>",
+        "set":    "{ title, status?, priority?, body?, assignee? }  (scalars only; tags/deps go through tag_add/dep_add)"
+      },
+      "reducer": "Accepted iff no prior accepted `create` exists for entity. On accept, every set field's clock becomes this op id.",
+      "example": {
+        "v": 1,
+        "op": "20260420T182455.124583Z-p4312-c0001-r7f3a-h6b9d0",
+        "ts": "2026-04-20T18:24:55.124583Z",
+        "actor": "claude-plan",
+        "kind": "create",
+        "entity": "bd-01JXYZABCDEFGHJKMNPQRSTVWX",
+        "set": { "title": "Fix auth bug", "status": "open", "priority": 1 }
+      }
+    },
+    "patch": {
+      "fields": {
+        "entity": "bd-<ULID>",
+        "expect": "{ field_name -> expected current clock op_id, or null for never-written }",
+        "set":    "{ field_name -> new value }  (scalar fields only)"
+      },
+      "reducer": "Scalar-only patch. Accepted iff for every field f in `expect`, current `_clock[f] == expect[f]`. On accept: each field in `set` updates its clock to this op id.",
+      "rejection": "If any expect mismatches, the entire op is rejected and recorded as a rejected intent. No partial application.",
+      "example": {
+        "v": 1,
+        "op": "20260420T182601.000777Z-p4312-c0002-r7f3b-h91aa2",
+        "ts": "2026-04-20T18:26:01.000777Z",
+        "actor": "claude-fixer",
+        "kind": "patch",
+        "entity": "bd-01JXYZABCDEFGHJKMNPQRSTVWX",
+        "expect": { "status": "20260420T182455.124583Z-p4312-c0001-r7f3a-h6b9d0" },
+        "set": { "status": "doing" }
+      }
+    },
+    "tag_add": {
+      "fields": { "entity": "bd-<ULID>", "tag": "string" },
+      "reducer": "Idempotent. Accepted if entity exists and is not deleted. Adds tag to the bead's tag set."
+    },
+    "tag_remove": {
+      "fields": { "entity": "bd-<ULID>", "tag": "string" },
+      "reducer": "Idempotent. Accepted if entity exists and is not deleted. Removes tag from the bead's tag set; no-op if absent."
+    },
+    "dep_add": {
+      "fields": { "entity": "bd-<ULID>  (child)", "parent": "bd-<ULID>", "dep_kind": "string  (default 'blocks'). Named `dep_kind` (not `kind`) so it does not collide with the envelope's `kind` tag." },
+      "reducer": "Idempotent. Accepted if both entities exist and are not deleted; rejected if entity == parent (self-dependency)."
+    },
+    "dep_remove": {
+      "fields": { "entity": "bd-<ULID>  (child)", "parent": "bd-<ULID>", "dep_kind": "string  (default 'blocks')" },
+      "reducer": "Idempotent. Accepted if both entities exist; no-op if the edge is absent."
+    },
+    "note": {
+      "fields": {
+        "entity":   "bd-<ULID>",
+        "note_kind": "note | progress | decision | handoff | blocker",
+        "text":     "free-form string, UTF-8"
+      },
+      "reducer": "Always accepted if the target entity exists. Append-only. Notes carry no `expect` field — they are intentionally low-friction.",
+      "rationale": "Splits 'progress chatter' off from `body` (a canonical summary), so multiple agents can leave updates on one bead without text-merge conflicts."
+    },
+    "close": {
+      "fields": {
+        "entity":   "bd-<ULID>",
+        "expect":   "{ status?: op_id }  optional; if present, current `_clock.status` must match"
+      },
+      "reducer": "Sets status = 'closed' and updates _clock.status to this op id. If `expect.status` is provided and mismatches current clock, rejected. Closing an already-closed bead is a no-op success."
+    },
+    "delete": {
+      "fields": { "entity": "bd-<ULID>" },
+      "reducer": "Accepted iff entity exists and is not already deleted. Sets deleted_at = this op's ts. Bead is hidden from `ls`/`show` defaults; `history` still includes it."
+    },
+    "claim": {
+      "fields": {
+        "entity":       "bd-<ULID>",
+        "to":           "actor receiving the claim (often == op.actor on first claim, or new actor on handoff)",
+        "ttl_s":        "integer seconds; defaults to FORMAT.json default_ttl_s.claim",
+        "expect_claim": "optional op_id of expected current claim_clock"
+      },
+      "reducer": "Accepted iff (current claim is absent or expired by this op's ts) OR `expect_claim` == current claim_clock. On accept: claim_clock = this op id, claimed_by = `to`, lease_until = this.ts + ttl_s."
+    },
+    "release": {
+      "fields": {
+        "entity":       "bd-<ULID>",
+        "expect_claim": "optional op_id of expected current claim_clock"
+      },
+      "reducer": "Accepted iff op.actor == current claimed_by OR `expect_claim` == current claim_clock. On accept: claim cleared, claim_clock advanced to this op id."
+    },
+    "reserve_open": {
+      "fields": {
+        "reservation_id": "rv-<ULID>  (assigned by the publisher)",
+        "entity":         "bd-<ULID>  (the issue this reservation supports; required)",
+        "paths":          "[repo-relative path strings]; trailing slash means directory; subject to normalization rules in planes.path",
+        "ttl_s":          "integer seconds; defaults to FORMAT.json default_ttl_s.reservation",
+        "mode":           "v0.2: must be 'exclusive'"
+      },
+      "reducer": "All-or-nothing. Accepted iff no live reservation by a different actor overlaps any listed path at this op's ts. A live reservation is one whose lease_until = open_op.ts + ttl_s has not been exceeded by this op's ts AND which has not been closed by a later reserve_close referencing the same reservation_id.",
+      "rejection": "If any path conflicts, the whole op is rejected; no partial reservation is opened."
+    },
+    "reserve_close": {
+      "fields": {
+        "reservation_id": "rv-<ULID> of the reserve_open being closed",
+        "paths":          "optional [path]; default = all paths in the referenced reservation"
+      },
+      "reducer": "Accepted iff the referenced reservation exists and op.actor == owner. Idempotent for already-closed paths."
+    },
+    "msg_send": {
+      "fields": {
+        "msg_id":      "msg-<ULID>",
+        "to":          "actor receiving the message",
+        "entity":      "optional bd-<ULID>; messages may be issue-scoped",
+        "reservation": "optional rv-<ULID>; messages may reference a reservation",
+        "msg_kind":    "note | request | handoff | blocked | fyi",
+        "body":        "free-form UTF-8"
+      },
+      "reducer": "Always accepted if schema-valid. Self-send (to == actor) is allowed but discouraged."
+    },
+    "msg_ack": {
+      "fields": { "msg_id": "msg-<ULID> of the msg_send" },
+      "reducer": "Accepted iff op.actor == referenced msg_send.to AND no prior msg_ack from op.actor for this msg_id. Self-ack of one's own send is rejected."
+    }
+  },
+
+  "reducer": {
+    "ordering": "Strict lexicographic order of filenames in .mote/ops/. Filenames are designed to sort to the same order as wall-clock publication.",
+    "determinism": "Two replays over the same set of files MUST produce identical state. No randomness, no clock reads during replay.",
+    "rejection_handling": "Rejected ops remain in .mote/ops/. The reducer records the reason. `mote history --include-rejected` exposes them. The CLI command that published the op exits 2.",
+    "snapshots_v0_3_plus": "If profiling later demands it, snapshots may be written to .mote/snap/<frontier-op-id>.json. They are derived caches: any inconsistency is resolved by deleting the snapshot and replaying. Never authoritative. Not in v0.2."
+  },
+
+  "concurrency_model": {
+    "scalar_field_clocks": "Each scalar field carries an op_id of its last accepted writer. A `patch` must declare expectations matching current clocks for every field it sets. Two patches to disjoint fields both succeed.",
+    "set_fields": "tag_add/tag_remove/dep_add/dep_remove are commutative and idempotent. No clocks needed.",
+    "append_only": "Notes and msg_send ops never conflict. msg_ack is a one-shot per (recipient, msg_id).",
+    "claim_leases": "TTL-bounded; expired leases auto-yield to the next claim. Stale agents do not leave permanent locks.",
+    "path_reservations": "TTL-bounded advisory leases. Overlap rule prevents two actors from believing they own the same code area. v0.2 supports only `exclusive` mode. Honor is voluntary by convention; a non-cooperating writer is out of scope."
+  },
+
+  "module_layout": {
+    "src/main.rs": "binary entry; argv parsing dispatch only",
+    "src/cli.rs":  "clap derive types; subcommand definitions",
+    "src/repo.rs": "Store discovery, init, FORMAT.json read/write",
+    "src/op.rs":   "typed op envelope + per-kind structs + serde",
+    "src/ids.rs":  "bead/reservation/message id helpers; op_name format/parse",
+    "src/publish.rs": "tmp write + sync + hardlink publish + dir fsync",
+    "src/reducer.rs": "replay rules: accept/reject decisions per op kind",
+    "src/state.rs":   "derived bead/reservation/inbox state",
+    "src/query.rs":   "ls / show / ready / history / inbox / who-has / board",
+    "src/fsck.rs":    "filename + hash + JSON validation; tmp/ cleanup",
+    "src/errors.rs":  "anyhow::Error context types",
+    "src/canonical.rs": "in-tree canonical-JSON encoder"
+  },
+
+  "cli": {
+    "global_flags": {
+      "--actor <s>":   "override actor identity for this invocation",
+      "--store <dir>": "override store path (default: walk up from cwd looking for .mote/)",
+      "--json":        "machine-readable output where applicable",
+      "--quiet":       "suppress non-essential stderr"
+    },
+    "commands": [
+      { "name": "init",      "synopsis": "mote init", "description": "Create .mote/ in the current dir if absent; write FORMAT.json; create tmp/, ops/, local/. Idempotent." },
+      { "name": "new",       "synopsis": "mote new \"<title>\" [-p N] [--body STR] [--tag T]... [--dep ID]...", "description": "Publish a `create` op (plus tag_add/dep_add ops for any --tag / --dep). Prints the new bd-id." },
+      { "name": "set",       "synopsis": "mote set <id> field=value...", "description": "Publish a scalar `patch` op. expect clocks are taken from the current replayed state at command time. Multiple field=value pairs allowed; all packed into one op. Exit 2 on conflict." },
+      { "name": "show",      "synopsis": "mote show <id>", "description": "Render full bead state (scalars + tags + deps + notes + claim + active reservations)." },
+      { "name": "ls",        "synopsis": "mote ls [--ready] [--status=...] [--mine] [--tag=T] [--actor=A]", "description": "List beads. Default: open beads. `--ready` is equivalent to `mote ready`." },
+      { "name": "ready",     "synopsis": "mote ready", "description": "List beads that are open + have no open blocking deps + are not currently claimed by another actor." },
+      { "name": "history",   "synopsis": "mote history <id> [--include-rejected]", "description": "Print all ops touching this entity in filename order. Default omits rejected ops; `--include-rejected` includes them with their rejection reason." },
+      { "name": "dep",       "synopsis": "mote dep add|rm <child> <parent> [--kind blocks]", "description": "Manage deps. Publishes one `dep_add` or `dep_remove` op." },
+      { "name": "tag",       "synopsis": "mote tag add|rm <id> <tag>", "description": "Manage tags. Publishes one `tag_add` or `tag_remove` op." },
+      { "name": "note",      "synopsis": "mote note <id> --kind <note_kind> \"<text>\"", "description": "Append-only note. note_kind in: note | progress | decision | handoff | blocker." },
+      { "name": "close",     "synopsis": "mote close <id>", "description": "Publish a `close` op. Sets status=closed. Idempotent." },
+      { "name": "claim",     "synopsis": "mote claim <id> [--by actor] [--ttl s]", "description": "Publish a `claim` op." },
+      { "name": "release",   "synopsis": "mote release <id>", "description": "Publish a `release` op." },
+      { "name": "reserve",   "synopsis": "mote reserve <path>... --issue <id> [--ttl s]", "description": "Publish a `reserve_open` op. Exit 2 on overlap." },
+      { "name": "unreserve", "synopsis": "mote unreserve <rv-id> [--paths <p>...]", "description": "Publish a `reserve_close` op." },
+      { "name": "preflight", "synopsis": "mote preflight --issue <id> --paths <p>...", "description": "Dry run. Reports any reservation overlaps. Exit 0 if free, exit 2 if any conflict." },
+      { "name": "begin",     "synopsis": "mote begin <id> --paths <p>... [--note STR] [--ttl s]", "description": "Compound: publishes `reserve_open`, then `claim`, then optional `note`. On reserve_open conflict: exit 2 immediately, no further ops. On claim conflict after reservation: emit compensating `reserve_close` and exit 2." },
+      { "name": "handoff",   "synopsis": "mote handoff <id> --to <actor> [--note STR] [--release]", "description": "Compound: publishes a handoff `note`, then a reassigning `claim` to <actor>, then `reserve_close` for current actor's reservations on the issue (only if --release)." },
+      { "name": "done",      "synopsis": "mote done <id> [--note STR]", "description": "Compound: publishes a completion `note` (note_kind=note), `close`, then `reserve_close` for current actor's reservations on the issue, then `release` of any current claim by this actor." },
+      { "name": "inbox",     "synopsis": "mote inbox [--issue ID] [--from ACTOR] [--kind K]", "description": "List msg_send ops with to == self.actor and no msg_ack from self." },
+      { "name": "msg",       "synopsis": "mote msg send --to <actor> [--issue ID] [--reservation RV] [--kind K] \"<text>\"  |  mote msg ack <msg-id>", "description": "Publish a `msg_send` or `msg_ack` op." },
+      { "name": "who-has",   "synopsis": "mote who-has <path>", "description": "List live reservations whose paths overlap <path>." },
+      { "name": "board",     "synopsis": "mote board", "description": "Compact overview: counts by status, current claims, current reservations, recent notes, unread inbox count." },
+      { "name": "fsck",      "synopsis": "mote fsck [--clean-tmp]", "description": "Verify filename hash suffixes and (with --clean-tmp) remove stragglers from .mote/tmp/. Does NOT heal locks; does NOT alter ops/." }
+    ],
+    "exit_codes": {
+      "0": "success / op accepted",
+      "1": "internal failure",
+      "2": "op rejected by reducer (stale, overlap, already-acked, etc.)",
+      "3": "invalid command, validation error, or actor identity unresolved",
+      "4": "repository / storage error"
+    }
+  },
+
+  "fsck": {
+    "v1_scope": [
+      "Verify each filename's hash suffix matches BLAKE3-6 of the canonical JSON of the op (with `op` field temporarily blanked).",
+      "With --clean-tmp: remove .mote/tmp/ entries older than 1h.",
+      "Report any filename that does not parse against the op_naming format.",
+      "Report any duplicate op_ids in ops/ (should be impossible if link()-with-EEXIST contract holds, but verify)."
+    ],
+    "explicitly_out_of_scope": [
+      "Lock healing of any kind.",
+      "Heuristic 'is this stale file safe to delete' on ops/ (NEVER delete published ops).",
+      "Re-deriving snapshots (handled separately if/when snapshots ship)."
+    ]
+  },
+
+  "git_boundary": {
+    "stance": "mote stays out of git. Mote files (.mote/) MAY be committed, but mote does not run git, install hooks, or read git state.",
+    "worktree_advice": "When two agents truly need separate HEAD/index, use `git worktree add`. That is the right escape hatch. mote's path reservations are for in-place collaboration on a single working tree.",
+    "not_used_for_coordination": ["git skip-worktree", "git assume-unchanged", "git hooks", "git lfs locks"],
+    "deferred_to_v0_3": ["reservation `base_rev` capture", "read-only `git diff --name-only` integration in queries", "branch / HEAD display in diagnostics"]
+  },
+
+  "implementation_plan": {
+    "milestones": [
+      {
+        "id": "M1",
+        "name": "Storage primitives",
+        "deliverables": [
+          "Walk-up `.mote/` discovery; `mote init` writes FORMAT.json and creates tmp/, ops/, local/.",
+          "Canonical JSON encoder (in-tree).",
+          "Op naming + parse + filename comparator (with 6-hex content hash).",
+          "publish_op(): O_CREAT|O_EXCL on tmp, fsync(file), link to ops, fsync(dir), unlink(tmp).",
+          "Replay loop: read dir, sort, deserialize.",
+          "Hash verification for fsck."
+        ],
+        "exit_criteria": "Acceptance test A3 passes. Unit tests cover canonical JSON, op naming round-trip, store discovery. Crash-injection harness in tests/ shows no half-published op surfaces in ops/."
+      },
+      {
+        "id": "M2",
+        "name": "Issue plane — scalars, tags, deps",
+        "deliverables": [
+          "Op kinds: create, patch, tag_add, tag_remove, dep_add, dep_remove, close, delete.",
+          "Reducer with per-field clocks.",
+          "CLI: init, new, set, show, ls, history, dep, tag, close, fsck."
+        ],
+        "exit_criteria": "Acceptance tests A1, A2, A9 pass."
+      },
+      {
+        "id": "M3",
+        "name": "Issue plane — notes & ready",
+        "deliverables": [
+          "note op + reducer.",
+          "ready computation (open + no open blockers + not foreign-claimed).",
+          "CLI: note, ready (and `ls --ready` alias)."
+        ],
+        "exit_criteria": "Acceptance test A8 passes; ready returns the expected frontier on a hand-built dep graph."
+      },
+      {
+        "id": "M4",
+        "name": "Claims & messages",
+        "deliverables": [
+          "claim, release, msg_send, msg_ack ops + reducers.",
+          "CLI: claim, release, msg send, msg ack, inbox."
+        ],
+        "exit_criteria": "Acceptance tests A5, A6 pass."
+      },
+      {
+        "id": "M5",
+        "name": "Path plane (coordination layer)",
+        "deliverables": [
+          "Path overlap helper with prefix-component semantics + normalization rules.",
+          "reserve_open, reserve_close ops + reducer with all-or-nothing accept.",
+          "Compound CLI: preflight, begin, handoff, done with compensating reserve_close.",
+          "Query CLI: who-has, board, reserve, unreserve."
+        ],
+        "exit_criteria": "Acceptance tests A4, A7 pass; compound-failure behavior documented and tested."
+      },
+      {
+        "id": "M6",
+        "name": "Polish & robustness",
+        "deliverables": [
+          "fsck full surface, JSON output mode (--json), better diagnostics on rejection (which field clock mismatched, which path overlapped).",
+          "README + man-page-style docs for each command."
+        ],
+        "exit_criteria": "Acceptance test A10 passes; manual end-to-end script covering all CLI commands runs clean."
+      }
+    ],
+    "acceptance_tests": [
+      { "id": "A1",  "name": "Concurrent creates",       "spec": "Spawn 20 processes that each `mote new`. All 20 succeed; .mote/ops/ contains 20 distinct create ops with 20 distinct bead ids; replay produces 20 beads.", "source_alignment": ["mote_prd.md §27.1", "mote_prd.md §28 integration: concurrent create"] },
+      { "id": "A2",  "name": "Same-field race",          "spec": "From identical observed state, two processes race `mote set <id> status=doing`. Exactly one exits 0; the other exits 2 with a clock-mismatch reason. Both ops persist in ops/. Replay shows only one accepted patch.", "source_alignment": ["mote_prd.md §27.2", "mote_prd.md §28 integration: concurrent patch on same field"] },
+      { "id": "A3",  "name": "Crash before publish",     "spec": "SIGKILL a writer between fsync(tmp) and link(). On restart, ops/ contains no new file; tmp/ contains the orphan; `mote fsck --clean-tmp` removes it.", "source_alignment": ["mote_prd.md §27.4", "mote_prd.md §28 integration: crash-like interruption"] },
+      { "id": "A4",  "name": "Reservation overlap",      "spec": "Two agents race `mote begin` on overlapping paths (e.g. src/auth/ vs src/auth/token.rs). Exactly one succeeds; the other exits 2 with overlap report. The losing agent emits no claim.", "source_alignment": ["addendum §15.2", "addendum §15.4"] },
+      { "id": "A5",  "name": "Claim lease expiry",       "spec": "Agent A claims with ttl=1. After 2s of wall-clock, agent B claims and succeeds.", "source_alignment": ["mote_prd.md §27 UX: claim expires naturally", "addendum §15.5"] },
+      { "id": "A6",  "name": "Inbox round-trip",         "spec": "alice msg_send to bob; bob inbox lists it; bob ack; bob inbox is empty; alice's history shows the msg + ack.", "source_alignment": ["addendum §15.6", "addendum §15.7"] },
+      { "id": "A7",  "name": "Path overlap correctness", "spec": "Reserving src/auth/ blocks src/auth/token.rs and src/auth/ but does NOT block src/authn/ or src/authentication/.", "source_alignment": ["addendum §5.4", "addendum §15.1"] },
+      { "id": "A8",  "name": "Notes never conflict",     "spec": "5 concurrent `mote note` calls on the same bead. All 5 succeed; replay shows all 5 in filename order.", "source_alignment": ["addendum §15.8", "addendum §11.4"] },
+      { "id": "A9",  "name": "Rejected intents visible", "spec": "`mote history <id> --include-rejected` lists the rejected patch from A2 with a structured reason.", "source_alignment": ["mote_prd.md §27 UX: history shows accepted vs rejected"] },
+      { "id": "A10", "name": "Replay determinism",       "spec": "Given a fixed ops/ directory, two independent replays produce byte-identical state representations.", "source_alignment": ["mote_prd.md §27.5"] }
+    ]
+  },
+
+  "open_questions": [
+    { "id": "Q1", "q": "Default `mote ls` behavior: 'all open' or '--ready'?", "default_pending_answer": "all open; --ready is opt-in and `mote ready` is the canonical alias" },
+    { "id": "Q2", "q": "Default `mote history` includes rejected ops?", "default_pending_answer": "no; --include-rejected to opt in" },
+    { "id": "Q3", "q": "Should `mote begin` auto-extend a same-actor existing claim, or require explicit release first?", "default_pending_answer": "auto-extend if same actor; fail if a different actor still holds a live lease" }
+  ]
+}

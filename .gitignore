@@ -1,0 +1,5 @@
+target/
+.mote/
+.omc/
+.DS_Store
+*.swp
