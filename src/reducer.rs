@@ -7,9 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::op::{
-    ClaimOp, CloseOp, CreateOp, DeleteOp, DepOp, MsgAckOp, MsgSendOp, NoteOp, Op, PatchOp,
-    ReleaseOp, ReserveCloseOp, ReserveOpenOp, ScalarSet, Status, TagOp, validate_msg_kind,
-    validate_note_kind,
+    BoardPostOp, BoardReadOp, BoardStickyOp, BoardTopicOp, ClaimOp, CloseOp, CreateOp, DeleteOp,
+    DepOp, MsgAckOp, MsgSendOp, NoteOp, Op, PatchOp, ReleaseOp, ReserveCloseOp, ReserveOpenOp,
+    ScalarSet, Status, TagOp, validate_msg_kind, validate_note_kind,
 };
 use crate::repo::Store;
 use crate::state::{Bead, HistoryEntry, State};
@@ -107,6 +107,10 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
         Op::Release(o) => apply_release(state, op_id, kind, &actor, &ts, o),
         Op::MsgSend(o) => apply_msg_send(state, op_id, kind, &actor, &ts, o),
         Op::MsgAck(o) => apply_msg_ack(state, op_id, kind, &actor, &ts, o),
+        Op::BoardPost(o) => apply_board_post(state, op_id, kind, &actor, &ts, o),
+        Op::BoardRead(o) => apply_board_read(state, op_id, kind, &actor, &ts, o),
+        Op::BoardTopic(o) => apply_board_topic(state, op_id, kind, &actor, &ts, o),
+        Op::BoardSticky(o) => apply_board_sticky(state, op_id, kind, &actor, &ts, o),
         Op::ReserveOpen(o) => apply_reserve_open(state, op_id, kind, &actor, &ts, o),
         Op::ReserveClose(o) => apply_reserve_close(state, op_id, kind, &actor, &ts, o),
     }
@@ -859,6 +863,298 @@ fn apply_msg_ack(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
         bind_entity.as_deref(),
         HistoryEntry::accepted(op_id, kind, actor, ts),
     );
+}
+
+fn reject_orphan(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    reason: String,
+) {
+    state.push_history(None, HistoryEntry::rejected(op_id, kind, actor, ts, reason));
+}
+
+fn apply_board_post(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: BoardPostOp,
+) {
+    let BoardPostOp {
+        post_id,
+        topic,
+        body,
+        reply_to,
+        ..
+    } = o;
+
+    if state.board_posts.contains_key(&post_id) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("duplicate post_id {post_id}"),
+        );
+        return;
+    }
+    if topic.trim().is_empty() {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "board post topic must be non-empty".into(),
+        );
+        return;
+    }
+    if body.trim().is_empty() {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "board post body must be non-empty".into(),
+        );
+        return;
+    }
+    if let Some(parent) = reply_to.as_deref() {
+        if !state.board_posts.contains_key(parent) {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("reply_to post {parent} does not exist"),
+            );
+            return;
+        }
+    }
+
+    ensure_topic(state, &topic, actor, ts, op_id);
+    if let Some(topic_record) = state.board_topics.get_mut(&topic) {
+        topic_record.post_count += 1;
+        topic_record.last_activity_ts = ts.to_string();
+        topic_record.last_activity_op_id = op_id.to_string();
+    }
+
+    state.board_posts.insert(
+        post_id.clone(),
+        crate::state::BoardPostRecord {
+            post_id,
+            from: actor.to_string(),
+            topic,
+            body,
+            reply_to,
+            sticky: false,
+            sticky_op_id: None,
+            sent_ts: ts.to_string(),
+            sent_op_id: op_id.to_string(),
+        },
+    );
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_board_topic(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: BoardTopicOp,
+) {
+    let BoardTopicOp {
+        topic, title, body, ..
+    } = o;
+
+    if topic.trim().is_empty() {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "discussion topic must be non-empty".into(),
+        );
+        return;
+    }
+
+    match state.board_topics.get_mut(&topic) {
+        Some(existing) if existing.explicit => {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("discussion topic {topic} already exists"),
+            );
+            return;
+        }
+        Some(existing) => {
+            existing.explicit = true;
+            existing.title = title.unwrap_or_else(|| topic.clone());
+            existing.body = body.unwrap_or_default();
+            existing.created_by = actor.to_string();
+            existing.created_ts = ts.to_string();
+            existing.created_op_id = op_id.to_string();
+            existing.last_activity_ts = ts.to_string();
+            existing.last_activity_op_id = op_id.to_string();
+        }
+        None => {
+            state.board_topics.insert(
+                topic.clone(),
+                crate::state::BoardTopicRecord {
+                    topic: topic.clone(),
+                    title: title.unwrap_or_else(|| topic.clone()),
+                    body: body.unwrap_or_default(),
+                    created_by: actor.to_string(),
+                    created_ts: ts.to_string(),
+                    created_op_id: op_id.to_string(),
+                    explicit: true,
+                    last_activity_ts: ts.to_string(),
+                    last_activity_op_id: op_id.to_string(),
+                    post_count: 0,
+                    sticky_count: 0,
+                },
+            );
+        }
+    }
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_board_read(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: BoardReadOp,
+) {
+    let BoardReadOp {
+        upto_op_id, topic, ..
+    } = o;
+    let post_topic = match state
+        .board_posts
+        .values()
+        .find(|p| p.sent_op_id == upto_op_id)
+        .map(|p| p.topic.clone())
+    {
+        Some(t) => t,
+        None => {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("board_read references unknown board_post op {upto_op_id}"),
+            );
+            return;
+        }
+    };
+    if let Some(topic) = topic.as_deref() {
+        if topic != post_topic {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("board_read topic {topic} does not match post topic {post_topic}"),
+            );
+            return;
+        }
+    }
+
+    let cursor = if let Some(topic) = topic {
+        state
+            .board_topic_read_cursors
+            .entry((actor.to_string(), topic))
+            .or_default()
+    } else {
+        state
+            .board_read_cursors
+            .entry(actor.to_string())
+            .or_default()
+    };
+    if cursor.as_str() < upto_op_id.as_str() {
+        *cursor = upto_op_id;
+    }
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_board_sticky(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: BoardStickyOp,
+) {
+    let BoardStickyOp {
+        post_id, sticky, ..
+    } = o;
+
+    let topic = match state.board_posts.get(&post_id) {
+        Some(post) => post.topic.clone(),
+        None => {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("no such board post {post_id}"),
+            );
+            return;
+        }
+    };
+
+    let post = state.board_posts.get_mut(&post_id).expect("checked above");
+    if post.sticky != sticky {
+        post.sticky = sticky;
+        post.sticky_op_id = Some(op_id.to_string());
+        if let Some(topic_record) = state.board_topics.get_mut(&topic) {
+            if sticky {
+                topic_record.sticky_count += 1;
+            } else {
+                topic_record.sticky_count = topic_record.sticky_count.saturating_sub(1);
+            }
+        }
+    }
+    if let Some(topic_record) = state.board_topics.get_mut(&topic) {
+        topic_record.last_activity_ts = ts.to_string();
+        topic_record.last_activity_op_id = op_id.to_string();
+    }
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn ensure_topic(state: &mut State, topic: &str, actor: &str, ts: &str, op_id: &str) {
+    state
+        .board_topics
+        .entry(topic.to_string())
+        .or_insert_with(|| crate::state::BoardTopicRecord {
+            topic: topic.to_string(),
+            title: topic.to_string(),
+            body: String::new(),
+            created_by: actor.to_string(),
+            created_ts: ts.to_string(),
+            created_op_id: op_id.to_string(),
+            explicit: false,
+            last_activity_ts: ts.to_string(),
+            last_activity_op_id: op_id.to_string(),
+            post_count: 0,
+            sticky_count: 0,
+        });
 }
 
 fn apply_reserve_open(

@@ -21,12 +21,53 @@ pub fn new_bead_id() -> String {
     format!("bd-{}", Ulid::new())
 }
 
+/// Validate a user-supplied bead id (e.g. when migrating from another tracker
+/// via `mote new --id`). Mote-minted ids start with `bd-`; external ids must
+/// not, so the two namespaces stay distinguishable in op files and CLI output.
+///
+/// Rules:
+/// - 1..=64 chars
+/// - lowercase ascii alphanumerics, `-`, or `_`
+/// - first and last char must be alphanumeric
+/// - must NOT start with `bd-` (reserved for mote-minted ids)
+pub fn validate_external_bead_id(id: &str) -> MoteResult<()> {
+    if id.is_empty() {
+        return Err(MoteError::Invalid("--id must be non-empty".into()));
+    }
+    if id.len() > 64 {
+        return Err(MoteError::Invalid(format!("--id `{id}` exceeds 64 chars")));
+    }
+    if id.starts_with("bd-") {
+        return Err(MoteError::Invalid(
+            "--id `bd-...` prefix is reserved for mote-minted ids".into(),
+        ));
+    }
+    let bytes = id.as_bytes();
+    let is_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let is_body = |b: u8| is_alnum(b) || b == b'-' || b == b'_';
+    if !is_alnum(bytes[0]) || !is_alnum(bytes[bytes.len() - 1]) {
+        return Err(MoteError::Invalid(format!(
+            "--id `{id}` must start and end with [a-z0-9]"
+        )));
+    }
+    if !bytes.iter().all(|&b| is_body(b)) {
+        return Err(MoteError::Invalid(format!(
+            "--id `{id}` may only contain [a-z0-9_-]"
+        )));
+    }
+    Ok(())
+}
+
 pub fn new_reservation_id() -> String {
     format!("rv-{}", Ulid::new())
 }
 
 pub fn new_msg_id() -> String {
     format!("msg-{}", Ulid::new())
+}
+
+pub fn new_post_id() -> String {
+    format!("post-{}", Ulid::new())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -248,6 +289,55 @@ mod tests {
         assert!(new_bead_id().starts_with("bd-"));
         assert!(new_reservation_id().starts_with("rv-"));
         assert!(new_msg_id().starts_with("msg-"));
+        assert!(new_post_id().starts_with("post-"));
+    }
+
+    #[test]
+    fn validate_external_bead_id_accepts_typical_external_ids() {
+        for id in [
+            "psycloud-eqgu",
+            "abc",
+            "a",
+            "a1",
+            "issue_42",
+            "x-y-z",
+            "1abc",
+            "with_under_score",
+        ] {
+            assert!(
+                validate_external_bead_id(id).is_ok(),
+                "expected {id} to validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_external_bead_id_rejects_bad_inputs() {
+        for id in [
+            "",                  // empty
+            "bd-anything",       // reserved prefix
+            "-leading-hyphen",   // bad start
+            "trailing-hyphen-",  // bad end
+            "_underscore_start", // bad start
+            "Has-Capitals",      // uppercase
+            "spaces in id",      // space
+            "slash/in/id",       // slash
+            "dot.in.id",         // dot
+            "exclaim!",          // punctuation
+        ] {
+            assert!(
+                validate_external_bead_id(id).is_err(),
+                "expected {id:?} to fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_external_bead_id_rejects_too_long() {
+        let id = "a".repeat(65);
+        assert!(validate_external_bead_id(&id).is_err());
+        let ok = "a".repeat(64);
+        assert!(validate_external_bead_id(&ok).is_ok());
     }
 
     #[test]

@@ -70,7 +70,7 @@
       "jiff — UTC timestamps with microsecond precision",
       "rand — random 4-hex suffix in op filenames",
       "serde + serde_json — op (de)serialization",
-      "ulid — bead / reservation / message ids",
+      "ulid — bead / reservation / message / discussion-post ids",
       "tempfile (dev only) — integration tests"
     ],
     "in_tree": [
@@ -170,6 +170,10 @@
     "message": {
       "purpose": "Tiny direct agent-to-agent messages with a single-step ack, forming a per-actor inbox.",
       "ops": ["msg_send", "msg_ack"]
+    },
+    "discussion": {
+      "purpose": "Public cross-agent message board for strategy, coordination, and discussion that is not tied to issue lodging.",
+      "ops": ["board_topic", "board_post", "board_sticky", "board_read"]
     }
   },
 
@@ -178,7 +182,7 @@
     "op": "op id (string equal to the filename without .json)",
     "ts": "RFC3339 UTC timestamp with microsecond precision; MUST equal the timestamp embedded in the filename",
     "actor": "the actor publishing this op",
-    "kind": "one of: create | patch | tag_add | tag_remove | dep_add | dep_remove | note | claim | release | close | delete | reserve_open | reserve_close | msg_send | msg_ack"
+    "kind": "one of: create | patch | tag_add | tag_remove | dep_add | dep_remove | note | claim | release | close | delete | reserve_open | reserve_close | msg_send | msg_ack | board_topic | board_post | board_sticky | board_read"
   },
 
   "op_kinds": {
@@ -301,6 +305,37 @@
     "msg_ack": {
       "fields": { "msg_id": "msg-<ULID> of the msg_send" },
       "reducer": "Accepted iff op.actor == referenced msg_send.to AND no prior msg_ack from op.actor for this msg_id. Self-ack of one's own send is rejected."
+    },
+    "board_topic": {
+      "fields": {
+        "topic": "single-line topic identity",
+        "title": "optional display title; defaults to topic",
+        "body":  "optional topic description"
+      },
+      "reducer": "Accepted iff topic is non-empty and no explicit topic with the same identity already exists. A topic created implicitly by an earlier board_post may be upgraded to explicit."
+    },
+    "board_post": {
+      "fields": {
+        "post_id":  "post-<ULID>",
+        "topic":    "single-line topic string; default CLI topic is `general`",
+        "body":     "free-form UTF-8",
+        "reply_to": "optional post-<ULID> parent post id"
+      },
+      "reducer": "Append-only. Accepted iff post_id is unique, topic/body are non-empty, and reply_to (when present) references an already accepted board_post. If the topic does not exist, replay creates an implicit topic summary."
+    },
+    "board_sticky": {
+      "fields": {
+        "post_id": "post-<ULID>",
+        "sticky":  "boolean sticky state"
+      },
+      "reducer": "Accepted iff post_id references an accepted board_post. Sticky state is last-writer-wins in replay order; topic sticky_count and last_activity are updated from accepted sticky changes."
+    },
+    "board_read": {
+      "fields": {
+        "upto_op_id": "op id of an accepted board_post",
+        "topic":      "optional topic for a topic-scoped read cursor"
+      },
+      "reducer": "Accepted iff upto_op_id references an accepted board_post and, when topic is present, the referenced post belongs to that topic. On accept, advances op.actor's global or topic-scoped discussion read cursor monotonically. `discuss unread` lists accepted board_post ops newer than the applicable cursor, excluding the actor's own posts."
     }
   },
 
@@ -324,7 +359,7 @@
     "src/cli.rs":  "clap derive types; subcommand definitions",
     "src/repo.rs": "Store discovery, init, FORMAT.json read/write",
     "src/op.rs":   "typed op envelope + per-kind structs + serde",
-    "src/ids.rs":  "bead/reservation/message id helpers; op_name format/parse",
+    "src/ids.rs":  "bead/reservation/message/discussion-post id helpers; op_name format/parse",
     "src/publish.rs": "tmp write + sync + hardlink publish + dir fsync",
     "src/reducer.rs": "replay rules: accept/reject decisions per op kind",
     "src/state.rs":   "derived bead/reservation/inbox state",
@@ -363,6 +398,7 @@
       { "name": "done",      "synopsis": "mote done <id> [--note STR]", "description": "Compound: publishes a completion `note` (note_kind=note), `close`, then `reserve_close` for current actor's reservations on the issue, then `release` of any current claim by this actor." },
       { "name": "inbox",     "synopsis": "mote inbox [--issue ID] [--from ACTOR] [--kind K]", "description": "List msg_send ops with to == self.actor and no msg_ack from self." },
       { "name": "msg",       "synopsis": "mote msg send --to <actor> [--issue ID] [--reservation RV] [--kind K] \"<text>\"  |  mote msg ack <msg-id>", "description": "Publish a `msg_send` or `msg_ack` op." },
+      { "name": "discuss",   "synopsis": "mote discuss topic new <topic> [--title T] [--body B]  |  mote discuss post [--topic TOPIC] [--reply-to POST] \"<text>\"  |  mote discuss sticky|unsticky <post-id>  |  mote discuss list [--topic TOPIC] [--limit N]  |  mote discuss search <query> [--topic TOPIC] [--limit N]  |  mote discuss unread [--topic TOPIC] [--limit N]  |  mote discuss mark-read [--topic TOPIC]  |  mote discuss replies <post-id>  |  mote discuss thread <post-id>  |  mote discuss topics", "description": "Publish and read public cross-agent message-board topics, posts, sticky state, replies, thread views, search results, activity summaries, and per-actor unread state." },
       { "name": "who-has",   "synopsis": "mote who-has <path>", "description": "List live reservations whose paths overlap <path>." },
       { "name": "board",     "synopsis": "mote board", "description": "Compact overview: counts by status, current claims, current reservations, recent notes, unread inbox count." },
       { "name": "fsck",      "synopsis": "mote fsck [--clean-tmp]", "description": "Verify filename hash suffixes and (with --clean-tmp) remove stragglers from .mote/tmp/. Does NOT heal locks; does NOT alter ops/." }
@@ -472,7 +508,11 @@
       { "id": "A7",  "name": "Path overlap correctness", "spec": "Reserving src/auth/ blocks src/auth/token.rs and src/auth/ but does NOT block src/authn/ or src/authentication/.", "source_alignment": ["addendum §5.4", "addendum §15.1"] },
       { "id": "A8",  "name": "Notes never conflict",     "spec": "5 concurrent `mote note` calls on the same bead. All 5 succeed; replay shows all 5 in filename order.", "source_alignment": ["addendum §15.8", "addendum §11.4"] },
       { "id": "A9",  "name": "Rejected intents visible", "spec": "`mote history <id> --include-rejected` lists the rejected patch from A2 with a structured reason.", "source_alignment": ["mote_prd.md §27 UX: history shows accepted vs rejected"] },
-      { "id": "A10", "name": "Replay determinism",       "spec": "Given a fixed ops/ directory, two independent replays produce byte-identical state representations.", "source_alignment": ["mote_prd.md §27.5"] }
+      { "id": "A10", "name": "Replay determinism",       "spec": "Given a fixed ops/ directory, two independent replays produce byte-identical state representations.", "source_alignment": ["mote_prd.md §27.5"] },
+      { "id": "A11", "name": "Discussion board",         "spec": "alice posts to a topic; bob replies with --reply-to; discuss list shows both post identities in order; discuss replies lists the child post; discuss topics reports the topic count; a reply to a missing post exits 2.", "source_alignment": ["message board feature request"] },
+      { "id": "A12", "name": "Discussion unread cursor", "spec": "bob sees alice's board post via discuss unread, runs discuss mark-read, then no longer sees that post; bob's own later post is not reported as unread; alice's later reply appears as a new unread post with its post identity.", "source_alignment": ["message board feature request"] },
+      { "id": "A13", "name": "Discussion topics and sticky posts", "spec": "alice creates an empty topic; search returns the topic with creation metadata; posts update topic last_activity; a sticky post sorts first in discuss list and appears as sticky in search; unsticky clears the state and topic sticky_count.", "source_alignment": ["message board follow-up request"] },
+      { "id": "A14", "name": "Forum thread and topic read workflow", "spec": "A root post, reply, and nested reply render parent-before-child in discuss thread with indentation; mark-read --topic hides only that topic's read posts while leaving unread posts in other topics visible.", "source_alignment": ["agent forum workflow request"] }
     ]
   },
 

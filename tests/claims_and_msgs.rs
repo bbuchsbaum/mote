@@ -223,6 +223,731 @@ fn a6_msg_send_inbox_ack_round_trip() {
 }
 
 #[test]
+fn discussion_board_post_list_topics_and_reply() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let first = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "planning",
+            "We should split the parser and tests.",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "first post failed: stderr={}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_id = String::from_utf8(first.stdout).unwrap().trim().to_string();
+    assert!(
+        first_id.starts_with("post-"),
+        "expected post id, got {first_id}"
+    );
+
+    let reply = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "planning",
+            "--reply-to",
+            &first_id,
+            "I can take the tests.",
+            "--actor",
+            "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        reply.status.success(),
+        "reply failed: stderr={}",
+        String::from_utf8_lossy(&reply.stderr)
+    );
+    let reply_id = String::from_utf8(reply.stdout).unwrap().trim().to_string();
+
+    let list = Command::new(bin)
+        .args(["discuss", "list", "--topic", "planning"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let s = String::from_utf8(list.stdout).unwrap();
+    assert!(s.contains(&first_id), "list output:\n{s}");
+    assert!(s.contains(&reply_id), "list output:\n{s}");
+    assert!(s.contains("reply="), "list output:\n{s}");
+    assert!(s.contains("I can take the tests."), "list output:\n{s}");
+
+    let replies = Command::new(bin)
+        .args(["discuss", "replies", &first_id])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(replies.status.success());
+    let replies_s = String::from_utf8(replies.stdout).unwrap();
+    assert!(
+        replies_s.contains(&reply_id),
+        "replies output:\n{replies_s}"
+    );
+    assert!(
+        !replies_s.lines().any(|line| line.starts_with(&first_id)),
+        "replies output should not include the parent as a row:\n{replies_s}"
+    );
+
+    let topics = Command::new(bin)
+        .args(["discuss", "topics"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(topics.status.success());
+    let topics_s = String::from_utf8(topics.stdout).unwrap();
+    assert!(
+        topics_s.contains("planning") && topics_s.contains("posts=2"),
+        "topics output:\n{topics_s}"
+    );
+
+    let store = Store::open(&td.path().join(".mote")).unwrap();
+    let state = reducer::replay_store(&store).unwrap();
+    let reply_record = state
+        .board_posts
+        .get(&reply_id)
+        .expect("reply should be recorded");
+    assert_eq!(reply_record.reply_to.as_deref(), Some(first_id.as_str()));
+    assert_eq!(state.board_posts_for(Some("planning")).len(), 2);
+}
+
+#[test]
+fn discussion_board_unread_cursor_tracks_new_external_posts() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let first = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "general",
+            "Initial note",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_id = String::from_utf8(first.stdout).unwrap().trim().to_string();
+    assert!(first_id.starts_with("post-"));
+
+    let unread1 = Command::new(bin)
+        .args(["discuss", "unread", "--actor", "bob"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(unread1.status.success());
+    let unread1_s = String::from_utf8(unread1.stdout).unwrap();
+    assert!(
+        unread1_s.contains(&first_id),
+        "bob should see alice's post as unread:\n{unread1_s}"
+    );
+
+    let marked = Command::new(bin)
+        .args(["discuss", "mark-read", "--actor", "bob"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(marked.status.success());
+    let marked_s = String::from_utf8(marked.stdout).unwrap();
+    assert!(
+        marked_s.contains(&first_id),
+        "mark-read prints the cursor post identity:\n{marked_s}"
+    );
+
+    let unread2 = Command::new(bin)
+        .args(["discuss", "unread", "--actor", "bob"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(unread2.status.success());
+    let unread2_s = String::from_utf8(unread2.stdout).unwrap();
+    assert!(
+        !unread2_s.contains(&first_id),
+        "marked post should no longer be unread:\n{unread2_s}"
+    );
+
+    let own = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "general",
+            "Bob's own note",
+            "--actor",
+            "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(own.status.success());
+    let own_id = String::from_utf8(own.stdout).unwrap().trim().to_string();
+
+    let unread3 = Command::new(bin)
+        .args(["discuss", "unread", "--actor", "bob"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(unread3.status.success());
+    let unread3_s = String::from_utf8(unread3.stdout).unwrap();
+    assert!(
+        !unread3_s.contains(&own_id),
+        "an actor should not see its own post as unread:\n{unread3_s}"
+    );
+
+    let second = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "general",
+            "--reply-to",
+            &first_id,
+            "Follow-up from alice",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let second_id = String::from_utf8(second.stdout).unwrap().trim().to_string();
+
+    let unread4 = Command::new(bin)
+        .args(["discuss", "unread", "--actor", "bob"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(unread4.status.success());
+    let unread4_s = String::from_utf8(unread4.stdout).unwrap();
+    assert!(
+        unread4_s.contains(&second_id),
+        "new reply should be unread and addressable by post id:\n{unread4_s}"
+    );
+}
+
+#[test]
+fn discussion_topic_creation_search_activity_and_sticky_posts() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let topic = Command::new(bin)
+        .args([
+            "discuss",
+            "topic",
+            "new",
+            "release",
+            "--title",
+            "Release coordination",
+            "--body",
+            "Where agents coordinate release work",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        topic.status.success(),
+        "topic creation failed: stderr={}",
+        String::from_utf8_lossy(&topic.stderr)
+    );
+    let topic_out = String::from_utf8(topic.stdout).unwrap();
+    assert_eq!(topic_out.trim(), "release");
+
+    let search_topic = Command::new(bin)
+        .args(["discuss", "search", "coordination"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(search_topic.status.success());
+    let search_topic_s = String::from_utf8(search_topic.stdout).unwrap();
+    assert!(
+        search_topic_s.contains("topic  release") && search_topic_s.contains("created="),
+        "new explicit topic should surface in search:\n{search_topic_s}"
+    );
+
+    let post1 = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "release",
+            "Beta checklist is the current priority.",
+            "--actor",
+            "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(post1.status.success());
+    let post1_id = String::from_utf8(post1.stdout).unwrap().trim().to_string();
+    assert!(post1_id.starts_with("post-"));
+
+    let post2 = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "release",
+            "Final signoff can wait.",
+            "--actor",
+            "carol",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(post2.status.success());
+    let post2_id = String::from_utf8(post2.stdout).unwrap().trim().to_string();
+
+    let sticky = Command::new(bin)
+        .args(["discuss", "sticky", &post2_id, "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        sticky.status.success(),
+        "sticky failed: stderr={}",
+        String::from_utf8_lossy(&sticky.stderr)
+    );
+
+    let list = Command::new(bin)
+        .args(["discuss", "list", "--topic", "release"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list_s = String::from_utf8(list.stdout).unwrap();
+    let first_line = list_s.lines().next().unwrap_or_default();
+    assert!(
+        first_line.starts_with(&post2_id) && first_line.contains("sticky"),
+        "sticky post should sort first:\n{list_s}"
+    );
+    assert!(list_s.contains(&post1_id), "list output:\n{list_s}");
+
+    let topics = Command::new(bin)
+        .args(["discuss", "topics"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(topics.status.success());
+    let topics_s = String::from_utf8(topics.stdout).unwrap();
+    let release_line = topics_s
+        .lines()
+        .find(|line| line.starts_with("release "))
+        .expect("release topic line");
+    assert!(
+        release_line.contains("posts=2")
+            && release_line.contains("sticky=1")
+            && release_line.contains("created=")
+            && release_line.contains("last="),
+        "topic should expose activity metadata:\n{release_line}"
+    );
+
+    let search_post = Command::new(bin)
+        .args(["discuss", "search", "signoff"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(search_post.status.success());
+    let search_post_s = String::from_utf8(search_post.stdout).unwrap();
+    assert!(
+        search_post_s.contains(&post2_id) && search_post_s.contains("sticky"),
+        "sticky post identity should surface in search:\n{search_post_s}"
+    );
+
+    let unsticky = Command::new(bin)
+        .args(["discuss", "unsticky", &post2_id, "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(unsticky.status.success());
+
+    let store = Store::open(&td.path().join(".mote")).unwrap();
+    let state = reducer::replay_store(&store).unwrap();
+    let release = state.board_topics.get("release").expect("release topic");
+    assert!(release.explicit);
+    assert_eq!(release.post_count, 2);
+    assert_eq!(release.sticky_count, 0);
+    assert!(!state.board_posts[&post2_id].sticky);
+}
+
+#[test]
+fn discussion_thread_view_and_topic_read_cursor_support_forum_workflow() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let root = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "ideas",
+            "Root proposal for agent collaboration.",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(root.status.success());
+    let root_id = String::from_utf8(root.stdout).unwrap().trim().to_string();
+
+    let reply = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "ideas",
+            "--reply-to",
+            &root_id,
+            "First response with refinement.",
+            "--actor",
+            "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(reply.status.success());
+    let reply_id = String::from_utf8(reply.stdout).unwrap().trim().to_string();
+
+    let nested = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "ideas",
+            "--reply-to",
+            &reply_id,
+            "Nested synthesis.",
+            "--actor",
+            "carol",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(nested.status.success());
+    let nested_id = String::from_utf8(nested.stdout).unwrap().trim().to_string();
+
+    let other = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "ops",
+            "Operational update.",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(other.status.success());
+    let other_id = String::from_utf8(other.stdout).unwrap().trim().to_string();
+
+    let thread = Command::new(bin)
+        .args(["discuss", "thread", &root_id])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(thread.status.success());
+    let thread_s = String::from_utf8(thread.stdout).unwrap();
+    let root_pos = thread_s.find(&root_id).expect("root shown");
+    let reply_pos = thread_s.find(&reply_id).expect("reply shown");
+    let nested_pos = thread_s.find(&nested_id).expect("nested reply shown");
+    assert!(
+        root_pos < reply_pos && reply_pos < nested_pos,
+        "thread should preserve parent-before-child order:\n{thread_s}"
+    );
+    let nested_line = thread_s
+        .lines()
+        .find(|line| line.contains(&nested_id))
+        .unwrap_or_default();
+    assert!(
+        nested_line.starts_with("    "),
+        "nested replies should be indented:\n{thread_s}"
+    );
+    assert!(
+        !thread_s.contains(&other_id),
+        "thread should not include another topic/root:\n{thread_s}"
+    );
+
+    let mark = Command::new(bin)
+        .args([
+            "discuss",
+            "mark-read",
+            "--topic",
+            "ideas",
+            "--actor",
+            "dana",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(mark.status.success());
+
+    let unread_ideas = Command::new(bin)
+        .args(["discuss", "unread", "--topic", "ideas", "--actor", "dana"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(unread_ideas.status.success());
+    let unread_ideas_s = String::from_utf8(unread_ideas.stdout).unwrap();
+    assert!(
+        !unread_ideas_s.contains(&root_id) && !unread_ideas_s.contains(&nested_id),
+        "topic cursor should hide read ideas posts:\n{unread_ideas_s}"
+    );
+
+    let unread_ops = Command::new(bin)
+        .args(["discuss", "unread", "--topic", "ops", "--actor", "dana"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(unread_ops.status.success());
+    let unread_ops_s = String::from_utf8(unread_ops.stdout).unwrap();
+    assert!(
+        unread_ops_s.contains(&other_id),
+        "topic cursor should not hide other topics:\n{unread_ops_s}"
+    );
+}
+
+#[test]
+fn discussion_topics_upgrade_implicit_once_and_reject_duplicate_explicit_create() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let implicit_post = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "architecture",
+            "Initial architecture note.",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(implicit_post.status.success());
+
+    let store = Store::open(&td.path().join(".mote")).unwrap();
+    let state1 = reducer::replay_store(&store).unwrap();
+    let implicit = state1
+        .board_topics
+        .get("architecture")
+        .expect("implicit topic");
+    assert!(!implicit.explicit);
+    assert_eq!(implicit.post_count, 1);
+
+    let upgrade = Command::new(bin)
+        .args([
+            "discuss",
+            "topic",
+            "new",
+            "architecture",
+            "--title",
+            "Architecture strategy",
+            "--actor",
+            "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        upgrade.status.success(),
+        "implicit topic upgrade failed: stderr={}",
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+
+    let duplicate = Command::new(bin)
+        .args([
+            "discuss",
+            "topic",
+            "new",
+            "architecture",
+            "--title",
+            "Duplicate",
+            "--actor",
+            "carol",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(duplicate.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(
+        stderr.contains("discussion topic architecture already exists"),
+        "stderr:\n{stderr}"
+    );
+
+    let state2 = reducer::replay_store(&store).unwrap();
+    let upgraded = state2
+        .board_topics
+        .get("architecture")
+        .expect("upgraded topic");
+    assert!(upgraded.explicit);
+    assert_eq!(upgraded.title, "Architecture strategy");
+    assert_eq!(upgraded.post_count, 1);
+}
+
+#[test]
+fn discussion_sticky_is_idempotent_and_rejects_unknown_posts() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let post = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "triage",
+            "Important triage note.",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(post.status.success());
+    let post_id = String::from_utf8(post.stdout).unwrap().trim().to_string();
+
+    for _ in 0..2 {
+        let sticky = Command::new(bin)
+            .args(["discuss", "sticky", &post_id, "--actor", "bob"])
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(
+            sticky.status.success(),
+            "sticky should be idempotent: stderr={}",
+            String::from_utf8_lossy(&sticky.stderr)
+        );
+    }
+
+    let store = Store::open(&td.path().join(".mote")).unwrap();
+    let state = reducer::replay_store(&store).unwrap();
+    assert!(state.board_posts[&post_id].sticky);
+    assert_eq!(state.board_topics["triage"].sticky_count, 1);
+
+    let missing = Command::new(bin)
+        .args(["discuss", "sticky", "post-missing", "--actor", "bob"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("no such board post post-missing"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn discussion_search_topic_filter_keeps_results_in_scope() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let design = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "design",
+            "shared parser idea",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(design.status.success());
+    let design_id = String::from_utf8(design.stdout).unwrap().trim().to_string();
+
+    let ops = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "ops",
+            "shared deployment idea",
+            "--actor",
+            "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(ops.status.success());
+    let ops_id = String::from_utf8(ops.stdout).unwrap().trim().to_string();
+
+    let filtered = Command::new(bin)
+        .args(["discuss", "search", "shared", "--topic", "design"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(filtered.status.success());
+    let filtered_s = String::from_utf8(filtered.stdout).unwrap();
+    assert!(
+        filtered_s.contains(&design_id),
+        "search output:\n{filtered_s}"
+    );
+    assert!(
+        !filtered_s.contains(&ops_id),
+        "topic-filtered search leaked another topic:\n{filtered_s}"
+    );
+}
+
+#[test]
+fn discussion_board_rejects_missing_reply_parent() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let out = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "planning",
+            "--reply-to",
+            "post-missing",
+            "Reply to nowhere",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("reply_to post post-missing does not exist"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn claim_release_round_trip_via_cli() {
     let td = TempDir::new().unwrap();
     init_store(&td);

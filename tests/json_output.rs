@@ -288,6 +288,127 @@ fn json_board_schema() {
 }
 
 #[test]
+fn json_discussion_forum_surfaces_schema() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+
+    let topic = Command::new(mote_bin())
+        .args([
+            "discuss",
+            "topic",
+            "new",
+            "planning",
+            "--title",
+            "Planning",
+            "--body",
+            "Agent planning board",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(topic.status.success());
+
+    let root = Command::new(mote_bin())
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "planning",
+            "Root idea",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(root.status.success());
+    let root_id = String::from_utf8(root.stdout).unwrap().trim().to_string();
+
+    let reply = Command::new(mote_bin())
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "planning",
+            "--reply-to",
+            &root_id,
+            "Reply idea",
+            "--actor",
+            "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(reply.status.success());
+    let reply_id = String::from_utf8(reply.stdout).unwrap().trim().to_string();
+
+    let sticky = Command::new(mote_bin())
+        .args(["discuss", "sticky", &reply_id, "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(sticky.status.success());
+
+    let topics = run_json(&td, &["discuss", "topics"]);
+    let topics_arr = topics.as_array().expect("topics JSON must be an array");
+    assert_eq!(topics_arr.len(), 1);
+    let topic = &topics_arr[0];
+    for k in &[
+        "topic",
+        "title",
+        "body",
+        "created_by",
+        "created_ts",
+        "created_op_id",
+        "last_activity_ts",
+        "last_activity_op_id",
+    ] {
+        assert_obj_has_str(topic, k);
+    }
+    for k in &["post_count", "sticky_count"] {
+        assert_obj_has_int(topic, k);
+    }
+    assert!(topic["explicit"].is_boolean());
+
+    let list = run_json(&td, &["discuss", "list", "--topic", "planning"]);
+    let list_arr = list.as_array().expect("list JSON must be an array");
+    assert_eq!(list_arr.len(), 2);
+    let post = &list_arr[0];
+    for k in &["post_id", "from", "topic", "body", "sent_ts"] {
+        assert_obj_has_str(post, k);
+    }
+    assert!(post["sticky"].is_boolean());
+    assert!(post.get("reply_to").is_some());
+    assert!(post.get("sticky_op_id").is_some());
+
+    let thread = run_json(&td, &["discuss", "thread", &root_id]);
+    let thread_arr = thread.as_array().expect("thread JSON must be an array");
+    assert_eq!(thread_arr.len(), 2);
+    assert_obj_has_int(&thread_arr[0], "depth");
+    assert_obj_has_int(&thread_arr[1], "depth");
+    assert_eq!(thread_arr[0]["depth"], 0);
+    assert_eq!(thread_arr[1]["depth"], 1);
+
+    let search = run_json(&td, &["discuss", "search", "idea"]);
+    let search_obj = search.as_object().expect("search JSON must be an object");
+    assert!(search_obj["topics"].is_array());
+    assert!(search_obj["posts"].is_array());
+    assert!(
+        search_obj["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["post_id"] == root_id)
+    );
+
+    let unread = run_json(&td, &["--actor", "carol", "discuss", "unread"]);
+    let unread_arr = unread.as_array().expect("unread JSON must be an array");
+    assert_eq!(unread_arr.len(), 2);
+}
+
+#[test]
 fn json_fsck_schema() {
     let td = TempDir::new().unwrap();
     init_store(&td);

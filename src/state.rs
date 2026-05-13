@@ -69,6 +69,14 @@ pub struct State {
     pub orphan_history: Vec<HistoryEntry>,
     /// All messages, indexed by `msg_id`. Both unacked and acked.
     pub messages: BTreeMap<String, MsgRecord>,
+    /// Public discussion-board posts, indexed by `post_id`.
+    pub board_posts: BTreeMap<String, BoardPostRecord>,
+    /// Public discussion-board topics, indexed by topic name.
+    pub board_topics: BTreeMap<String, BoardTopicRecord>,
+    /// Per-actor discussion-board read cursor, as the latest seen board_post op id.
+    pub board_read_cursors: BTreeMap<String, String>,
+    /// Per-(actor, topic) discussion-board read cursor.
+    pub board_topic_read_cursors: BTreeMap<(String, String), String>,
     /// All reservations, indexed by `reservation_id`. Both live and closed.
     pub reservations: BTreeMap<String, ReservationState>,
 }
@@ -119,6 +127,34 @@ pub struct MsgRecord {
     pub sent_op_id: String,
     pub ack_op_id: Option<String>,
     pub ack_ts: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoardPostRecord {
+    pub post_id: String,
+    pub from: String,
+    pub topic: String,
+    pub body: String,
+    pub reply_to: Option<String>,
+    pub sticky: bool,
+    pub sticky_op_id: Option<String>,
+    pub sent_ts: String,
+    pub sent_op_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoardTopicRecord {
+    pub topic: String,
+    pub title: String,
+    pub body: String,
+    pub created_by: String,
+    pub created_ts: String,
+    pub created_op_id: String,
+    pub explicit: bool,
+    pub last_activity_ts: String,
+    pub last_activity_op_id: String,
+    pub post_count: usize,
+    pub sticky_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +253,118 @@ impl State {
         msgs
     }
 
+    /// All discussion-board posts, optionally filtered by topic, in send-order.
+    pub fn board_posts_for<'a>(&'a self, topic: Option<&str>) -> Vec<&'a BoardPostRecord> {
+        let mut posts: Vec<&BoardPostRecord> = self
+            .board_posts
+            .values()
+            .filter(|p| topic.is_none_or(|t| p.topic == t))
+            .collect();
+        posts.sort_by(|a, b| {
+            b.sticky
+                .cmp(&a.sticky)
+                .then_with(|| a.sent_op_id.cmp(&b.sent_op_id))
+        });
+        posts
+    }
+
+    /// Public discussion-board posts newer than `actor`'s read cursor.
+    /// The caller's own posts are omitted so agents can poll for new external
+    /// messages without being notified about their own publication.
+    pub fn unread_board_posts_for<'a>(
+        &'a self,
+        actor: &str,
+        topic: Option<&str>,
+    ) -> Vec<&'a BoardPostRecord> {
+        let cursor = self
+            .discussion_cursor_for(actor, topic)
+            .map(String::as_str)
+            .unwrap_or("");
+        let mut posts: Vec<&BoardPostRecord> = self
+            .board_posts
+            .values()
+            .filter(|p| {
+                p.from != actor
+                    && p.sent_op_id.as_str() > cursor
+                    && topic.is_none_or(|t| p.topic == t)
+            })
+            .collect();
+        posts.sort_by(|a, b| {
+            b.sticky
+                .cmp(&a.sticky)
+                .then_with(|| a.sent_op_id.cmp(&b.sent_op_id))
+        });
+        posts
+    }
+
+    pub fn discussion_cursor_for(&self, actor: &str, topic: Option<&str>) -> Option<&String> {
+        topic
+            .and_then(|t| {
+                self.board_topic_read_cursors
+                    .get(&(actor.to_string(), t.to_string()))
+            })
+            .or_else(|| self.board_read_cursors.get(actor))
+    }
+
+    /// Direct replies to a discussion-board post, in send-order.
+    pub fn replies_to<'a>(&'a self, post_id: &str) -> Vec<&'a BoardPostRecord> {
+        let mut posts: Vec<&BoardPostRecord> = self
+            .board_posts
+            .values()
+            .filter(|p| p.reply_to.as_deref() == Some(post_id))
+            .collect();
+        posts.sort_by(|a, b| {
+            b.sticky
+                .cmp(&a.sticky)
+                .then_with(|| a.sent_op_id.cmp(&b.sent_op_id))
+        });
+        posts
+    }
+
+    /// Discussion topics ordered by current activity, newest first.
+    pub fn board_topics_by_activity(&self) -> Vec<&BoardTopicRecord> {
+        let mut topics: Vec<&BoardTopicRecord> = self.board_topics.values().collect();
+        topics.sort_by(|a, b| {
+            b.last_activity_op_id
+                .cmp(&a.last_activity_op_id)
+                .then_with(|| a.topic.cmp(&b.topic))
+        });
+        topics
+    }
+
+    /// Descendant replies to a root post in parent-before-child order.
+    pub fn thread_posts<'a>(&'a self, root_post_id: &str) -> Vec<(usize, &'a BoardPostRecord)> {
+        let mut out = Vec::new();
+        let Some(root) = self.board_posts.get(root_post_id) else {
+            return out;
+        };
+        out.push((0, root));
+        self.collect_thread_children(root_post_id, 1, &mut out);
+        out
+    }
+
+    fn collect_thread_children<'a>(
+        &'a self,
+        post_id: &str,
+        depth: usize,
+        out: &mut Vec<(usize, &'a BoardPostRecord)>,
+    ) {
+        let mut children: Vec<&BoardPostRecord> = self
+            .board_posts
+            .values()
+            .filter(|p| p.reply_to.as_deref() == Some(post_id))
+            .collect();
+        children.sort_by(|a, b| {
+            b.sticky
+                .cmp(&a.sticky)
+                .then_with(|| a.sent_op_id.cmp(&b.sent_op_id))
+        });
+        for child in children {
+            out.push((depth, child));
+            self.collect_thread_children(&child.post_id, depth + 1, out);
+        }
+    }
+
     /// Returns the rejection reason from the most recent history entry of
     /// `op_id`, or `None` if the op was accepted (or not found).
     pub fn rejection_reason(&self, op_id: &str) -> Option<String> {
@@ -242,6 +390,11 @@ impl State {
                 if e.op_id == op_id {
                     return e.accepted;
                 }
+            }
+        }
+        for e in &self.orphan_history {
+            if e.op_id == op_id {
+                return e.accepted;
             }
         }
         false

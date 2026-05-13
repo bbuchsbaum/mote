@@ -10,9 +10,10 @@ use jiff::Timestamp;
 use crate::errors::{MoteError, MoteResult};
 use crate::ids;
 use crate::op::{
-    self, ScalarSet, Status, make_claim, make_close, make_create, make_delete, make_dep,
-    make_msg_ack, make_msg_send, make_note, make_patch, make_release, make_reserve_close,
-    make_reserve_open, make_tag, validate_msg_kind, validate_note_kind,
+    self, ScalarSet, Status, make_board_post, make_board_read, make_board_sticky, make_board_topic,
+    make_claim, make_close, make_create, make_delete, make_dep, make_msg_ack, make_msg_send,
+    make_note, make_patch, make_release, make_reserve_close, make_reserve_open, make_tag,
+    validate_msg_kind, validate_note_kind,
 };
 use crate::reducer;
 use crate::state::Bead;
@@ -75,6 +76,11 @@ pub enum Command {
         /// Parent dependencies to add (repeatable; relationship `blocks`)
         #[arg(long = "dep")]
         deps: Vec<String>,
+        /// Use this exact bead id instead of minting a `bd-...` ulid.
+        /// Intended for migrations from another tracker. Reserved prefix
+        /// `bd-` is rejected; collisions are caught by the reducer.
+        #[arg(long)]
+        id: Option<String>,
     },
 
     /// Update scalar fields on a bead via a single patch op.
@@ -160,6 +166,12 @@ pub enum Command {
     Msg {
         #[command(subcommand)]
         cmd: MsgCmd,
+    },
+
+    /// Public message-board discussion commands
+    Discuss {
+        #[command(subcommand)]
+        cmd: DiscussCmd,
     },
 
     /// List unacked messages addressed to me
@@ -312,6 +324,90 @@ pub enum MsgCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum DiscussCmd {
+    /// Add a public post to the message board
+    Post {
+        /// Topic name (default: general)
+        #[arg(long, default_value = "general")]
+        topic: String,
+        /// Optional parent post id for a threaded reply
+        #[arg(long = "reply-to")]
+        reply_to: Option<String>,
+        /// Body text (positional)
+        text: String,
+    },
+    /// List public posts
+    List {
+        /// Filter by topic
+        #[arg(long)]
+        topic: Option<String>,
+        /// Maximum number of posts to print
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// List posts newer than this actor's discussion read cursor
+    Unread {
+        /// Filter by topic
+        #[arg(long)]
+        topic: Option<String>,
+        /// Maximum number of posts to print
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Mark currently visible discussion posts as read for this actor
+    MarkRead {
+        /// Mark only one topic read
+        #[arg(long)]
+        topic: Option<String>,
+    },
+    /// List direct replies to a post
+    Replies {
+        /// Parent post id
+        post_id: String,
+    },
+    /// Show a post with all descendant replies
+    Thread {
+        /// Root post id
+        post_id: String,
+    },
+    /// Manage discussion topics
+    Topic {
+        #[command(subcommand)]
+        cmd: DiscussTopicCmd,
+    },
+    /// Search topics and posts
+    Search {
+        query: String,
+        /// Filter posts by topic
+        #[arg(long)]
+        topic: Option<String>,
+        /// Maximum number of topic matches and post matches to print
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Mark a post sticky
+    Sticky { post_id: String },
+    /// Remove sticky state from a post
+    Unsticky { post_id: String },
+    /// List topics with post counts
+    Topics,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DiscussTopicCmd {
+    /// Create a topic before any posts exist
+    New {
+        topic: String,
+        /// Display title (defaults to topic)
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional topic description
+        #[arg(long)]
+        body: Option<String>,
+    },
+}
+
 pub fn run(cli: Cli) -> MoteResult<i32> {
     match cli.command {
         Command::Init => cmd_init(cli.quiet),
@@ -325,6 +421,7 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             assignee,
             tags,
             deps,
+            id,
         } => cmd_new(
             cli.actor.as_deref(),
             cli.store.as_deref(),
@@ -335,6 +432,7 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             assignee,
             tags,
             deps,
+            id,
         ),
         Command::Set { id, fields } => cmd_set(
             cli.actor.as_deref(),
@@ -385,6 +483,9 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         }
         Command::Release { id } => cmd_release(cli.actor.as_deref(), cli.store.as_deref(), id),
         Command::Msg { cmd } => cmd_msg(cli.actor.as_deref(), cli.store.as_deref(), cmd),
+        Command::Discuss { cmd } => {
+            cmd_discuss(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
+        }
         Command::Inbox { issue, from, kind } => cmd_inbox(
             cli.actor.as_deref(),
             cli.store.as_deref(),
@@ -590,6 +691,7 @@ fn cmd_new(
     assignee: Option<String>,
     tags: Vec<String>,
     deps: Vec<String>,
+    id: Option<String>,
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
@@ -603,7 +705,13 @@ fn cmd_new(
         }
     }
 
-    let bead_id = ids::new_bead_id();
+    let bead_id = match id {
+        Some(custom) => {
+            ids::validate_external_bead_id(&custom)?;
+            custom
+        }
+        None => ids::new_bead_id(),
+    };
     let mut set = ScalarSet {
         title: Some(title),
         priority,
@@ -1168,6 +1276,332 @@ fn cmd_msg(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: MsgCmd) -> 
     }
 }
 
+fn cmd_discuss(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    cmd: DiscussCmd,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+
+    match cmd {
+        DiscussCmd::Post {
+            topic,
+            reply_to,
+            text,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let topic = normalize_discussion_topic(&topic)?;
+            if text.trim().is_empty() {
+                return Err(MoteError::Invalid(
+                    "discussion post text must be non-empty".into(),
+                ));
+            }
+            let post_id = ids::new_post_id();
+            let op = make_board_post(
+                actor,
+                post_id.clone(),
+                topic,
+                text,
+                reply_to,
+                Timestamp::now(),
+            );
+            let name = publish::publish_op(&store, &op)?;
+            println!("{post_id}");
+            verify_accept(&store, &name)
+        }
+        DiscussCmd::List { topic, limit } => {
+            let state = reducer::replay_store(&store)?;
+            let normalized_topic = topic
+                .as_deref()
+                .map(normalize_discussion_topic)
+                .transpose()?;
+            let mut posts = state.board_posts_for(normalized_topic.as_deref());
+            if let Some(limit) = limit {
+                if posts.len() > limit {
+                    posts = posts.split_off(posts.len() - limit);
+                }
+            }
+            print_board_posts(posts, json_mode)
+        }
+        DiscussCmd::Unread { topic, limit } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let state = reducer::replay_store(&store)?;
+            let normalized_topic = topic
+                .as_deref()
+                .map(normalize_discussion_topic)
+                .transpose()?;
+            let mut posts = state.unread_board_posts_for(&actor, normalized_topic.as_deref());
+            if let Some(limit) = limit {
+                if posts.len() > limit {
+                    posts = posts.split_off(posts.len() - limit);
+                }
+            }
+            print_board_posts(posts, json_mode)
+        }
+        DiscussCmd::MarkRead { topic } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let state = reducer::replay_store(&store)?;
+            let normalized_topic = topic
+                .as_deref()
+                .map(normalize_discussion_topic)
+                .transpose()?;
+            let latest = state
+                .board_posts_for(normalized_topic.as_deref())
+                .into_iter()
+                .max_by(|a, b| a.sent_op_id.cmp(&b.sent_op_id));
+            let Some(latest) = latest else {
+                return Ok(0);
+            };
+            let op = make_board_read(
+                actor,
+                latest.sent_op_id.clone(),
+                normalized_topic,
+                Timestamp::now(),
+            );
+            let name = publish::publish_op(&store, &op)?;
+            println!("{}", latest.post_id);
+            verify_accept(&store, &name)
+        }
+        DiscussCmd::Replies { post_id } => {
+            let state = reducer::replay_store(&store)?;
+            if !state.board_posts.contains_key(&post_id) {
+                return Err(MoteError::Invalid(format!("no such post {post_id}")));
+            }
+            print_board_posts(state.replies_to(&post_id), json_mode)
+        }
+        DiscussCmd::Thread { post_id } => {
+            let state = reducer::replay_store(&store)?;
+            if !state.board_posts.contains_key(&post_id) {
+                return Err(MoteError::Invalid(format!("no such post {post_id}")));
+            }
+            print_thread_posts(state.thread_posts(&post_id), json_mode)
+        }
+        DiscussCmd::Topic { cmd } => match cmd {
+            DiscussTopicCmd::New { topic, title, body } => {
+                let actor = store.resolve_actor(actor_flag)?;
+                let topic = normalize_discussion_topic(&topic)?;
+                let op = make_board_topic(actor, topic.clone(), title, body, Timestamp::now());
+                let name = publish::publish_op(&store, &op)?;
+                println!("{topic}");
+                verify_accept(&store, &name)
+            }
+        },
+        DiscussCmd::Search {
+            query,
+            topic,
+            limit,
+        } => {
+            let state = reducer::replay_store(&store)?;
+            let query = query.trim();
+            if query.is_empty() {
+                return Err(MoteError::Invalid(
+                    "discussion search query must be non-empty".into(),
+                ));
+            }
+            let normalized_topic = topic
+                .as_deref()
+                .map(normalize_discussion_topic)
+                .transpose()?;
+            print_discussion_search(&state, query, normalized_topic.as_deref(), limit, json_mode)
+        }
+        DiscussCmd::Sticky { post_id } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let op = make_board_sticky(actor, post_id, true, Timestamp::now());
+            let name = publish::publish_op(&store, &op)?;
+            verify_accept(&store, &name)
+        }
+        DiscussCmd::Unsticky { post_id } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let op = make_board_sticky(actor, post_id, false, Timestamp::now());
+            let name = publish::publish_op(&store, &op)?;
+            verify_accept(&store, &name)
+        }
+        DiscussCmd::Topics => {
+            let state = reducer::replay_store(&store)?;
+            print_discussion_topics(state.board_topics_by_activity(), json_mode)
+        }
+    }
+}
+
+fn print_discussion_topics(
+    topics: Vec<&crate::state::BoardTopicRecord>,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    if json_mode {
+        let arr: Vec<_> = topics.iter().map(|t| topic_json(t)).collect();
+        println!("{}", serde_json::to_string(&arr)?);
+    } else {
+        for t in &topics {
+            let explicit = if t.explicit { "explicit" } else { "implicit" };
+            println!(
+                "{}  posts={}  sticky={}  created={}  last={}  {}  {}",
+                t.topic,
+                t.post_count,
+                t.sticky_count,
+                t.created_ts,
+                t.last_activity_ts,
+                explicit,
+                t.title
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn topic_json(t: &crate::state::BoardTopicRecord) -> serde_json::Value {
+    serde_json::json!({
+        "topic": t.topic,
+        "title": t.title,
+        "body": t.body,
+        "created_by": t.created_by,
+        "created_ts": t.created_ts,
+        "created_op_id": t.created_op_id,
+        "explicit": t.explicit,
+        "last_activity_ts": t.last_activity_ts,
+        "last_activity_op_id": t.last_activity_op_id,
+        "post_count": t.post_count,
+        "sticky_count": t.sticky_count,
+    })
+}
+
+fn print_discussion_search(
+    state: &crate::state::State,
+    query: &str,
+    topic_filter: Option<&str>,
+    limit: Option<usize>,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    let needle = query.to_ascii_lowercase();
+    let matches_query = |s: &str| s.to_ascii_lowercase().contains(&needle);
+
+    let mut topics: Vec<&crate::state::BoardTopicRecord> = state
+        .board_topics_by_activity()
+        .into_iter()
+        .filter(|t| {
+            topic_filter.is_none_or(|wanted| t.topic == wanted)
+                && (matches_query(&t.topic) || matches_query(&t.title) || matches_query(&t.body))
+        })
+        .collect();
+    let mut posts: Vec<&crate::state::BoardPostRecord> = state
+        .board_posts_for(topic_filter)
+        .into_iter()
+        .filter(|p| {
+            matches_query(&p.post_id)
+                || matches_query(&p.topic)
+                || matches_query(&p.from)
+                || matches_query(&p.body)
+        })
+        .collect();
+
+    if let Some(limit) = limit {
+        topics.truncate(limit);
+        posts.truncate(limit);
+    }
+
+    if json_mode {
+        let v = serde_json::json!({
+            "topics": topics.iter().map(|t| topic_json(t)).collect::<Vec<_>>(),
+            "posts": posts.iter().map(|p| board_post_json(p)).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string(&v)?);
+    } else {
+        for t in &topics {
+            println!(
+                "topic  {}  posts={}  sticky={}  created={}  last={}  {}",
+                t.topic, t.post_count, t.sticky_count, t.created_ts, t.last_activity_ts, t.title
+            );
+        }
+        for p in &posts {
+            let sticky = if p.sticky { " sticky" } else { "" };
+            let reply = p.reply_to.as_deref().unwrap_or("-");
+            println!(
+                "post   {}{}  {}  from={}  topic={}  reply={}  {}",
+                p.post_id, sticky, p.sent_ts, p.from, p.topic, reply, p.body
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn print_board_posts(
+    posts: Vec<&crate::state::BoardPostRecord>,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    if json_mode {
+        let arr: Vec<_> = posts.iter().map(|p| board_post_json(p)).collect();
+        println!("{}", serde_json::to_string(&arr)?);
+    } else {
+        for p in &posts {
+            let reply = p.reply_to.as_deref().unwrap_or("-");
+            let sticky = if p.sticky { " sticky" } else { "" };
+            println!(
+                "{}{}  {}  from={}  topic={}  reply={}  {}",
+                p.post_id, sticky, p.sent_ts, p.from, p.topic, reply, p.body
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn print_thread_posts(
+    posts: Vec<(usize, &crate::state::BoardPostRecord)>,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    if json_mode {
+        let arr: Vec<_> = posts
+            .iter()
+            .map(|(depth, post)| {
+                let mut v = board_post_json(post);
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("depth".into(), serde_json::json!(depth));
+                }
+                v
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&arr)?);
+    } else {
+        for (depth, post) in &posts {
+            let indent = "  ".repeat(*depth);
+            let reply = post.reply_to.as_deref().unwrap_or("-");
+            let sticky = if post.sticky { " sticky" } else { "" };
+            println!(
+                "{}{}{}  {}  from={}  topic={}  reply={}  {}",
+                indent, post.post_id, sticky, post.sent_ts, post.from, post.topic, reply, post.body
+            );
+        }
+    }
+    Ok(0)
+}
+
+fn board_post_json(p: &crate::state::BoardPostRecord) -> serde_json::Value {
+    serde_json::json!({
+        "post_id": p.post_id,
+        "from": p.from,
+        "topic": p.topic,
+        "body": p.body,
+        "reply_to": p.reply_to,
+        "sticky": p.sticky,
+        "sticky_op_id": p.sticky_op_id,
+        "sent_ts": p.sent_ts,
+    })
+}
+
+fn normalize_discussion_topic(topic: &str) -> MoteResult<String> {
+    let topic = topic.trim();
+    if topic.is_empty() {
+        return Err(MoteError::Invalid(
+            "discussion topic must be non-empty".into(),
+        ));
+    }
+    if topic.chars().any(|c| c == '\0' || c == '\n' || c == '\r') {
+        return Err(MoteError::Invalid(
+            "discussion topic must be a single-line string".into(),
+        ));
+    }
+    Ok(topic.to_string())
+}
+
 fn cmd_inbox(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
@@ -1659,6 +2093,10 @@ fn cmd_board(
         .as_ref()
         .map(|a| state.inbox_for(a).len())
         .unwrap_or(0);
+    let discussion_unread_count = actor
+        .as_ref()
+        .map(|a| state.unread_board_posts_for(a, None).len())
+        .unwrap_or(0);
 
     if json_mode {
         let v = serde_json::json!({
@@ -1674,6 +2112,7 @@ fn cmd_board(
                 "paths": r.live_paths(), "lease_until_ts": r.lease_until_ts,
             })).collect::<Vec<_>>(),
             "inbox_unacked": inbox_count,
+            "discussion_unread": discussion_unread_count,
         });
         println!("{}", serde_json::to_string(&v)?);
     } else {
@@ -1702,6 +2141,7 @@ fn cmd_board(
             );
         }
         println!("inbox:        {inbox_count} unacked");
+        println!("discussion:   {discussion_unread_count} unread");
     }
     Ok(0)
 }

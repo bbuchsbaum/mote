@@ -372,3 +372,92 @@ fn dep_add_and_remove_round_trip_via_cli() {
         "expected parent gone from child's show:\n{s2}"
     );
 }
+
+#[test]
+fn new_with_custom_id_preserves_external_id() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let out = Command::new(bin)
+        .args([
+            "new",
+            "Fix auth bug",
+            "--actor",
+            "alice",
+            "--id",
+            "psycloud-eqgu",
+            "-p",
+            "1",
+            "--tag",
+            "bug",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    assert_eq!(printed, "psycloud-eqgu");
+
+    let show = Command::new(bin)
+        .args(["show", "psycloud-eqgu"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    let s = String::from_utf8(show.stdout).unwrap();
+    assert!(s.contains("psycloud-eqgu"), "show output:\n{s}");
+    assert!(s.contains("Fix auth bug"));
+    assert!(s.contains("bug"));
+}
+
+#[test]
+fn new_with_duplicate_custom_id_is_rejected_by_reducer() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let first = Command::new(bin)
+        .args(["new", "first", "--actor", "alice", "--id", "dup-1"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+
+    let second = Command::new(bin)
+        .args(["new", "second", "--actor", "bob", "--id", "dup-1"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    // Reducer rejects → exit code 2.
+    assert_eq!(second.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&second.stderr).to_string();
+    assert!(
+        stderr.contains("already exists"),
+        "expected reducer rejection on stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn new_with_invalid_custom_id_fails_validation() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    for bad in ["bd-anything", "Has-Caps", "has space", ""] {
+        let out = Command::new(bin)
+            .args(["new", "title", "--actor", "alice", "--id", bad])
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "expected failure for --id {bad:?}; stdout={}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}

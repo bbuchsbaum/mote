@@ -237,6 +237,53 @@ pub struct MsgAckOp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardPostOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub post_id: String,
+    pub topic: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardReadOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub upto_op_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardTopicOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub topic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardStickyOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub post_id: String,
+    pub sticky: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReserveOpenOp {
     pub v: u32,
     pub op: String,
@@ -282,6 +329,10 @@ pub enum Op {
     Release(ReleaseOp),
     MsgSend(MsgSendOp),
     MsgAck(MsgAckOp),
+    BoardPost(BoardPostOp),
+    BoardRead(BoardReadOp),
+    BoardTopic(BoardTopicOp),
+    BoardSticky(BoardStickyOp),
     ReserveOpen(ReserveOpenOp),
     ReserveClose(ReserveCloseOp),
 }
@@ -300,6 +351,10 @@ impl Op {
             Op::Release(o) => &o.op,
             Op::MsgSend(o) => &o.op,
             Op::MsgAck(o) => &o.op,
+            Op::BoardPost(o) => &o.op,
+            Op::BoardRead(o) => &o.op,
+            Op::BoardTopic(o) => &o.op,
+            Op::BoardSticky(o) => &o.op,
             Op::ReserveOpen(o) => &o.op,
             Op::ReserveClose(o) => &o.op,
         }
@@ -318,6 +373,10 @@ impl Op {
             Op::Release(o) => &o.actor,
             Op::MsgSend(o) => &o.actor,
             Op::MsgAck(o) => &o.actor,
+            Op::BoardPost(o) => &o.actor,
+            Op::BoardRead(o) => &o.actor,
+            Op::BoardTopic(o) => &o.actor,
+            Op::BoardSticky(o) => &o.actor,
             Op::ReserveOpen(o) => &o.actor,
             Op::ReserveClose(o) => &o.actor,
         }
@@ -336,6 +395,10 @@ impl Op {
             Op::Release(o) => &o.ts,
             Op::MsgSend(o) => &o.ts,
             Op::MsgAck(o) => &o.ts,
+            Op::BoardPost(o) => &o.ts,
+            Op::BoardRead(o) => &o.ts,
+            Op::BoardTopic(o) => &o.ts,
+            Op::BoardSticky(o) => &o.ts,
             Op::ReserveOpen(o) => &o.ts,
             Op::ReserveClose(o) => &o.ts,
         }
@@ -357,6 +420,10 @@ impl Op {
             Op::Release(o) => Some(&o.entity),
             Op::MsgSend(o) => o.entity.as_deref(),
             Op::MsgAck(_) => None,
+            Op::BoardPost(_) => None,
+            Op::BoardRead(_) => None,
+            Op::BoardTopic(_) => None,
+            Op::BoardSticky(_) => None,
             Op::ReserveOpen(o) => Some(&o.entity),
             Op::ReserveClose(_) => None,
         }
@@ -377,6 +444,10 @@ impl Op {
             Op::Release(_) => "release",
             Op::MsgSend(_) => "msg_send",
             Op::MsgAck(_) => "msg_ack",
+            Op::BoardPost(_) => "board_post",
+            Op::BoardRead(_) => "board_read",
+            Op::BoardTopic(_) => "board_topic",
+            Op::BoardSticky(_) => "board_sticky",
             Op::ReserveOpen(_) => "reserve_open",
             Op::ReserveClose(_) => "reserve_close",
         }
@@ -602,6 +673,71 @@ pub fn make_msg_ack(actor: String, msg_id: String, ts: jiff::Timestamp) -> Op {
         ts: ids::format_rfc3339(ts),
         actor,
         msg_id,
+    })
+}
+
+pub fn make_board_post(
+    actor: String,
+    post_id: String,
+    topic: String,
+    body: String,
+    reply_to: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
+    Op::BoardPost(BoardPostOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        post_id,
+        topic,
+        body,
+        reply_to,
+    })
+}
+
+pub fn make_board_read(
+    actor: String,
+    upto_op_id: String,
+    topic: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
+    Op::BoardRead(BoardReadOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        upto_op_id,
+        topic,
+    })
+}
+
+pub fn make_board_topic(
+    actor: String,
+    topic: String,
+    title: Option<String>,
+    body: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
+    Op::BoardTopic(BoardTopicOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        topic,
+        title,
+        body,
+    })
+}
+
+pub fn make_board_sticky(actor: String, post_id: String, sticky: bool, ts: jiff::Timestamp) -> Op {
+    Op::BoardSticky(BoardStickyOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        post_id,
+        sticky,
     })
 }
 

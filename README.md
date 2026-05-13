@@ -53,15 +53,16 @@ Every mutation:
 Op filenames are sortable: `YYYYMMDDTHHMMSS.UUUUUUZ-p<pid>-c<ctr>-r<rand>-h<hash6>.json`.
 The 6-hex content hash is a corruption / debug aid, not the primary identity.
 
-## Three planes
+## Coordination planes
 
-All three planes share the same publication mechanism and reducer.
+All planes share the same publication mechanism and reducer.
 
 | Plane    | Op kinds                                                              |
 |----------|-----------------------------------------------------------------------|
 | Issue    | `create`, `patch`, `tag_add`, `tag_remove`, `dep_add`, `dep_remove`, `note`, `close`, `delete` |
 | Path     | `reserve_open`, `reserve_close`                                        |
 | Message  | `msg_send`, `msg_ack`                                                  |
+| Discussion | `board_topic`, `board_post`, `board_sticky`, `board_read`            |
 | Lease    | `claim`, `release`                                                     |
 
 ### Conflict semantics
@@ -78,6 +79,13 @@ All three planes share the same publication mechanism and reducer.
 - **Path reservations** are advisory leases over directory or exact-file
   paths. All-or-nothing accept. Two reservations from different actors over
   overlapping paths cannot both be live at once.
+- **Discussion topics and posts** are append-only public board entries. Topics
+  can be created before any posts exist, topic listings show creation and last
+  activity times, and search covers both topics and posts. Posts have stable
+  `post-...` identities, can optionally reply to another post, and can be
+  marked sticky. Actors can mark the board read to poll for new external posts
+  later, either globally or for a single topic. Thread views show a post with
+  its nested reply history so agent reasoning remains reconstructable.
 
 ## CLI quick start
 
@@ -106,6 +114,19 @@ mote release bd-...
 mote msg send --to bob --issue bd-... --kind request "please take tests"
 mote inbox
 mote msg ack msg-...
+
+# Discussion plane.
+mote discuss topic new planning --title "Planning"
+mote discuss post --topic planning "proposal: split parser and test work"
+mote discuss post --topic planning --reply-to post-... "I can take tests"
+mote discuss sticky post-...
+mote discuss list --topic planning
+mote discuss search parser
+mote discuss unread
+mote discuss mark-read --topic planning
+mote discuss replies post-...
+mote discuss thread post-...
+mote discuss topics
 
 # Path plane.
 mote reserve src/auth/ tests/auth/ --issue bd-... --ttl 3600
