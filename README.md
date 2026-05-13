@@ -143,9 +143,29 @@ mote board
 # Diagnostics.
 mote doctor
 mote fsck --clean-tmp
+
+# Oversight (read-only).
+mote watch                # human-readable snapshots that re-render on store changes
+mote --json watch         # newline-delimited JSON for piping into other tools
+mote ui                   # interactive TUI dashboard (q to quit, ? for help)
 ```
 
 Most agent-facing commands accept `--json` for machine-readable output.
+
+### Oversight
+
+`mote watch` and `mote ui` are passive viewers — they only ever call the same
+deterministic replay path the CLI uses, never publish ops. They are safe to
+leave running while agents are writing to the store.
+
+- `mote watch` redraws a board-style summary every time a new op appears, with
+  a periodic fallback tick so it also reflects lease expiry. `mote --json
+  watch` writes one JSON snapshot per change to stdout, suitable for piping
+  into `jq` or any small UI.
+- `mote ui` opens a four-tab terminal dashboard (Overview / Beads / Discussion
+  / Activity) with full per-bead detail, recent op history (including
+  rejected ops with their reasons), and incremental refresh on filesystem
+  events.
 
 ## Agent skills
 

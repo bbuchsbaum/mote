@@ -14,6 +14,8 @@ pub mod publish;
 pub mod reducer;
 pub mod repo;
 pub mod state;
+pub mod tui;
+pub mod watch;
 
 pub use errors::{MoteError, MoteResult};
 pub use repo::Store;

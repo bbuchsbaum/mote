@@ -254,6 +254,16 @@ pub enum Command {
     /// Compact overview of board state
     Board,
 
+    /// Stream snapshots whenever the op log changes. Read-only.
+    Watch {
+        /// Periodic re-emit interval in seconds (fallback to the FS watcher)
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+    },
+
+    /// Open a read-only TUI dashboard. Read-only.
+    Ui,
+
     /// Check store layout, actor identity, and op-log health
     Doctor,
 
@@ -542,6 +552,13 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         }
         Command::WhoHas { path } => cmd_who_has(cli.store.as_deref(), cli.json, path),
         Command::Board => cmd_board(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
+        Command::Watch { interval } => cmd_watch(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            interval,
+        ),
+        Command::Ui => cmd_ui(cli.actor.as_deref(), cli.store.as_deref()),
         Command::Doctor => cmd_doctor(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
         Command::Fsck { clean_tmp } => cmd_fsck(cli.store.as_deref(), cli.json, clean_tmp),
     }
@@ -2178,6 +2195,23 @@ fn cmd_board(
         println!("discussion:   {discussion_unread_count} unread");
     }
     Ok(0)
+}
+
+fn cmd_watch(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    interval: u64,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let actor = store.resolve_actor(actor_flag).ok();
+    crate::watch::run(&store, actor.as_deref(), json_mode, interval)
+}
+
+fn cmd_ui(actor_flag: Option<&str>, store_flag: Option<&Path>) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let actor = store.resolve_actor(actor_flag).ok();
+    crate::tui::run(&store, actor.as_deref())
 }
 
 fn verify_accept(store: &Store, name: &ids::OpName) -> MoteResult<i32> {
