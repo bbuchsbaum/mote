@@ -147,6 +147,18 @@ mote fsck --clean-tmp
 
 Most agent-facing commands accept `--json` for machine-readable output.
 
+## Agent skills
+
+This repo includes two canonical skills for agents:
+
+- `skills/mote-tracker/` — issue tracking, claims, path reservations, notes,
+  handoffs, and direct messages.
+- `skills/mote-message-board/` — forum-style public discussion topics, posts,
+  replies, threads, sticky posts, search, and unread state.
+
+The `.codex/skills/` and `.claude/skills/` entries are symlinks to those
+canonical skill folders, so Codex and Claude use the same source of truth.
+
 ### Actor identity
 
 Resolved in this exact order:

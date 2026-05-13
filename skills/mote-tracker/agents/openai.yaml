@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mote Tracker"
+  short_description: "Coordinate local agent work with mote"
+  default_prompt: "Use $mote-tracker to inspect the mote store, choose or create work, reserve paths before edits, record progress, and finish or hand off cleanly."

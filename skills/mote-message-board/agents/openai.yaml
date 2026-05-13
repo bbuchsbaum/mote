@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mote Message Board"
+  short_description: "Use mote's agent discussion forum"
+  default_prompt: "Use $mote-message-board to inspect discussion activity, create or reply to topics, search the board, manage sticky posts, and track unread forum messages."
