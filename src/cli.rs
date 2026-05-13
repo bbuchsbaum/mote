@@ -1318,9 +1318,7 @@ fn cmd_discuss(
                 .transpose()?;
             let mut posts = state.board_posts_for(normalized_topic.as_deref());
             if let Some(limit) = limit {
-                if posts.len() > limit {
-                    posts = posts.split_off(posts.len() - limit);
-                }
+                posts = limit_board_posts_preserving_stickies(posts, limit);
             }
             print_board_posts(posts, json_mode)
         }
@@ -1351,6 +1349,11 @@ fn cmd_discuss(
                 .into_iter()
                 .max_by(|a, b| a.sent_op_id.cmp(&b.sent_op_id));
             let Some(latest) = latest else {
+                if let Some(topic) = normalized_topic.as_deref() {
+                    eprintln!("no posts in topic {topic}");
+                } else {
+                    eprintln!("no discussion posts");
+                }
                 return Ok(0);
             };
             let op = make_board_read(
@@ -1496,7 +1499,7 @@ fn print_discussion_search(
 
     if let Some(limit) = limit {
         topics.truncate(limit);
-        posts.truncate(limit);
+        posts = limit_board_posts_preserving_stickies(posts, limit);
     }
 
     if json_mode {
@@ -1542,6 +1545,37 @@ fn print_board_posts(
         }
     }
     Ok(0)
+}
+
+fn limit_board_posts_preserving_stickies(
+    posts: Vec<&crate::state::BoardPostRecord>,
+    limit: usize,
+) -> Vec<&crate::state::BoardPostRecord> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if posts.len() <= limit {
+        return posts;
+    }
+    let mut sticky = Vec::new();
+    let mut non_sticky = Vec::new();
+    for post in posts {
+        if post.sticky {
+            sticky.push(post);
+        } else {
+            non_sticky.push(post);
+        }
+    }
+    if sticky.len() >= limit {
+        sticky.truncate(limit);
+        return sticky;
+    }
+    let keep_non_sticky = limit - sticky.len();
+    if non_sticky.len() > keep_non_sticky {
+        non_sticky = non_sticky.split_off(non_sticky.len() - keep_non_sticky);
+    }
+    sticky.extend(non_sticky);
+    sticky
 }
 
 fn print_thread_posts(

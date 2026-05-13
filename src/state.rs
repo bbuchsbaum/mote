@@ -71,6 +71,8 @@ pub struct State {
     pub messages: BTreeMap<String, MsgRecord>,
     /// Public discussion-board posts, indexed by `post_id`.
     pub board_posts: BTreeMap<String, BoardPostRecord>,
+    /// Discussion-board posts indexed by the accepted board_post op id.
+    pub board_post_op_index: BTreeMap<String, String>,
     /// Public discussion-board topics, indexed by topic name.
     pub board_topics: BTreeMap<String, BoardTopicRecord>,
     /// Per-actor discussion-board read cursor, as the latest seen board_post op id.
@@ -276,34 +278,46 @@ impl State {
         actor: &str,
         topic: Option<&str>,
     ) -> Vec<&'a BoardPostRecord> {
-        let cursor = self
-            .discussion_cursor_for(actor, topic)
-            .map(String::as_str)
-            .unwrap_or("");
         let mut posts: Vec<&BoardPostRecord> = self
             .board_posts
             .values()
             .filter(|p| {
+                let cursor = if let Some(topic) = topic {
+                    self.discussion_cursor_for(actor, Some(topic))
+                } else {
+                    self.discussion_cursor_for(actor, Some(&p.topic))
+                }
+                .map(String::as_str)
+                .unwrap_or("");
                 p.from != actor
                     && p.sent_op_id.as_str() > cursor
                     && topic.is_none_or(|t| p.topic == t)
             })
             .collect();
-        posts.sort_by(|a, b| {
-            b.sticky
-                .cmp(&a.sticky)
-                .then_with(|| a.sent_op_id.cmp(&b.sent_op_id))
-        });
+        posts.sort_by(|a, b| a.sent_op_id.cmp(&b.sent_op_id));
         posts
     }
 
     pub fn discussion_cursor_for(&self, actor: &str, topic: Option<&str>) -> Option<&String> {
-        topic
-            .and_then(|t| {
-                self.board_topic_read_cursors
-                    .get(&(actor.to_string(), t.to_string()))
-            })
-            .or_else(|| self.board_read_cursors.get(actor))
+        let global = self.board_read_cursors.get(actor);
+        let Some(topic) = topic else {
+            return global;
+        };
+        let topic = self
+            .board_topic_read_cursors
+            .get(&(actor.to_string(), topic.to_string()));
+        match (topic, global) {
+            (Some(topic), Some(global)) => {
+                if topic.as_str() >= global.as_str() {
+                    Some(topic)
+                } else {
+                    Some(global)
+                }
+            }
+            (Some(topic), None) => Some(topic),
+            (None, Some(global)) => Some(global),
+            (None, None) => None,
+        }
     }
 
     /// Direct replies to a discussion-board post, in send-order.

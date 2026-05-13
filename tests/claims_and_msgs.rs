@@ -590,6 +590,158 @@ fn discussion_topic_creation_search_activity_and_sticky_posts() {
 }
 
 #[test]
+fn discussion_list_and_search_limit_keep_stickies_with_newest_hits() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let sticky = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "release",
+            "matching anchor note",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(sticky.status.success());
+    let sticky_id = String::from_utf8(sticky.stdout).unwrap().trim().to_string();
+
+    let sticky_out = Command::new(bin)
+        .args(["discuss", "sticky", &sticky_id, "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(sticky_out.status.success());
+
+    let mut non_sticky_ids = Vec::new();
+    for idx in 0..6 {
+        let post = Command::new(bin)
+            .args([
+                "discuss",
+                "post",
+                "--topic",
+                "release",
+                &format!("matching update {idx}"),
+                "--actor",
+                "bob",
+            ])
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(post.status.success());
+        non_sticky_ids.push(String::from_utf8(post.stdout).unwrap().trim().to_string());
+    }
+
+    let list = Command::new(bin)
+        .args(["discuss", "list", "--topic", "release", "--limit", "5"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list_s = String::from_utf8(list.stdout).unwrap();
+    assert!(list_s.contains(&sticky_id), "limited list:\n{list_s}");
+    assert!(
+        !list_s.contains(&non_sticky_ids[0]) && !list_s.contains(&non_sticky_ids[1]),
+        "limited list should trim oldest non-sticky posts:\n{list_s}"
+    );
+    assert!(
+        list_s.contains(non_sticky_ids.last().unwrap()),
+        "limited list should keep newest non-sticky post:\n{list_s}"
+    );
+
+    let search = Command::new(bin)
+        .args([
+            "discuss", "search", "matching", "--topic", "release", "--limit", "3",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let search_s = String::from_utf8(search.stdout).unwrap();
+    assert!(search_s.contains(&sticky_id), "limited search:\n{search_s}");
+    assert!(
+        search_s.contains(non_sticky_ids.last().unwrap()) && !search_s.contains(&non_sticky_ids[0]),
+        "limited search should keep sticky plus newest matching posts:\n{search_s}"
+    );
+}
+
+#[test]
+fn discussion_list_and_search_limit_caps_sticky_posts() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    for idx in 0..4 {
+        let post = Command::new(bin)
+            .args([
+                "discuss",
+                "post",
+                "--topic",
+                "sticky-limit",
+                &format!("unique-match sticky note {idx}"),
+                "--actor",
+                "alice",
+            ])
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(post.status.success());
+        let post_id = String::from_utf8(post.stdout).unwrap().trim().to_string();
+
+        let sticky = Command::new(bin)
+            .args(["discuss", "sticky", &post_id, "--actor", "alice"])
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(sticky.status.success());
+    }
+
+    let list = Command::new(bin)
+        .args(["discuss", "list", "--topic", "sticky-limit", "--limit", "3"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list_s = String::from_utf8(list.stdout).unwrap();
+    let list_lines: Vec<_> = list_s.lines().collect();
+    assert_eq!(list_lines.len(), 3, "limited sticky list:\n{list_s}");
+    assert!(
+        list_lines.iter().all(|line| line.contains(" sticky")),
+        "limited sticky list should contain only sticky posts:\n{list_s}"
+    );
+
+    let search = Command::new(bin)
+        .args([
+            "discuss",
+            "search",
+            "unique-match",
+            "--topic",
+            "sticky-limit",
+            "--limit",
+            "2",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let search_s = String::from_utf8(search.stdout).unwrap();
+    let post_lines: Vec<_> = search_s
+        .lines()
+        .filter(|line| line.starts_with("post   "))
+        .collect();
+    assert_eq!(post_lines.len(), 2, "limited sticky search:\n{search_s}");
+    assert!(
+        post_lines.iter().all(|line| line.contains(" sticky")),
+        "limited sticky search should contain only sticky posts:\n{search_s}"
+    );
+}
+
+#[test]
 fn discussion_thread_view_and_topic_read_cursor_support_forum_workflow() {
     let td = TempDir::new().unwrap();
     init_store(&td);
@@ -727,6 +879,97 @@ fn discussion_thread_view_and_topic_read_cursor_support_forum_workflow() {
         unread_ops_s.contains(&other_id),
         "topic cursor should not hide other topics:\n{unread_ops_s}"
     );
+
+    let unread_all = Command::new(bin)
+        .args(["discuss", "unread", "--actor", "dana"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(unread_all.status.success());
+    let unread_all_s = String::from_utf8(unread_all.stdout).unwrap();
+    assert!(
+        !unread_all_s.contains(&root_id)
+            && !unread_all_s.contains(&reply_id)
+            && !unread_all_s.contains(&nested_id),
+        "global unread should honor topic-specific cursors:\n{unread_all_s}"
+    );
+    assert!(
+        unread_all_s.contains(&other_id),
+        "global unread should still show unread posts from other topics:\n{unread_all_s}"
+    );
+
+    let later = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "ideas",
+            "Later idea after topic-specific mark-read.",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(later.status.success());
+    let later_id = String::from_utf8(later.stdout).unwrap().trim().to_string();
+
+    let mark_global = Command::new(bin)
+        .args(["discuss", "mark-read", "--actor", "dana"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(mark_global.status.success());
+
+    let unread_ideas_after_global = Command::new(bin)
+        .args(["discuss", "unread", "--topic", "ideas", "--actor", "dana"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(unread_ideas_after_global.status.success());
+    let unread_ideas_after_global_s = String::from_utf8(unread_ideas_after_global.stdout).unwrap();
+    assert!(
+        !unread_ideas_after_global_s.contains(&later_id),
+        "global cursor should hide newer ideas posts despite an older topic cursor:\n{unread_ideas_after_global_s}"
+    );
+
+    let unread_all_after_global = Command::new(bin)
+        .args(["discuss", "unread", "--actor", "dana"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(unread_all_after_global.status.success());
+    let unread_all_after_global_s = String::from_utf8(unread_all_after_global.stdout).unwrap();
+    assert!(
+        !unread_all_after_global_s.contains(&later_id),
+        "global unread should use the later cursor for each topic:\n{unread_all_after_global_s}"
+    );
+}
+
+#[test]
+fn discussion_mark_read_empty_topic_reports_no_posts() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let topic = Command::new(bin)
+        .args(["discuss", "topic", "new", "empty", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(topic.status.success());
+
+    let mark = Command::new(bin)
+        .args(["discuss", "mark-read", "--topic", "empty", "--actor", "bob"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(mark.status.success());
+    let stderr = String::from_utf8_lossy(&mark.stderr);
+    assert!(
+        stderr.contains("no posts in topic empty"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[test]
@@ -758,6 +1001,9 @@ fn discussion_topics_upgrade_implicit_once_and_reject_duplicate_explicit_create(
         .expect("implicit topic");
     assert!(!implicit.explicit);
     assert_eq!(implicit.post_count, 1);
+    let implicit_created_by = implicit.created_by.clone();
+    let implicit_created_ts = implicit.created_ts.clone();
+    let implicit_created_op_id = implicit.created_op_id.clone();
 
     let upgrade = Command::new(bin)
         .args([
@@ -808,6 +1054,9 @@ fn discussion_topics_upgrade_implicit_once_and_reject_duplicate_explicit_create(
     assert!(upgraded.explicit);
     assert_eq!(upgraded.title, "Architecture strategy");
     assert_eq!(upgraded.post_count, 1);
+    assert_eq!(upgraded.created_by, implicit_created_by);
+    assert_eq!(upgraded.created_ts, implicit_created_ts);
+    assert_eq!(upgraded.created_op_id, implicit_created_op_id);
 }
 
 #[test]
@@ -832,23 +1081,41 @@ fn discussion_sticky_is_idempotent_and_rejects_unknown_posts() {
     assert!(post.status.success());
     let post_id = String::from_utf8(post.stdout).unwrap().trim().to_string();
 
-    for _ in 0..2 {
-        let sticky = Command::new(bin)
-            .args(["discuss", "sticky", &post_id, "--actor", "bob"])
-            .current_dir(td.path())
-            .output()
-            .unwrap();
-        assert!(
-            sticky.status.success(),
-            "sticky should be idempotent: stderr={}",
-            String::from_utf8_lossy(&sticky.stderr)
-        );
-    }
+    let sticky = Command::new(bin)
+        .args(["discuss", "sticky", &post_id, "--actor", "bob"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        sticky.status.success(),
+        "sticky failed: stderr={}",
+        String::from_utf8_lossy(&sticky.stderr)
+    );
 
     let store = Store::open(&td.path().join(".mote")).unwrap();
+    let state_after_first = reducer::replay_store(&store).unwrap();
+    let first_activity = state_after_first.board_topics["triage"]
+        .last_activity_op_id
+        .clone();
+
+    let sticky_again = Command::new(bin)
+        .args(["discuss", "sticky", &post_id, "--actor", "bob"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        sticky_again.status.success(),
+        "sticky should be idempotent: stderr={}",
+        String::from_utf8_lossy(&sticky_again.stderr)
+    );
+
     let state = reducer::replay_store(&store).unwrap();
     assert!(state.board_posts[&post_id].sticky);
     assert_eq!(state.board_topics["triage"].sticky_count, 1);
+    assert_eq!(
+        state.board_topics["triage"].last_activity_op_id,
+        first_activity
+    );
 
     let missing = Command::new(bin)
         .args(["discuss", "sticky", "post-missing", "--actor", "bob"])
@@ -943,6 +1210,51 @@ fn discussion_board_rejects_missing_reply_parent() {
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
         stderr.contains("reply_to post post-missing does not exist"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn discussion_board_rejects_cross_topic_reply() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let parent = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "planning",
+            "Planning root",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(parent.status.success());
+    let parent_id = String::from_utf8(parent.stdout).unwrap().trim().to_string();
+
+    let out = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "ops",
+            "--reply-to",
+            &parent_id,
+            "Wrong topic reply",
+            "--actor",
+            "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("is in topic planning, not ops"),
         "stderr:\n{stderr}"
     );
 }

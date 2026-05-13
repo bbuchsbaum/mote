@@ -891,6 +891,7 @@ fn apply_board_post(
         reply_to,
         ..
     } = o;
+    let topic = topic.trim().to_string();
 
     if state.board_posts.contains_key(&post_id) {
         reject_orphan(
@@ -926,7 +927,7 @@ fn apply_board_post(
         return;
     }
     if let Some(parent) = reply_to.as_deref() {
-        if !state.board_posts.contains_key(parent) {
+        let Some(parent_post) = state.board_posts.get(parent) else {
             reject_orphan(
                 state,
                 op_id,
@@ -934,6 +935,20 @@ fn apply_board_post(
                 actor,
                 ts,
                 format!("reply_to post {parent} does not exist"),
+            );
+            return;
+        };
+        if parent_post.topic != topic {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!(
+                    "reply_to post {parent} is in topic {}, not {topic}",
+                    parent_post.topic
+                ),
             );
             return;
         }
@@ -946,6 +961,9 @@ fn apply_board_post(
         topic_record.last_activity_op_id = op_id.to_string();
     }
 
+    state
+        .board_post_op_index
+        .insert(op_id.to_string(), post_id.clone());
     state.board_posts.insert(
         post_id.clone(),
         crate::state::BoardPostRecord {
@@ -974,6 +992,7 @@ fn apply_board_topic(
     let BoardTopicOp {
         topic, title, body, ..
     } = o;
+    let topic = topic.trim().to_string();
 
     if topic.trim().is_empty() {
         reject_orphan(
@@ -1003,9 +1022,6 @@ fn apply_board_topic(
             existing.explicit = true;
             existing.title = title.unwrap_or_else(|| topic.clone());
             existing.body = body.unwrap_or_default();
-            existing.created_by = actor.to_string();
-            existing.created_ts = ts.to_string();
-            existing.created_op_id = op_id.to_string();
             existing.last_activity_ts = ts.to_string();
             existing.last_activity_op_id = op_id.to_string();
         }
@@ -1042,10 +1058,22 @@ fn apply_board_read(
     let BoardReadOp {
         upto_op_id, topic, ..
     } = o;
+    let topic = topic.map(|t| t.trim().to_string());
+    if topic.as_deref().is_some_and(str::is_empty) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "board_read topic must be non-empty".into(),
+        );
+        return;
+    }
     let post_topic = match state
-        .board_posts
-        .values()
-        .find(|p| p.sent_op_id == upto_op_id)
+        .board_post_op_index
+        .get(&upto_op_id)
+        .and_then(|post_id| state.board_posts.get(post_id))
         .map(|p| p.topic.clone())
     {
         Some(t) => t,
@@ -1129,11 +1157,9 @@ fn apply_board_sticky(
             } else {
                 topic_record.sticky_count = topic_record.sticky_count.saturating_sub(1);
             }
+            topic_record.last_activity_ts = ts.to_string();
+            topic_record.last_activity_op_id = op_id.to_string();
         }
-    }
-    if let Some(topic_record) = state.board_topics.get_mut(&topic) {
-        topic_record.last_activity_ts = ts.to_string();
-        topic_record.last_activity_op_id = op_id.to_string();
     }
     state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
 }
