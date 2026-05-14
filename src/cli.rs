@@ -218,7 +218,7 @@ pub enum Command {
         paths: Vec<String>,
     },
 
-    /// Compound: reserve_open + claim + optional progress note. Compensates on partial failure.
+    /// Compound: reserve_open + claim + status=doing + optional progress note. Compensates on partial failure.
     Begin {
         id: String,
         #[arg(long = "paths", num_args = 1..)]
@@ -415,7 +415,10 @@ pub enum DiscussTopicCmd {
         /// Display title (defaults to topic)
         #[arg(long)]
         title: Option<String>,
-        /// Optional topic description
+        /// Topic description shown in topic listings
+        #[arg(long)]
+        description: Option<String>,
+        /// Optional initial visible post body
         #[arg(long)]
         body: Option<String>,
     },
@@ -1336,14 +1339,27 @@ fn cmd_discuss(
             let op = make_board_post(
                 actor,
                 post_id.clone(),
-                topic,
+                topic.clone(),
                 text,
-                reply_to,
+                reply_to.clone(),
                 Timestamp::now(),
             );
             let name = publish::publish_op(&store, &op)?;
-            println!("{post_id}");
-            verify_accept(&store, &name)
+            let code = verify_accept(&store, &name)?;
+            if code == 0 {
+                if json_mode {
+                    let v = serde_json::json!({
+                        "post_id": post_id,
+                        "topic": topic,
+                        "reply_to": reply_to,
+                    });
+                    println!("{}", serde_json::to_string(&v)?);
+                } else {
+                    println!("{post_id}");
+                    eprintln!("posted {post_id} to topic {topic}");
+                }
+            }
+            Ok(code)
         }
         DiscussCmd::List { topic, limit } => {
             let state = reducer::replay_store(&store)?;
@@ -1416,13 +1432,76 @@ fn cmd_discuss(
             print_thread_posts(state.thread_posts(&post_id), json_mode)
         }
         DiscussCmd::Topic { cmd } => match cmd {
-            DiscussTopicCmd::New { topic, title, body } => {
+            DiscussTopicCmd::New {
+                topic,
+                title,
+                description,
+                body,
+            } => {
                 let actor = store.resolve_actor(actor_flag)?;
                 let topic = normalize_discussion_topic(&topic)?;
-                let op = make_board_topic(actor, topic.clone(), title, body, Timestamp::now());
-                let name = publish::publish_op(&store, &op)?;
-                println!("{topic}");
-                verify_accept(&store, &name)
+                if body.as_deref().is_some_and(|text| text.trim().is_empty()) {
+                    return Err(MoteError::Invalid(
+                        "initial post body must be non-empty".into(),
+                    ));
+                }
+
+                let topic_op = make_board_topic(
+                    actor.clone(),
+                    topic.clone(),
+                    title,
+                    description,
+                    Timestamp::now(),
+                );
+                let topic_name = publish::publish_op(&store, &topic_op)?;
+                let state = reducer::replay_store(&store)?;
+                if !state.was_accepted(topic_name.as_str()) {
+                    let reason = state
+                        .rejection_reason(topic_name.as_str())
+                        .unwrap_or_else(|| "unknown".into());
+                    eprintln!("rejected: {reason}");
+                    return Ok(2);
+                }
+
+                let mut initial_post_id = None;
+                if let Some(body) = body {
+                    let post_id = ids::new_post_id();
+                    let post_op = make_board_post(
+                        actor,
+                        post_id.clone(),
+                        topic.clone(),
+                        body,
+                        None,
+                        Timestamp::now(),
+                    );
+                    let post_name = publish::publish_op(&store, &post_op)?;
+                    let state = reducer::replay_store(&store)?;
+                    if !state.was_accepted(post_name.as_str()) {
+                        let reason = state
+                            .rejection_reason(post_name.as_str())
+                            .unwrap_or_else(|| "unknown".into());
+                        eprintln!("initial post rejected: {reason}");
+                        return Ok(2);
+                    }
+                    initial_post_id = Some(post_id);
+                }
+
+                if json_mode {
+                    let v = serde_json::json!({
+                        "topic": topic,
+                        "initial_post_id": initial_post_id,
+                    });
+                    println!("{}", serde_json::to_string(&v)?);
+                } else {
+                    println!("{topic}");
+                    match initial_post_id.as_deref() {
+                        Some(post_id) => {
+                            eprintln!("created topic {topic} with initial post {post_id}")
+                        }
+                        None => eprintln!("created topic {topic} with no posts"),
+                    }
+                }
+                Ok(0)
             }
         },
         DiscussCmd::Search {
@@ -1918,7 +1997,31 @@ fn cmd_begin(
         return Ok(2);
     }
 
-    // Step 3: optional progress note (best effort).
+    // Step 3: move open work out of the ready queue after the claim lands.
+    if let Some(bead) = state2.beads.get(&id) {
+        if bead.status == Status::Open {
+            let mut set = ScalarSet::default();
+            set.status = Some(Status::Doing);
+            let mut expect = BTreeMap::new();
+            expect.insert("status".to_string(), clock_for(bead, "status")?);
+            let status_op = make_patch(actor.clone(), id.clone(), expect, set, Timestamp::now());
+            let status_name = publish::publish_op(&store, &status_op)?;
+            let state3 = reducer::replay_store(&store)?;
+            if !state3.was_accepted(status_name.as_str()) {
+                let reason = state3
+                    .rejection_reason(status_name.as_str())
+                    .unwrap_or_else(|| "unknown".into());
+                eprintln!("status update rejected: {reason}");
+                let close = make_reserve_close(actor.clone(), rv_id, None, Timestamp::now());
+                let _ = publish::publish_op(&store, &close);
+                let release = make_release(actor, id, None, Timestamp::now());
+                let _ = publish::publish_op(&store, &release);
+                return Ok(2);
+            }
+        }
+    }
+
+    // Step 4: optional progress note (best effort).
     if let Some(text) = note {
         let note_op = make_note(actor, id, "progress".into(), text, Timestamp::now());
         let _ = publish::publish_op(&store, &note_op);

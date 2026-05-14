@@ -658,3 +658,82 @@ That gives you:
 - low-tech collaboration in one repo
 
 without recreating the brittleness you are trying to escape.
+
+## 18. Session, in-flight, and discussion routing roadmap
+
+Recent multi-agent use exposed three follow-on needs that should share one
+design surface instead of becoming separate ad hoc commands.
+
+### 18.1 Session identity
+
+Actor resolution should keep the current precedence:
+
+1. `--actor`
+2. `MOTE_ACTOR`
+3. `.mote/local/actor`
+
+The missing capability is a deliberate session affordance. A future
+`mote session start --as <actor> [--ttl <seconds>]` should:
+
+- print a shell-safe `export MOTE_ACTOR=<actor>` line for the caller to eval or copy
+- publish a TTL-bounded session lease op so other agents can see active sessions
+- warn when the actor falls back to `.mote/local/actor` in a multi-session repo
+
+The CLI cannot set environment variables in its parent shell, so session start
+must be explicit about how the identity is activated.
+
+### 18.2 In-flight dashboard
+
+`mote in-flight` should be a one-shot, read-only derived view. It should not
+replace `mote watch` or `mote ui`; it should answer the narrower question:
+
+> what work is actively being touched right now?
+
+The first version should combine:
+
+- live session leases, grouped by actor
+- live path reservations
+- live issue claims
+- `doing` beads, including whether they have a live claim
+- recent discussion topics with unread or unrouted activity
+
+This remains a replay-only command. It must not infer hidden state from Git or
+process tables unless such context is explicitly marked as advisory.
+
+### 18.3 Discussion routing
+
+Discussion threads are useful for exploration, but decisions and implementation
+must route back into issue state. The board should gain structured routing ops
+rather than relying only on prose.
+
+Candidate commands:
+
+```sh
+mote discuss route post-... --issue bd-...
+mote discuss route topic <topic> --issue bd-...
+mote discuss decision --topic <topic> --body "decision text"
+mote discuss resolve --topic <topic>
+```
+
+The derived routing state should support:
+
+- `needs-bead`: discussion has actionable content but no linked issue
+- `routed`: topic or post is linked to one or more beads
+- `resolved`: discussion no longer needs tracker action
+
+Promotion to a bead should be explicit. A future helper may create a bead from a
+post, but it should record the post/topic link at the same time so the board is
+not a second, competing task tracker.
+
+### 18.4 Acceptance criteria
+
+1. `mote begin` moves open work to `doing` so same-actor sessions do not keep
+   seeing begun work in `mote ready`.
+2. `mote session start --as <actor>` gives the caller a clear activation path
+   and leaves a visible session lease.
+3. `mote in-flight` shows claims, reservations, `doing` work, and active
+   sessions from replayed state only.
+4. Discussion routing can answer "which posts still need tracker action?"
+   without scraping prose.
+5. Board-to-bead promotion creates or links issue work without turning topic
+   bodies into the source of truth.

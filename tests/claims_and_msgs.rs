@@ -400,6 +400,63 @@ fn discussion_post_accepts_body_flag_and_rejects_ambiguous_text() {
 }
 
 #[test]
+fn discussion_topic_new_body_creates_visible_initial_post() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+    let bin = mote_bin();
+
+    let topic = Command::new(bin)
+        .args([
+            "discuss",
+            "topic",
+            "new",
+            "planning",
+            "--title",
+            "Planning",
+            "--description",
+            "Planning metadata",
+            "--body",
+            "Initial visible proposal",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        topic.status.success(),
+        "topic creation failed: stderr={}",
+        String::from_utf8_lossy(&topic.stderr)
+    );
+    assert_eq!(String::from_utf8(topic.stdout).unwrap().trim(), "planning");
+    let stderr = String::from_utf8_lossy(&topic.stderr);
+    assert!(
+        stderr.contains("with initial post post-"),
+        "stderr:\n{stderr}"
+    );
+
+    let state = reducer::replay_store(&store).unwrap();
+    let topic_record = state.board_topics.get("planning").unwrap();
+    assert_eq!(topic_record.body, "Planning metadata");
+    assert_eq!(topic_record.post_count, 1);
+    let posts = state.board_posts_for(Some("planning"));
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body, "Initial visible proposal");
+
+    let list = Command::new(bin)
+        .args(["discuss", "list", "--topic", "planning"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list_s = String::from_utf8(list.stdout).unwrap();
+    assert!(
+        list_s.contains("Initial visible proposal"),
+        "list output:\n{list_s}"
+    );
+}
+
+#[test]
 fn discussion_board_unread_cursor_tracks_new_external_posts() {
     let td = TempDir::new().unwrap();
     init_store(&td);
@@ -531,7 +588,7 @@ fn discussion_topic_creation_search_activity_and_sticky_posts() {
             "release",
             "--title",
             "Release coordination",
-            "--body",
+            "--description",
             "Where agents coordinate release work",
             "--actor",
             "alice",

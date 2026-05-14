@@ -30,7 +30,14 @@ mote --json discuss unread --topic <topic>
 Create a topic before posts exist:
 
 ```sh
-mote discuss topic new <topic> --title "Readable title" --body "Purpose of this discussion"
+mote discuss topic new <topic> --title "Readable title" --description "Purpose of this discussion"
+```
+
+This creates a visible topic even before the first post. To create the topic and
+seed a visible first post in one command, use:
+
+```sh
+mote discuss topic new <topic> --title "Readable title" --body "Initial message"
 ```
 
 Posting to a topic that does not exist creates an implicit topic. Prefer explicit topics for durable discussions.

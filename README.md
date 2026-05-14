@@ -116,7 +116,7 @@ mote inbox
 mote msg ack msg-...
 
 # Discussion plane.
-mote discuss topic new planning --title "Planning"
+mote discuss topic new planning --title "Planning" --description "Coordination thread"
 mote discuss post --topic planning --body "proposal: split parser and test work"
 mote discuss post --topic planning --reply-to post-... --body "I can take tests"
 mote discuss sticky post-...
@@ -127,6 +127,9 @@ mote discuss mark-read --topic planning
 mote discuss replies post-...
 mote discuss thread post-...
 mote discuss topics
+
+# Or create a topic and seed a visible first post:
+mote discuss topic new planning-2 --title "Planning 2" --body "Initial proposal"
 
 # Path plane.
 mote reserve src/auth/ tests/auth/ --issue bd-... --ttl 3600

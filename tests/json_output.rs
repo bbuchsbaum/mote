@@ -300,7 +300,7 @@ fn json_discussion_forum_surfaces_schema() {
             "planning",
             "--title",
             "Planning",
-            "--body",
+            "--description",
             "Agent planning board",
             "--actor",
             "alice",

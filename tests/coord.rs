@@ -274,6 +274,63 @@ fn begin_compensates_when_claim_fails() {
 }
 
 #[test]
+fn begin_marks_open_work_doing_and_removes_it_from_ready() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+    let id = new_bead(&td, "auth", "alice");
+    let bin = mote_bin();
+
+    let ready_before = Command::new(bin)
+        .args(["ready", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(ready_before.status.success());
+    let ready_before_s = String::from_utf8(ready_before.stdout).unwrap();
+    assert!(
+        ready_before_s.contains(&id),
+        "new open bead should be ready before begin:\n{ready_before_s}"
+    );
+
+    let begin = Command::new(bin)
+        .args([
+            "begin",
+            &id,
+            "--paths",
+            "src/auth/",
+            "--note",
+            "starting",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        begin.status.success(),
+        "begin failed: stderr={}",
+        String::from_utf8_lossy(&begin.stderr)
+    );
+
+    let state = reducer::replay_store(&store).unwrap();
+    let bead = &state.beads[&id];
+    assert_eq!(bead.status.as_str(), "doing");
+    assert!(bead.claim.is_some(), "begin should still claim the bead");
+
+    let ready_after = Command::new(bin)
+        .args(["ready", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(ready_after.status.success());
+    let ready_after_s = String::from_utf8(ready_after.stdout).unwrap();
+    assert!(
+        !ready_after_s.contains(&id),
+        "begun bead should not stay in ready:\n{ready_after_s}"
+    );
+}
+
+#[test]
 fn preflight_reports_overlaps_and_clear_paths() {
     let td = TempDir::new().unwrap();
     init_store(&td);
