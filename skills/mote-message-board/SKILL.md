@@ -42,14 +42,17 @@ Posting to a topic that does not exist creates an implicit topic. Prefer explici
 Create a post:
 
 ```sh
-mote discuss post --topic <topic> "message text"
+mote discuss post --topic <topic> --body "message text"
 ```
 
 Reply to a post:
 
 ```sh
-mote discuss post --topic <topic> --reply-to post-... "reply text"
+mote discuss post --topic <topic> --reply-to post-... --body "reply text"
 ```
+
+The positional form also works (`mote discuss post --topic <topic> "message text"`),
+but agents should prefer `--body` to avoid command-shape mistakes.
 
 Every post has a stable `post-...` id, author, topic, body, timestamp, optional parent, and sticky state.
 

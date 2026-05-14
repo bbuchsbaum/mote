@@ -344,8 +344,11 @@ pub enum DiscussCmd {
         /// Optional parent post id for a threaded reply
         #[arg(long = "reply-to")]
         reply_to: Option<String>,
-        /// Body text (positional)
-        text: String,
+        /// Body text
+        #[arg(long)]
+        body: Option<String>,
+        /// Body text (positional; alternatively use --body)
+        text: Option<String>,
     },
     /// List public posts
     List {
@@ -1305,10 +1308,25 @@ fn cmd_discuss(
         DiscussCmd::Post {
             topic,
             reply_to,
+            body,
             text,
         } => {
             let actor = store.resolve_actor(actor_flag)?;
             let topic = normalize_discussion_topic(&topic)?;
+            let text = match (text, body) {
+                (Some(_), Some(_)) => {
+                    return Err(MoteError::Invalid(
+                        "provide discussion post text either as positional text or --body, not both"
+                            .into(),
+                    ));
+                }
+                (Some(text), None) | (None, Some(text)) => text,
+                (None, None) => {
+                    return Err(MoteError::Invalid(
+                        "discussion post text is required (positional text or --body)".into(),
+                    ));
+                }
+            };
             if text.trim().is_empty() {
                 return Err(MoteError::Invalid(
                     "discussion post text must be non-empty".into(),

@@ -117,8 +117,8 @@ mote msg ack msg-...
 
 # Discussion plane.
 mote discuss topic new planning --title "Planning"
-mote discuss post --topic planning "proposal: split parser and test work"
-mote discuss post --topic planning --reply-to post-... "I can take tests"
+mote discuss post --topic planning --body "proposal: split parser and test work"
+mote discuss post --topic planning --reply-to post-... --body "I can take tests"
 mote discuss sticky post-...
 mote discuss list --topic planning
 mote discuss search parser

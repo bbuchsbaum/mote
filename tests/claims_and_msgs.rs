@@ -325,6 +325,81 @@ fn discussion_board_post_list_topics_and_reply() {
 }
 
 #[test]
+fn discussion_post_accepts_body_flag_and_rejects_ambiguous_text() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bin = mote_bin();
+
+    let post = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "planning",
+            "--body",
+            "Flag-shaped body",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        post.status.success(),
+        "--body post failed: stderr={}",
+        String::from_utf8_lossy(&post.stderr)
+    );
+    let post_id = String::from_utf8(post.stdout).unwrap().trim().to_string();
+
+    let list = Command::new(bin)
+        .args(["discuss", "list", "--topic", "planning"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list_s = String::from_utf8(list.stdout).unwrap();
+    assert!(list_s.contains(&post_id), "list output:\n{list_s}");
+    assert!(
+        list_s.contains("Flag-shaped body"),
+        "list output:\n{list_s}"
+    );
+
+    let ambiguous = Command::new(bin)
+        .args([
+            "discuss",
+            "post",
+            "--topic",
+            "planning",
+            "--body",
+            "Flag body",
+            "Positional body",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(ambiguous.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&ambiguous.stderr);
+    assert!(
+        stderr.contains("either as positional text or --body, not both"),
+        "stderr:\n{stderr}"
+    );
+
+    let missing = Command::new(bin)
+        .args(["discuss", "post", "--topic", "planning", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("discussion post text is required"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn discussion_board_unread_cursor_tracks_new_external_posts() {
     let td = TempDir::new().unwrap();
     init_store(&td);
