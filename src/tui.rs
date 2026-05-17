@@ -80,6 +80,9 @@ struct App {
     beads_state: ListState,
     topics_state: ListState,
     activity_state: ListState,
+    discussion_scroll: u16,
+    discussion_scroll_max: u16,
+    discussion_page_rows: u16,
 
     // Derived caches refreshed on each replay.
     bead_ids: Vec<String>,
@@ -111,6 +114,9 @@ impl App {
             beads_state: ListState::default(),
             topics_state: ListState::default(),
             activity_state: ListState::default(),
+            discussion_scroll: 0,
+            discussion_scroll_max: 0,
+            discussion_page_rows: 1,
             bead_ids: Vec::new(),
             topic_names: Vec::new(),
             activity: Vec::new(),
@@ -194,6 +200,8 @@ impl App {
     }
 
     fn move_down(&mut self) {
+        let reset_discussion_scroll = self.tab == Tab::Discussion;
+        let old_selection = self.topics_state.selected();
         let (state, len) = self.current_list_mut();
         if len == 0 {
             return;
@@ -204,18 +212,30 @@ impl App {
             None => 0,
         };
         state.select(Some(next));
+        if reset_discussion_scroll && self.topics_state.selected() != old_selection {
+            self.discussion_scroll = 0;
+        }
     }
 
     fn move_up(&mut self) {
+        let reset_discussion_scroll = self.tab == Tab::Discussion;
+        let old_selection = self.topics_state.selected();
         let (state, _) = self.current_list_mut();
         let next = match state.selected() {
             Some(i) if i > 0 => i - 1,
             _ => 0,
         };
         state.select(Some(next));
+        if reset_discussion_scroll && self.topics_state.selected() != old_selection {
+            self.discussion_scroll = 0;
+        }
     }
 
     fn page_down(&mut self) {
+        if self.tab == Tab::Discussion {
+            self.scroll_discussion_down();
+            return;
+        }
         let (state, len) = self.current_list_mut();
         if len == 0 {
             return;
@@ -225,23 +245,58 @@ impl App {
     }
 
     fn page_up(&mut self) {
+        if self.tab == Tab::Discussion {
+            self.scroll_discussion_up();
+            return;
+        }
         let (state, _) = self.current_list_mut();
         let next = state.selected().map(|i| i.saturating_sub(10)).unwrap_or(0);
         state.select(Some(next));
     }
 
     fn home(&mut self) {
+        let reset_discussion_scroll = self.tab == Tab::Discussion;
+        let old_selection = self.topics_state.selected();
         let (state, len) = self.current_list_mut();
         if len > 0 {
             state.select(Some(0));
         }
+        if reset_discussion_scroll && self.topics_state.selected() != old_selection {
+            self.discussion_scroll = 0;
+        }
     }
 
     fn end(&mut self) {
+        let reset_discussion_scroll = self.tab == Tab::Discussion;
+        let old_selection = self.topics_state.selected();
         let (state, len) = self.current_list_mut();
         if len > 0 {
             state.select(Some(len - 1));
         }
+        if reset_discussion_scroll && self.topics_state.selected() != old_selection {
+            self.discussion_scroll = 0;
+        }
+    }
+
+    fn scroll_discussion_down(&mut self) {
+        let step = self.discussion_page_rows.max(1);
+        self.discussion_scroll = self
+            .discussion_scroll
+            .saturating_add(step)
+            .min(self.discussion_scroll_max);
+    }
+
+    fn scroll_discussion_up(&mut self) {
+        let step = self.discussion_page_rows.max(1);
+        self.discussion_scroll = self.discussion_scroll.saturating_sub(step);
+    }
+
+    fn scroll_discussion_top(&mut self) {
+        self.discussion_scroll = 0;
+    }
+
+    fn scroll_discussion_bottom(&mut self) {
+        self.discussion_scroll = self.discussion_scroll_max;
     }
 
     fn current_list_mut(&mut self) -> (&mut ListState, usize) {
@@ -324,6 +379,12 @@ fn event_loop<B: Backend>(
                         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.move_up(),
                         (KeyCode::PageDown, _) => app.page_down(),
                         (KeyCode::PageUp, _) => app.page_up(),
+                        (KeyCode::Home, _) if app.tab == Tab::Discussion => {
+                            app.scroll_discussion_top()
+                        }
+                        (KeyCode::End, _) if app.tab == Tab::Discussion => {
+                            app.scroll_discussion_bottom()
+                        }
                         (KeyCode::Home, _) | (KeyCode::Char('g'), _) => app.home(),
                         (KeyCode::End, _) | (KeyCode::Char('G'), _) => app.end(),
                         (KeyCode::Char('r'), _) => needs_refresh = true,
@@ -401,9 +462,14 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::raw(
-        "  q quit · Tab next · 1-4 jump · j/k move · r refresh · ? help",
-    ));
+    let scroll_hint = if app.tab == Tab::Discussion {
+        " · PgUp/PgDn scroll posts"
+    } else {
+        " · PgUp/PgDn page"
+    };
+    spans.push(Span::raw(format!(
+        "  q quit · Tab next · 1-4 jump · j/k move{scroll_hint} · r refresh · ? help"
+    )));
     if let Some(err) = &app.error {
         spans.push(Span::raw("  |  "));
         spans.push(Span::styled(
@@ -807,13 +873,26 @@ fn render_discussion(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
         Some(topic) => discussion_post_lines(state, &topic),
         None => vec![Line::from("(no topic selected)")],
     };
+    let visible_rows = chunks[1].height.saturating_sub(2).max(1);
+    app.discussion_page_rows = visible_rows;
+    app.discussion_scroll_max = posts_lines
+        .len()
+        .saturating_sub(visible_rows as usize)
+        .min(u16::MAX as usize) as u16;
+    app.discussion_scroll = app.discussion_scroll.min(app.discussion_scroll_max);
+
     let title = match app.topics_state.selected().and_then(|i| topics.get(i)) {
+        Some(t) if app.discussion_scroll_max > 0 => format!(
+            "Posts in {} — {}  scroll {}/{}",
+            t.topic, t.title, app.discussion_scroll, app.discussion_scroll_max
+        ),
         Some(t) => format!("Posts in {} — {}", t.topic, t.title),
         None => "Posts".to_string(),
     };
     f.render_widget(
         Paragraph::new(posts_lines)
             .wrap(Wrap { trim: false })
+            .scroll((app.discussion_scroll, 0))
             .block(Block::default().borders(Borders::ALL).title(title)),
         chunks[1],
     );
@@ -828,7 +907,7 @@ fn discussion_post_lines(state: &State, topic: &str) -> Vec<Line<'static>> {
         ))];
     }
     let mut lines: Vec<Line> = Vec::new();
-    for p in posts.iter().take(60) {
+    for p in posts {
         let sticky = if p.sticky { " ★" } else { "" };
         lines.push(Line::from(vec![
             Span::styled(p.post_id.clone(), Style::default().fg(Color::Cyan)),
@@ -839,7 +918,7 @@ fn discussion_post_lines(state: &State, topic: &str) -> Vec<Line<'static>> {
             Span::styled(p.sent_ts.clone(), Style::default().fg(Color::DarkGray)),
             Span::raw(if p.reply_to.is_some() { "  ↪" } else { "" }),
         ]));
-        for body_line in p.body.lines().take(4) {
+        for body_line in p.body.lines() {
             lines.push(Line::from(format!("  {body_line}")));
         }
         lines.push(Line::from(""));
@@ -982,8 +1061,9 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("Tab / S-Tab   next / prev tab"),
         Line::from("1 2 3 4       jump to tab"),
         Line::from("j/k or ↑/↓    move selection"),
-        Line::from("g / G         top / bottom"),
-        Line::from("PgUp / PgDn   move ten rows"),
+        Line::from("g / G         top / bottom of selected list"),
+        Line::from("PgUp / PgDn   page list; in Discussion, scroll posts"),
+        Line::from("Home / End    in Discussion, top / bottom of posts"),
         Line::from("r             force refresh now"),
         Line::from("? / h         show / hide help"),
         Line::from(""),
@@ -1007,5 +1087,115 @@ fn truncate(s: &str, max: usize) -> String {
         let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
         t.push('…');
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::BoardPostRecord;
+
+    fn test_app() -> App {
+        App {
+            actor: None,
+            tab: Tab::Discussion,
+            state: None,
+            last_refresh_ts: None,
+            error: None,
+            show_help: false,
+            store_root: ".mote".into(),
+            beads_state: ListState::default(),
+            topics_state: ListState::default(),
+            activity_state: ListState::default(),
+            discussion_scroll: 0,
+            discussion_scroll_max: 0,
+            discussion_page_rows: 1,
+            bead_ids: Vec::new(),
+            topic_names: Vec::new(),
+            activity: Vec::new(),
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn discussion_page_keys_scroll_post_pane_without_moving_topic_selection() {
+        let mut app = test_app();
+        app.topic_names = vec!["alpha".into(), "beta".into()];
+        app.topics_state.select(Some(1));
+        app.discussion_page_rows = 5;
+        app.discussion_scroll_max = 12;
+
+        app.page_down();
+        assert_eq!(app.topics_state.selected(), Some(1));
+        assert_eq!(app.discussion_scroll, 5);
+
+        app.page_down();
+        app.page_down();
+        assert_eq!(app.discussion_scroll, 12);
+
+        app.page_up();
+        assert_eq!(app.discussion_scroll, 7);
+
+        app.scroll_discussion_top();
+        assert_eq!(app.discussion_scroll, 0);
+        app.scroll_discussion_bottom();
+        assert_eq!(app.discussion_scroll, 12);
+    }
+
+    #[test]
+    fn changing_discussion_topic_resets_post_scroll() {
+        let mut app = test_app();
+        app.topic_names = vec!["alpha".into(), "beta".into()];
+        app.topics_state.select(Some(0));
+        app.discussion_scroll = 8;
+        app.discussion_scroll_max = 20;
+
+        app.move_down();
+        assert_eq!(app.topics_state.selected(), Some(1));
+        assert_eq!(app.discussion_scroll, 0);
+    }
+
+    #[test]
+    fn discussion_post_lines_include_full_bodies_and_all_posts() {
+        let mut state = State::default();
+        for i in 0..61 {
+            let body = if i == 0 {
+                (1..=6)
+                    .map(|line| format!("line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                format!("body {i}")
+            };
+            let post_id = format!("post-{i:03}");
+            state.board_posts.insert(
+                post_id.clone(),
+                BoardPostRecord {
+                    post_id,
+                    from: "alice".into(),
+                    topic: "planning".into(),
+                    body,
+                    reply_to: None,
+                    sticky: false,
+                    sticky_op_id: None,
+                    sent_ts: format!("2026-05-14T00:00:{i:02}Z"),
+                    sent_op_id: format!("op-{i:03}"),
+                },
+            );
+        }
+
+        let lines = discussion_post_lines(&state, "planning");
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("line 6"), "body text was truncated:\n{text}");
+        assert!(
+            text.contains("post-060"),
+            "post list was truncated:\n{text}"
+        );
     }
 }
