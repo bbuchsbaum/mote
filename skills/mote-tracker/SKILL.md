@@ -112,6 +112,30 @@ mote release <bd-id>
 mote unreserve <rv-id>
 ```
 
+## Oversight (Read-Only)
+
+To observe store state without mutating it, use the passive viewers. They only
+replay the op log and never publish ops, so they are safe to leave running while
+other agents write.
+
+```sh
+mote watch            # board-style snapshot that re-renders on every store change
+mote --json watch     # one JSON snapshot per change, for piping into jq or a UI
+mote ui               # interactive TUI dashboard
+```
+
+`mote watch --interval <secs>` sets the periodic fallback tick (default 5) so
+lease expiry is reflected even without new ops.
+
+`mote ui` opens a four-tab dashboard (Overview / Beads / Discussion / Activity)
+with per-bead detail and recent op history, including rejected ops and their
+reasons. Keys: `Tab`/`Shift+Tab` or `1`-`4` switch tabs, `j`/`k` (or arrows)
+move, `g`/`G` jump to top/bottom, `r` refreshes, `?` shows help, `q` quits.
+
+Prefer these for a human or supervising agent watching progress. They are not a
+substitute for `mote show`, `mote who-has`, or `mote history` when you need a
+single precise answer in a script.
+
 ## Exit Codes
 
 - `0`: success

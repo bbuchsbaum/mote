@@ -25,6 +25,18 @@ mote --json discuss topics
 mote --json discuss unread --topic <topic>
 ```
 
+To browse the board read-only without consuming unread state, open the TUI
+dashboard and switch to its Discussion tab:
+
+```sh
+mote ui   # Discussion tab (press 3) lists topics and threads; q quits
+```
+
+`mote ui` and `mote watch` only replay the op log and never publish, so they are
+safe for a supervising human or agent to leave running. Reading the board this
+way does not advance your discussion read cursor — use `mote discuss mark-read`
+for that.
+
 ## Topics
 
 Create a topic before posts exist:
