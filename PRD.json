@@ -125,7 +125,7 @@
   "data_model": {
     "bead": {
       "scalar_fields_with_clocks": ["title", "status", "priority", "body", "assignee"],
-      "set_fields": ["tags", "deps"],
+      "set_fields": ["tags", "deps", "rels"],
       "append_only": ["notes", "incoming_msgs"],
       "tombstone": "deleted_at (set by `delete` op)"
     },
@@ -136,7 +136,8 @@
       "body":     { "type": "string", "default": "", "rule": "Canonical summary only. Agent chatter belongs in notes, not body." },
       "assignee": { "type": "string?", "rule": "Distinct from `claimed_by`. Assignee is intent (who should do it); claim is current TTL lease." },
       "tags":     { "type": "set<string>" },
-      "deps":     { "type": "set<bead_id, kind=blocks>", "rule": "Cycles are accepted but `ready` won't fire on a node in a cycle of open beads." }
+      "deps":     { "type": "set<bead_id, kind=blocks>", "rule": "Blocking dependencies. Every dep edge kind blocks readiness for backward compatibility; cycles are accepted but `ready` won't fire on a node in a cycle of open beads." },
+      "rels":     { "type": "set<bead_id, kind=parent>", "rule": "Non-blocking relationships for hierarchy/containment. `ready` ignores these edges." }
     },
     "derived_state_per_bead": {
       "_clock": "{ field_name -> op_id_of_last_accepted_writer }",
@@ -148,7 +149,7 @@
   "planes": {
     "issue": {
       "purpose": "Small mutable scalars + sets + append-only notes describing each bead.",
-      "ops": ["create", "patch", "tag_add", "tag_remove", "dep_add", "dep_remove", "note", "close", "delete"]
+      "ops": ["create", "patch", "tag_add", "tag_remove", "dep_add", "dep_remove", "rel_add", "rel_remove", "note", "close", "delete"]
     },
     "path": {
       "purpose": "Advisory TTL-bounded reservations over repo-relative paths so agents do not stomp each other's edits.",
@@ -182,14 +183,14 @@
     "op": "op id (string equal to the filename without .json)",
     "ts": "RFC3339 UTC timestamp with microsecond precision; MUST equal the timestamp embedded in the filename",
     "actor": "the actor publishing this op",
-    "kind": "one of: create | patch | tag_add | tag_remove | dep_add | dep_remove | note | claim | release | close | delete | reserve_open | reserve_close | msg_send | msg_ack | board_topic | board_post | board_sticky | board_read"
+    "kind": "one of: create | patch | tag_add | tag_remove | dep_add | dep_remove | rel_add | rel_remove | note | claim | release | close | delete | reserve_open | reserve_close | msg_send | msg_ack | board_topic | board_post | board_sticky | board_read"
   },
 
   "op_kinds": {
     "create": {
       "fields": {
         "entity": "bd-<ULID>",
-        "set":    "{ title, status?, priority?, body?, assignee? }  (scalars only; tags/deps go through tag_add/dep_add)"
+        "set":    "{ title, status?, priority?, body?, assignee? }  (scalars only; tags/deps/rels go through tag_add/dep_add/rel_add)"
       },
       "reducer": "Accepted iff no prior accepted `create` exists for entity. On accept, every set field's clock becomes this op id.",
       "example": {
@@ -236,6 +237,14 @@
     "dep_remove": {
       "fields": { "entity": "bd-<ULID>  (child)", "parent": "bd-<ULID>", "dep_kind": "string  (default 'blocks')" },
       "reducer": "Idempotent. Accepted if both entities exist; no-op if the edge is absent."
+    },
+    "rel_add": {
+      "fields": { "entity": "bd-<ULID>  (child)", "parent": "bd-<ULID>", "rel_kind": "string  (default 'parent'). Named `rel_kind` (not `kind`) so it does not collide with the envelope's `kind` tag." },
+      "reducer": "Idempotent. Accepted if both entities exist and are not deleted; rejected if entity == parent (self-relation). Does not affect readiness."
+    },
+    "rel_remove": {
+      "fields": { "entity": "bd-<ULID>  (child)", "parent": "bd-<ULID>", "rel_kind": "string  (default 'parent')" },
+      "reducer": "Idempotent. Accepted if both entities exist; no-op if the edge is absent. Does not affect readiness."
     },
     "note": {
       "fields": {
@@ -348,7 +357,7 @@
 
   "concurrency_model": {
     "scalar_field_clocks": "Each scalar field carries an op_id of its last accepted writer. A `patch` must declare expectations matching current clocks for every field it sets. Two patches to disjoint fields both succeed.",
-    "set_fields": "tag_add/tag_remove/dep_add/dep_remove are commutative and idempotent. No clocks needed.",
+    "set_fields": "tag_add/tag_remove/dep_add/dep_remove/rel_add/rel_remove are commutative and idempotent. No clocks needed.",
     "append_only": "Notes and msg_send ops never conflict. msg_ack is a one-shot per (recipient, msg_id).",
     "claim_leases": "TTL-bounded; expired leases auto-yield to the next claim. Stale agents do not leave permanent locks.",
     "path_reservations": "TTL-bounded advisory leases. Overlap rule prevents two actors from believing they own the same code area. v0.2 supports only `exclusive` mode. Honor is voluntary by convention; a non-cooperating writer is out of scope."
@@ -380,12 +389,18 @@
       { "name": "init",      "synopsis": "mote init", "description": "Create .mote/ in the current dir if absent; write FORMAT.json; create tmp/, ops/, local/. Idempotent." },
       { "name": "new",       "synopsis": "mote new \"<title>\" [-p N] [--body STR] [--tag T]... [--dep ID]...", "description": "Publish a `create` op (plus tag_add/dep_add ops for any --tag / --dep). Prints the new bd-id." },
       { "name": "set",       "synopsis": "mote set <id> field=value...", "description": "Publish a scalar `patch` op. expect clocks are taken from the current replayed state at command time. Multiple field=value pairs allowed; all packed into one op. Exit 2 on conflict." },
-      { "name": "show",      "synopsis": "mote show <id>", "description": "Render full bead state (scalars + tags + deps + notes + claim + active reservations)." },
-      { "name": "ls",        "synopsis": "mote ls [--ready] [--status=...] [--mine] [--tag=T] [--actor=A]", "description": "List beads. Default: open beads. `--ready` is equivalent to `mote ready`." },
+      { "name": "show",      "synopsis": "mote show <id>", "description": "Render full bead state (scalars + tags + deps + relations + notes + claim + active reservations), including downward relation children and blocking dependents." },
+      { "name": "ls",        "synopsis": "mote ls [--ready] [--status=...] [--mine] [--tag=T]... [--actor=A]", "description": "List beads. Default: open beads. Multiple --tag filters are an intersection. `--ready` is equivalent to `mote ready`." },
       { "name": "ready",     "synopsis": "mote ready", "description": "List beads that are open + have no open blocking deps + are not currently claimed by another actor." },
       { "name": "history",   "synopsis": "mote history <id> [--include-rejected]", "description": "Print all ops touching this entity in filename order. Default omits rejected ops; `--include-rejected` includes them with their rejection reason." },
-      { "name": "dep",       "synopsis": "mote dep add|rm <child> <parent> [--kind blocks]", "description": "Manage deps. Publishes one `dep_add` or `dep_remove` op." },
-      { "name": "tag",       "synopsis": "mote tag add|rm <id> <tag>", "description": "Manage tags. Publishes one `tag_add` or `tag_remove` op." },
+      { "name": "dep",       "synopsis": "mote dep add|rm <child> <parent> [--kind blocks]", "description": "Manage blocking deps. Publishes one `dep_add` or `dep_remove` op. Containment-looking kinds such as `parent` warn at the CLI but still block for compatibility." },
+      { "name": "rel",       "synopsis": "mote rel add|rm <child> <parent> [--kind parent]", "description": "Manage non-blocking relationships for hierarchy/containment. Publishes one `rel_add` or `rel_remove` op." },
+      { "name": "parents",   "synopsis": "mote parents <id>", "description": "List non-blocking relation parents of a bead." },
+      { "name": "children",  "synopsis": "mote children <id>", "description": "List non-blocking relation children of a bead." },
+      { "name": "dependents", "synopsis": "mote dependents <id>", "description": "List beads blocked by this bead through dependency edges." },
+      { "name": "tag",       "synopsis": "mote tag add <id> <tag>... | mote tag rm <id> <tag>", "description": "Manage tags. `tag add` can publish multiple `tag_add` ops in one invocation." },
+      { "name": "batch",     "synopsis": "mote batch [path|-]", "description": "Read JSONL batch actions and publish ordinary ops sequentially, reporting accepted/rejected/skipped results." },
+      { "name": "import",    "synopsis": "mote import [path|-]", "description": "Read a JSON plan with beads, deps, and relations and publish ordinary ops sequentially." },
       { "name": "note",      "synopsis": "mote note <id> --kind <note_kind> \"<text>\"", "description": "Append-only note. note_kind in: note | progress | decision | handoff | blocker." },
       { "name": "close",     "synopsis": "mote close <id>", "description": "Publish a `close` op. Sets status=closed. Idempotent." },
       { "name": "claim",     "synopsis": "mote claim <id> [--by actor] [--ttl s]", "description": "Publish a `claim` op." },
@@ -450,11 +465,11 @@
       },
       {
         "id": "M2",
-        "name": "Issue plane — scalars, tags, deps",
+        "name": "Issue plane — scalars, tags, deps, relations",
         "deliverables": [
-          "Op kinds: create, patch, tag_add, tag_remove, dep_add, dep_remove, close, delete.",
+          "Op kinds: create, patch, tag_add, tag_remove, dep_add, dep_remove, rel_add, rel_remove, close, delete.",
           "Reducer with per-field clocks.",
-          "CLI: init, new, set, show, ls, history, dep, tag, close, fsck."
+          "CLI: init, new, set, show, ls, history, dep, rel, parents, children, dependents, tag, batch, import, close, fsck."
         ],
         "exit_criteria": "Acceptance tests A1, A2, A9 pass."
       },

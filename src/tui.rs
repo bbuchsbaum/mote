@@ -755,6 +755,33 @@ fn bead_detail_lines(state: &State, b: &Bead) -> Vec<Line<'static>> {
             .join(", ");
         lines.push(Line::from(format!("deps: {deps}")));
     }
+    if !b.rels.is_empty() {
+        let rels = b
+            .rels
+            .iter()
+            .map(|(p, k)| format!("{p}({k})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(format!("rels: {rels}")));
+    }
+    let children = state.relation_children_of(&b.id);
+    if !children.is_empty() {
+        let child_ids = children
+            .iter()
+            .map(|(child, kind)| format!("{}({kind})", child.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(format!("children: {child_ids}")));
+    }
+    let dependents = state.dependency_children_of(&b.id);
+    if !dependents.is_empty() {
+        let dependent_ids = dependents
+            .iter()
+            .map(|(child, kind)| format!("{}({kind})", child.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(format!("dependents: {dependent_ids}")));
+    }
     if let Some(c) = &b.claim {
         lines.push(Line::from(vec![
             Span::raw("claim: "),

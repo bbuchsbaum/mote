@@ -10,8 +10,8 @@ use tempfile::TempDir;
 
 use mote::op::{
     self, Op, ScalarSet, Status, make_claim, make_create, make_delete, make_dep, make_msg_ack,
-    make_msg_send, make_note, make_patch, make_release, make_reserve_close, make_reserve_open,
-    make_tag,
+    make_msg_send, make_note, make_patch, make_rel, make_release, make_reserve_close,
+    make_reserve_open, make_tag,
 };
 use mote::{ids, paths, publish, reducer, repo::Store};
 
@@ -139,6 +139,8 @@ enum RandomOp {
     Release(String, String),     // entity, actor
     DepAdd(String, String),      // child, parent
     DepRemove(String, String),   // child, parent
+    RelAdd(String, String),      // child, parent
+    RelRemove(String, String),   // child, parent
     ReserveOpen(String, String, Vec<String>, u32), // entity, actor, paths, ttl
     MsgSend(String, String, String, String), // from, to, body, msg_id
     MsgAck(String, String),      // actor, msg_id
@@ -176,6 +178,16 @@ fn arb_random_op() -> impl Strategy<Value = RandomOp> {
             (0..POOL_SIZE).prop_map(entity_id)
         )
             .prop_map(|(c, p)| RandomOp::DepRemove(c, p)),
+        (
+            (0..POOL_SIZE).prop_map(entity_id),
+            (0..POOL_SIZE).prop_map(entity_id)
+        )
+            .prop_map(|(c, p)| RandomOp::RelAdd(c, p)),
+        (
+            (0..POOL_SIZE).prop_map(entity_id),
+            (0..POOL_SIZE).prop_map(entity_id)
+        )
+            .prop_map(|(c, p)| RandomOp::RelRemove(c, p)),
         (
             entity.clone(),
             actor.clone(),
@@ -308,6 +320,32 @@ fn publish_random(store: &Store, op: &RandomOp) {
                     c.clone(),
                     p.clone(),
                     "blocks".into(),
+                    ts,
+                ),
+            );
+        }
+        RandomOp::RelAdd(c, p) => {
+            let _ = publish::publish_op(
+                store,
+                &make_rel(
+                    true,
+                    "alice".into(),
+                    c.clone(),
+                    p.clone(),
+                    "parent".into(),
+                    ts,
+                ),
+            );
+        }
+        RandomOp::RelRemove(c, p) => {
+            let _ = publish::publish_op(
+                store,
+                &make_rel(
+                    false,
+                    "alice".into(),
+                    c.clone(),
+                    p.clone(),
+                    "parent".into(),
                     ts,
                 ),
             );

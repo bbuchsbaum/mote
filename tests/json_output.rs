@@ -93,7 +93,14 @@ fn json_show_schema() {
         assert_obj_has_str(&v, k);
     }
     assert_obj_has_int(&v, "priority");
-    for k in &["tags", "deps", "notes"] {
+    for k in &[
+        "tags",
+        "deps",
+        "relations",
+        "children",
+        "dependents",
+        "notes",
+    ] {
         assert_obj_has_array(&v, k);
     }
     assert_eq!(o["id"], Value::String(id));

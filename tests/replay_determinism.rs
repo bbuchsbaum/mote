@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use mote::ids;
 use mote::op::{
     ScalarSet, Status, make_claim, make_close, make_create, make_dep, make_msg_ack, make_msg_send,
-    make_note, make_patch, make_release, make_reserve_close, make_reserve_open, make_tag,
+    make_note, make_patch, make_rel, make_release, make_reserve_close, make_reserve_open, make_tag,
 };
 use mote::{publish, reducer, repo::Store};
 
@@ -105,6 +105,18 @@ fn a10_two_replays_produce_identical_state() {
             a.clone(),
             b.clone(),
             "blocks".into(),
+            Timestamp::now(),
+        ),
+    )
+    .unwrap();
+    publish::publish_op(
+        &store,
+        &make_rel(
+            true,
+            "alice".into(),
+            a.clone(),
+            b.clone(),
+            "parent".into(),
             Timestamp::now(),
         ),
     )
@@ -245,11 +257,12 @@ fn a10_two_replays_produce_identical_state() {
     assert_eq!(s1.reservations.len(), s2.reservations.len());
     assert_eq!(s1.beads[&a].notes.len(), s2.beads[&a].notes.len());
 
-    // Bead A: status doing; tags={backend}; deps={(B,blocks)}; 2 notes; closed claim absent.
+    // Bead A: status doing; tags={backend}; deps={(B,blocks)}; rels={(B,parent)}; 2 notes; closed claim absent.
     let a1 = &s1.beads[&a];
     assert_eq!(a1.status, Status::Doing);
     assert!(a1.tags.contains("backend"));
     assert_eq!(a1.deps.len(), 1);
+    assert_eq!(a1.rels.len(), 1);
     assert_eq!(a1.notes.len(), 2);
     assert!(a1.claim.is_none(), "released claim should be cleared");
 

@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::op::{
     BoardPostOp, BoardReadOp, BoardStickyOp, BoardTopicOp, ClaimOp, CloseOp, CreateOp, DeleteOp,
-    DepOp, MsgAckOp, MsgSendOp, NoteOp, Op, PatchOp, ReleaseOp, ReserveCloseOp, ReserveOpenOp,
-    ScalarSet, Status, TagOp, validate_msg_kind, validate_note_kind,
+    DepOp, MsgAckOp, MsgSendOp, NoteOp, Op, PatchOp, RelOp, ReleaseOp, ReserveCloseOp,
+    ReserveOpenOp, ScalarSet, Status, TagOp, validate_msg_kind, validate_note_kind,
 };
 use crate::repo::Store;
 use crate::state::{Bead, HistoryEntry, State};
@@ -100,6 +100,8 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
         Op::TagRemove(o) => apply_tag(state, op_id, kind, &actor, &ts, o, false),
         Op::DepAdd(o) => apply_dep(state, op_id, kind, &actor, &ts, o, true),
         Op::DepRemove(o) => apply_dep(state, op_id, kind, &actor, &ts, o, false),
+        Op::RelAdd(o) => apply_rel(state, op_id, kind, &actor, &ts, o, true),
+        Op::RelRemove(o) => apply_rel(state, op_id, kind, &actor, &ts, o, false),
         Op::Note(o) => apply_note(state, op_id, kind, &actor, &ts, o),
         Op::Close(o) => apply_close(state, op_id, kind, &actor, &ts, o),
         Op::Delete(o) => apply_delete(state, op_id, kind, &actor, &ts, o),
@@ -203,6 +205,7 @@ fn apply_create(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &st
         assignee: set.assignee,
         tags: BTreeSet::new(),
         deps: BTreeSet::new(),
+        rels: BTreeSet::new(),
         clock,
         notes: Vec::new(),
         claim: None,
@@ -446,6 +449,99 @@ fn apply_dep(
         bead.deps.insert(edge);
     } else {
         bead.deps.remove(&edge);
+    }
+    accept(state, &entity, op_id, kind, actor, ts);
+}
+
+fn apply_rel(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: RelOp,
+    add: bool,
+) {
+    let RelOp {
+        entity,
+        parent,
+        rel_kind,
+        ..
+    } = o;
+    if entity == parent {
+        reject(
+            state,
+            &entity,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "self-relation forbidden".into(),
+        );
+        return;
+    }
+
+    let parent_present = state.beads.contains_key(&parent);
+    if !parent_present {
+        reject(
+            state,
+            &entity,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("parent {parent} does not exist"),
+        );
+        return;
+    }
+    if add {
+        let parent_alive = state.beads.get(&parent).is_some_and(|b| !b.is_deleted());
+        if !parent_alive {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("parent {parent} is deleted"),
+            );
+            return;
+        }
+    }
+
+    let bead = match state.beads.get_mut(&entity) {
+        Some(b) if !b.is_deleted() => b,
+        Some(_) => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "entity is deleted".into(),
+            );
+            return;
+        }
+        None => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("entity {entity} does not exist"),
+            );
+            return;
+        }
+    };
+    let edge = (parent, rel_kind);
+    if add {
+        bead.rels.insert(edge);
+    } else {
+        bead.rels.remove(&edge);
     }
     accept(state, &entity, op_id, kind, actor, ts);
 }

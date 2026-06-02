@@ -17,8 +17,10 @@ pub struct Bead {
     pub body: String,
     pub assignee: Option<String>,
     pub tags: BTreeSet<String>,
-    /// (parent_id, kind) — current bead is blocked on `parent_id`
+    /// (parent_id, kind) — current bead is blocked on `parent_id`.
     pub deps: BTreeSet<(String, String)>,
+    /// (parent_id, kind) — non-blocking hierarchy/containment relationships.
+    pub rels: BTreeSet<(String, String)>,
     pub clock: BTreeMap<String, String>,
     pub notes: Vec<Note>,
     pub claim: Option<ClaimState>,
@@ -209,7 +211,7 @@ impl State {
     /// A bead is "ready" when:
     ///   - it's not deleted
     ///   - status is `open`
-    ///   - every parent dep is either missing, deleted, or closed
+    ///   - every blocking parent dep is either missing, deleted, or closed
     ///
     /// Claim filtering (PRD: "not currently claimed by another actor") arrives
     /// in M4 once `claim`/`release` ops are wired through the reducer.
@@ -222,6 +224,42 @@ impl State {
                 .get(parent_id)
                 .is_none_or(|p| p.is_deleted() || p.status == Status::Closed)
         })
+    }
+
+    /// Non-blocking relation children of `parent_id`, in bead id order.
+    pub fn relation_children_of<'a>(&'a self, parent_id: &str) -> Vec<(&'a Bead, &'a str)> {
+        let mut children: Vec<(&Bead, &str)> = self
+            .live_beads()
+            .flat_map(|b| {
+                b.rels.iter().filter_map(move |(p, k)| {
+                    if p == parent_id {
+                        Some((b, k.as_str()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        children.sort_by(|(a, ak), (b, bk)| a.id.cmp(&b.id).then_with(|| ak.cmp(bk)));
+        children
+    }
+
+    /// Blocking dependency children of `parent_id`, in bead id order.
+    pub fn dependency_children_of<'a>(&'a self, parent_id: &str) -> Vec<(&'a Bead, &'a str)> {
+        let mut children: Vec<(&Bead, &str)> = self
+            .live_beads()
+            .flat_map(|b| {
+                b.deps.iter().filter_map(move |(p, k)| {
+                    if p == parent_id {
+                        Some((b, k.as_str()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        children.sort_by(|(a, ak), (b, bk)| a.id.cmp(&b.id).then_with(|| ak.cmp(bk)));
+        children
     }
 
     /// Iterate ready beads, in BTreeMap (id) order.

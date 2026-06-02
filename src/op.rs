@@ -156,6 +156,24 @@ fn default_dep_kind() -> String {
     "blocks".to_string()
 }
 
+/// Non-blocking relationship op. These edges express hierarchy/containment
+/// and are intentionally ignored by readiness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub entity: BeadId, // child
+    pub parent: BeadId,
+    #[serde(default = "default_rel_kind")]
+    pub rel_kind: String,
+}
+
+fn default_rel_kind() -> String {
+    "parent".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteOp {
     pub v: u32,
@@ -322,6 +340,8 @@ pub enum Op {
     TagRemove(TagOp),
     DepAdd(DepOp),
     DepRemove(DepOp),
+    RelAdd(RelOp),
+    RelRemove(RelOp),
     Note(NoteOp),
     Close(CloseOp),
     Delete(DeleteOp),
@@ -344,6 +364,7 @@ impl Op {
             Op::Patch(o) => &o.op,
             Op::TagAdd(o) | Op::TagRemove(o) => &o.op,
             Op::DepAdd(o) | Op::DepRemove(o) => &o.op,
+            Op::RelAdd(o) | Op::RelRemove(o) => &o.op,
             Op::Note(o) => &o.op,
             Op::Close(o) => &o.op,
             Op::Delete(o) => &o.op,
@@ -366,6 +387,7 @@ impl Op {
             Op::Patch(o) => &o.actor,
             Op::TagAdd(o) | Op::TagRemove(o) => &o.actor,
             Op::DepAdd(o) | Op::DepRemove(o) => &o.actor,
+            Op::RelAdd(o) | Op::RelRemove(o) => &o.actor,
             Op::Note(o) => &o.actor,
             Op::Close(o) => &o.actor,
             Op::Delete(o) => &o.actor,
@@ -388,6 +410,7 @@ impl Op {
             Op::Patch(o) => &o.ts,
             Op::TagAdd(o) | Op::TagRemove(o) => &o.ts,
             Op::DepAdd(o) | Op::DepRemove(o) => &o.ts,
+            Op::RelAdd(o) | Op::RelRemove(o) => &o.ts,
             Op::Note(o) => &o.ts,
             Op::Close(o) => &o.ts,
             Op::Delete(o) => &o.ts,
@@ -413,6 +436,7 @@ impl Op {
             Op::Patch(o) => Some(&o.entity),
             Op::TagAdd(o) | Op::TagRemove(o) => Some(&o.entity),
             Op::DepAdd(o) | Op::DepRemove(o) => Some(&o.entity),
+            Op::RelAdd(o) | Op::RelRemove(o) => Some(&o.entity),
             Op::Note(o) => Some(&o.entity),
             Op::Close(o) => Some(&o.entity),
             Op::Delete(o) => Some(&o.entity),
@@ -437,6 +461,8 @@ impl Op {
             Op::TagRemove(_) => "tag_remove",
             Op::DepAdd(_) => "dep_add",
             Op::DepRemove(_) => "dep_remove",
+            Op::RelAdd(_) => "rel_add",
+            Op::RelRemove(_) => "rel_remove",
             Op::Note(_) => "note",
             Op::Close(_) => "close",
             Op::Delete(_) => "delete",
@@ -521,6 +547,30 @@ pub fn make_dep(
         Op::DepAdd(payload)
     } else {
         Op::DepRemove(payload)
+    }
+}
+
+pub fn make_rel(
+    add: bool,
+    actor: String,
+    entity: BeadId,
+    parent: BeadId,
+    rel_kind: String,
+    ts: jiff::Timestamp,
+) -> Op {
+    let payload = RelOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        entity,
+        parent,
+        rel_kind,
+    };
+    if add {
+        Op::RelAdd(payload)
+    } else {
+        Op::RelRemove(payload)
     }
 }
 
@@ -829,6 +879,20 @@ mod tests {
     }
 
     #[test]
+    fn rel_add_default_kind() {
+        let v = json!({
+            "v": 1, "op": "x", "ts": "2026-04-20T18:24:55.124583Z",
+            "actor": "a", "kind": "rel_add",
+            "entity": "bd-1", "parent": "bd-2",
+        });
+        let op: Op = serde_json::from_value(v).unwrap();
+        match op {
+            Op::RelAdd(r) => assert_eq!(r.rel_kind, "parent"),
+            _ => panic!("expected RelAdd"),
+        }
+    }
+
+    #[test]
     fn rejects_unknown_kind() {
         let v = json!({
             "v": 1, "op": "x", "ts": "2026-04-20T18:24:55.124583Z",
@@ -876,5 +940,14 @@ mod tests {
         );
         assert_eq!(add.kind_name(), "tag_add");
         assert_eq!(rem.kind_name(), "tag_remove");
+        let rel = make_rel(
+            true,
+            "a".into(),
+            "bd-1".into(),
+            "bd-2".into(),
+            "parent".into(),
+            "2026-04-20T18:24:55Z".parse().unwrap(),
+        );
+        assert_eq!(rel.kind_name(), "rel_add");
     }
 }

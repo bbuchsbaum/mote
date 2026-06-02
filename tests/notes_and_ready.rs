@@ -7,7 +7,7 @@ use std::thread;
 use jiff::Timestamp;
 use tempfile::TempDir;
 
-use mote::op::{ScalarSet, Status, make_close, make_create, make_dep};
+use mote::op::{ScalarSet, Status, make_close, make_create, make_dep, make_rel};
 use mote::{publish, reducer, repo::Store};
 
 fn mote_bin() -> &'static str {
@@ -219,6 +219,48 @@ fn ready_computation_dep_graph() {
         !ready_ids.contains(&"bd-Z"),
         "Z should NOT be ready (status closed): {ready_ids:?}"
     );
+}
+
+#[test]
+fn ready_ignores_non_blocking_relations() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+
+    let mk_create = |id: &str| {
+        let mut s = ScalarSet {
+            title: Some(id.into()),
+            ..Default::default()
+        };
+        s.status = Some(Status::Open);
+        publish::publish_op(
+            &store,
+            &make_create("tester".into(), id.into(), s, Timestamp::now()),
+        )
+        .unwrap()
+    };
+
+    mk_create("bd-epic");
+    mk_create("bd-leaf");
+    publish::publish_op(
+        &store,
+        &make_rel(
+            true,
+            "tester".into(),
+            "bd-leaf".into(),
+            "bd-epic".into(),
+            "parent".into(),
+            Timestamp::now(),
+        ),
+    )
+    .unwrap();
+
+    let state = reducer::replay_store(&store).unwrap();
+    let ready_ids: Vec<&str> = state.ready_beads().map(|b| b.id.as_str()).collect();
+    assert!(
+        ready_ids.contains(&"bd-leaf"),
+        "non-blocking relation parent should not hide leaf from ready: {ready_ids:?}"
+    );
+    assert_eq!(state.relation_children_of("bd-epic")[0].0.id, "bd-leaf");
 }
 
 #[test]

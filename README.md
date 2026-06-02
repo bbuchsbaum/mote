@@ -59,7 +59,7 @@ All planes share the same publication mechanism and reducer.
 
 | Plane    | Op kinds                                                              |
 |----------|-----------------------------------------------------------------------|
-| Issue    | `create`, `patch`, `tag_add`, `tag_remove`, `dep_add`, `dep_remove`, `note`, `close`, `delete` |
+| Issue    | `create`, `patch`, `tag_add`, `tag_remove`, `dep_add`, `dep_remove`, `rel_add`, `rel_remove`, `note`, `close`, `delete` |
 | Path     | `reserve_open`, `reserve_close`                                        |
 | Message  | `msg_send`, `msg_ack`                                                  |
 | Discussion | `board_topic`, `board_post`, `board_sticky`, `board_read`            |
@@ -72,7 +72,11 @@ All planes share the same publication mechanism and reducer.
   the fields it touches. Two patches to disjoint fields both succeed; two
   patches to the same field — exactly one is accepted, the other is recorded
   as a rejected intent with reason.
-- **Set fields** (`tags`, `deps`) use commutative idempotent ops; never conflict.
+- **Set fields** (`tags`, `deps`, `rels`) use commutative idempotent ops; never conflict.
+- **Dependencies** are blocking edges. Every `dep` edge kind still blocks
+  readiness for compatibility, including old `--kind parent` edges.
+- **Relations** are non-blocking hierarchy edges. They are visible in `show`,
+  `parents`, and `children`, but `ready` ignores them.
 - **Append-only** (`note`, `msg_send`) never conflict.
 - **Claims** are TTL leases. Expired leases auto-yield. Stale agents do not
   leave permanent locks. Self-actor renewal is auto-accepted.
@@ -100,7 +104,11 @@ mote new "Fix auth bug" -p 1 --tag backend
 mote ls
 mote set bd-... status=doing
 mote dep add bd-CHILD bd-PARENT
-mote tag add bd-... refactor
+mote rel add bd-CHILD bd-PARENT --kind parent
+mote children bd-PARENT
+mote dependents bd-PARENT
+mote tag add bd-... refactor reviewed
+mote ls --tag m1 --tag task
 mote note bd-... --kind progress "parser changes done"
 mote ready
 mote close bd-...
@@ -147,6 +155,10 @@ mote board
 mote doctor
 mote fsck --clean-tmp
 
+# Batch/import. Omitted input path means stdin.
+mote batch < plan.jsonl
+mote import plan.json
+
 # Oversight (read-only).
 mote watch                # human-readable snapshots that re-render on store changes
 mote --json watch         # newline-delimited JSON for piping into other tools
@@ -154,6 +166,19 @@ mote ui                   # interactive TUI dashboard (q to quit, ? for help)
 ```
 
 Most agent-facing commands accept `--json` for machine-readable output.
+
+`mote batch` reads JSONL, one action per line, and publishes the corresponding
+normal ops sequentially:
+
+```jsonl
+{"action":"create","id":"epic-1","title":"Epic","tags":["m1","epic"]}
+{"action":"create","id":"task-1","title":"Task","relations":[{"parent":"epic-1","kind":"parent"}]}
+{"action":"tag_add","id":"task-1","tags":["api","quick"]}
+```
+
+`mote import` reads a single JSON object with `beads`, `deps`, and `relations`
+arrays. Both commands print accepted/rejected/skipped results; `--json` returns
+the same report as structured data.
 
 ### Oversight
 
@@ -180,7 +205,40 @@ This repo includes two canonical skills for agents:
   replies, threads, sticky posts, search, and unread state.
 
 The `.codex/skills/` and `.claude/skills/` entries are symlinks to those
-canonical skill folders, so Codex and Claude use the same source of truth.
+canonical skill folders, so Codex and Claude use the same source of truth in
+this checkout.
+
+### Install skills for your agents
+
+The `mote` binary embeds both canonical skills, so installing them anywhere
+else is a single command and does not require the source checkout.
+
+List the skills bundled with this binary:
+
+```sh
+mote skills list
+```
+
+Install them for the current user (writes `~/.claude/skills/<skill>/` and
+`~/.codex/skills/<skill>/`):
+
+```sh
+mote skills install --user
+```
+
+Install them into another repository (writes
+`<repo>/.claude/skills/<skill>/` and `<repo>/.codex/skills/<skill>/`):
+
+```sh
+mote skills install --repo /path/to/other/repo
+```
+
+Restrict the target agents with `--agent claude` or `--agent codex` (the
+default is both). Existing skill directories are left untouched; rerun with
+`--force` to overwrite them with the version embedded in the current binary.
+
+Re-running `mote skills install --user --force` after `cargo install ... --force`
+is the supported way to refresh installed skills when mote is upgraded.
 
 ### Actor identity
 
@@ -219,6 +277,13 @@ First run inside a project:
 mote init
 mote actor set alice
 mote doctor
+```
+
+Install the bundled Claude and Codex agent skills (optional but recommended
+for agent users — see `Agent skills` below for details):
+
+```sh
+mote skills install --user
 ```
 
 Update an existing install later:

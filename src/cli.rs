@@ -2,17 +2,19 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 
 use crate::errors::{MoteError, MoteResult};
 use crate::ids;
 use crate::op::{
     self, ScalarSet, Status, make_board_post, make_board_read, make_board_sticky, make_board_topic,
     make_claim, make_close, make_create, make_delete, make_dep, make_msg_ack, make_msg_send,
-    make_note, make_patch, make_release, make_reserve_close, make_reserve_open, make_tag,
+    make_note, make_patch, make_rel, make_release, make_reserve_close, make_reserve_open, make_tag,
     validate_msg_kind, validate_note_kind,
 };
 use crate::reducer;
@@ -94,14 +96,23 @@ pub enum Command {
     /// Show full state of a bead
     Show { id: String },
 
+    /// List non-blocking relation parents of a bead
+    Parents { id: String },
+
+    /// List non-blocking relation children of a bead
+    Children { id: String },
+
+    /// List beads blocked by this bead
+    Dependents { id: String },
+
     /// List beads
     Ls {
         /// Filter by status (open|doing|blocked|review|closed)
         #[arg(long)]
         status: Option<String>,
-        /// Filter by tag
-        #[arg(long)]
-        tag: Option<String>,
+        /// Filter by tag. Repeat for intersection, e.g. --tag m1 --tag task.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
         /// Filter by assignee
         #[arg(long)]
         assignee: Option<String>,
@@ -137,6 +148,12 @@ pub enum Command {
     Dep {
         #[command(subcommand)]
         cmd: DepCmd,
+    },
+
+    /// Manage non-blocking relationships
+    Rel {
+        #[command(subcommand)]
+        cmd: RelCmd,
     },
 
     /// Manage tags
@@ -272,6 +289,45 @@ pub enum Command {
         #[arg(long)]
         clean_tmp: bool,
     },
+
+    /// Publish a JSONL batch of ordinary mote operations sequentially
+    Batch {
+        /// Input file, or stdin when omitted / "-"
+        input: Option<PathBuf>,
+    },
+
+    /// Import a JSON plan containing beads, deps, and relations
+    Import {
+        /// Input file, or stdin when omitted / "-"
+        input: Option<PathBuf>,
+    },
+
+    /// Manage canonical mote skills bundled with this binary
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillsCmd {
+    /// List skills bundled with this mote binary
+    List,
+    /// Install bundled skills into a user-global or repo-local skills directory
+    Install {
+        /// Install for the current user (~/.claude/skills and ~/.codex/skills)
+        #[arg(long, conflicts_with = "repo")]
+        user: bool,
+        /// Install into a target repository's `.claude/skills` and `.codex/skills`
+        #[arg(long, conflicts_with = "user")]
+        repo: Option<PathBuf>,
+        /// Comma-separated agent list (default: claude,codex)
+        #[arg(long = "agent", value_delimiter = ',')]
+        agents: Vec<String>,
+        /// Overwrite existing skill directories
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -303,9 +359,34 @@ pub enum DepCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum RelCmd {
+    /// Add a non-blocking relationship edge: `child` is contained by `parent`
+    Add {
+        child: String,
+        parent: String,
+        #[arg(long, default_value = "parent")]
+        kind: String,
+    },
+    /// Remove a non-blocking relationship edge
+    Rm {
+        child: String,
+        parent: String,
+        #[arg(long, default_value = "parent")]
+        kind: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum TagCmd {
-    Add { id: String, tag: String },
-    Rm { id: String, tag: String },
+    Add {
+        id: String,
+        #[arg(num_args = 1.., required = true)]
+        tags: Vec<String>,
+    },
+    Rm {
+        id: String,
+        tag: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -458,9 +539,12 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             fields,
         ),
         Command::Show { id } => cmd_show(cli.store.as_deref(), cli.json, id),
+        Command::Parents { id } => cmd_parents(cli.store.as_deref(), cli.json, id),
+        Command::Children { id } => cmd_children(cli.store.as_deref(), cli.json, id),
+        Command::Dependents { id } => cmd_dependents(cli.store.as_deref(), cli.json, id),
         Command::Ls {
             status,
-            tag,
+            tags,
             assignee,
             all,
             ready,
@@ -469,7 +553,7 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             cli.store.as_deref(),
             cli.json,
             status,
-            tag,
+            tags,
             assignee,
             all,
             ready,
@@ -490,7 +574,8 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             id,
             include_rejected,
         } => cmd_history(cli.store.as_deref(), cli.json, id, include_rejected),
-        Command::Dep { cmd } => cmd_dep(cli.actor.as_deref(), cli.store.as_deref(), cmd),
+        Command::Dep { cmd } => cmd_dep(cli.actor.as_deref(), cli.store.as_deref(), cli.quiet, cmd),
+        Command::Rel { cmd } => cmd_rel(cli.actor.as_deref(), cli.store.as_deref(), cmd),
         Command::Tag { cmd } => cmd_tag(cli.actor.as_deref(), cli.store.as_deref(), cmd),
         Command::Close { id } => cmd_close(cli.actor.as_deref(), cli.store.as_deref(), id),
         Command::Delete { id } => cmd_delete(cli.actor.as_deref(), cli.store.as_deref(), id),
@@ -567,6 +652,13 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         Command::Ui => cmd_ui(cli.actor.as_deref(), cli.store.as_deref()),
         Command::Doctor => cmd_doctor(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
         Command::Fsck { clean_tmp } => cmd_fsck(cli.store.as_deref(), cli.json, clean_tmp),
+        Command::Batch { input } => {
+            cmd_batch(cli.actor.as_deref(), cli.store.as_deref(), cli.json, input)
+        }
+        Command::Import { input } => {
+            cmd_import(cli.actor.as_deref(), cli.store.as_deref(), cli.json, input)
+        }
+        Command::Skills { cmd } => cmd_skills(cli.json, cli.quiet, cmd),
     }
 }
 
@@ -701,6 +793,578 @@ fn resolve_actor_with_source(
         }
     }
     Err(MoteError::ActorUnresolved)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EdgeSpec {
+    Id(String),
+    Object {
+        parent: String,
+        #[serde(default)]
+        kind: Option<String>,
+    },
+}
+
+impl EdgeSpec {
+    fn into_parent_kind(self, default_kind: &str) -> (String, String) {
+        match self {
+            EdgeSpec::Id(parent) => (parent, default_kind.to_string()),
+            EdgeSpec::Object { parent, kind } => {
+                (parent, kind.unwrap_or_else(|| default_kind.to_string()))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NewSpec {
+    id: Option<String>,
+    title: String,
+    priority: Option<i32>,
+    body: Option<String>,
+    assignee: Option<String>,
+    tags: Vec<String>,
+    deps: Vec<EdgeSpec>,
+    relations: Vec<EdgeSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchItem {
+    action: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, alias = "entity")]
+    child: Option<String>,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    deps: Vec<EdgeSpec>,
+    #[serde(default, alias = "rels")]
+    relations: Vec<EdgeSpec>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    note_kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportPlan {
+    #[serde(default)]
+    beads: Vec<ImportBead>,
+    #[serde(default)]
+    deps: Vec<ImportEdge>,
+    #[serde(default, alias = "rels")]
+    relations: Vec<ImportEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportBead {
+    #[serde(default)]
+    id: Option<String>,
+    title: String,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    deps: Vec<EdgeSpec>,
+    #[serde(default, alias = "rels")]
+    relations: Vec<EdgeSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportEdge {
+    #[serde(alias = "entity")]
+    child: String,
+    parent: String,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchOutcome {
+    action: String,
+    entity: Option<String>,
+    parent: Option<String>,
+    kind: Option<String>,
+    op_id: Option<String>,
+    status: String,
+    reason: Option<String>,
+}
+
+fn cmd_batch(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    input: Option<PathBuf>,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let actor = store.resolve_actor(actor_flag)?;
+    let content = read_command_input(input)?;
+    let mut outcomes = Vec::new();
+
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let item: BatchItem = serde_json::from_str(trimmed)
+            .map_err(|e| MoteError::Invalid(format!("batch line {}: {e}", idx + 1)))?;
+        process_batch_item(&store, &actor, item, &mut outcomes)?;
+    }
+
+    print_batch_report(&outcomes, json_mode)
+}
+
+fn cmd_import(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    input: Option<PathBuf>,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let actor = store.resolve_actor(actor_flag)?;
+    let content = read_command_input(input)?;
+    let plan: ImportPlan = serde_json::from_str(&content)
+        .map_err(|e| MoteError::Invalid(format!("import JSON: {e}")))?;
+    let mut outcomes = Vec::new();
+
+    for bead in plan.beads {
+        let spec = NewSpec {
+            id: bead.id,
+            title: bead.title,
+            priority: bead.priority,
+            body: bead.body,
+            assignee: bead.assignee,
+            tags: bead.tags,
+            deps: bead.deps,
+            relations: bead.relations,
+        };
+        let _ = publish_new_spec(&store, &actor, spec, &mut outcomes)?;
+    }
+    for dep in plan.deps {
+        publish_edge(
+            &store,
+            &actor,
+            true,
+            dep.child,
+            dep.parent,
+            dep.kind.unwrap_or_else(|| "blocks".to_string()),
+            true,
+            &mut outcomes,
+        )?;
+    }
+    for rel in plan.relations {
+        publish_edge(
+            &store,
+            &actor,
+            true,
+            rel.child,
+            rel.parent,
+            rel.kind.unwrap_or_else(|| "parent".to_string()),
+            false,
+            &mut outcomes,
+        )?;
+    }
+
+    print_batch_report(&outcomes, json_mode)
+}
+
+fn read_command_input(input: Option<PathBuf>) -> MoteResult<String> {
+    match input {
+        Some(path) if path.as_os_str() != "-" => Ok(fs::read_to_string(path)?),
+        _ => {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            Ok(s)
+        }
+    }
+}
+
+fn process_batch_item(
+    store: &Store,
+    actor: &str,
+    item: BatchItem,
+    outcomes: &mut Vec<BatchOutcome>,
+) -> MoteResult<()> {
+    match item.action.as_str() {
+        "create" | "new" => {
+            let title = item
+                .title
+                .ok_or_else(|| MoteError::Invalid("batch create requires title".into()))?;
+            let spec = NewSpec {
+                id: item.id,
+                title,
+                priority: item.priority,
+                body: item.body,
+                assignee: item.assignee,
+                tags: item.tags,
+                deps: item.deps,
+                relations: item.relations,
+            };
+            let _ = publish_new_spec(store, actor, spec, outcomes)?;
+        }
+        "tag_add" => {
+            let id = require_item_id(&item, "tag_add")?;
+            let tags = item_tags(item)?;
+            for tag in tags {
+                publish_tag(store, actor, true, id.clone(), tag, outcomes)?;
+            }
+        }
+        "tag_remove" | "tag_rm" => {
+            let id = require_item_id(&item, "tag_remove")?;
+            let tags = item_tags(item)?;
+            for tag in tags {
+                publish_tag(store, actor, false, id.clone(), tag, outcomes)?;
+            }
+        }
+        "dep_add" => {
+            let child = require_child_id(&item, "dep_add")?;
+            let parent = require_parent_id(&item, "dep_add")?;
+            let kind = item.kind.unwrap_or_else(|| "blocks".to_string());
+            publish_edge(store, actor, true, child, parent, kind, true, outcomes)?;
+        }
+        "dep_remove" | "dep_rm" => {
+            let child = require_child_id(&item, "dep_remove")?;
+            let parent = require_parent_id(&item, "dep_remove")?;
+            let kind = item.kind.unwrap_or_else(|| "blocks".to_string());
+            publish_edge(store, actor, false, child, parent, kind, true, outcomes)?;
+        }
+        "rel_add" => {
+            let child = require_child_id(&item, "rel_add")?;
+            let parent = require_parent_id(&item, "rel_add")?;
+            let kind = item.kind.unwrap_or_else(|| "parent".to_string());
+            publish_edge(store, actor, true, child, parent, kind, false, outcomes)?;
+        }
+        "rel_remove" | "rel_rm" => {
+            let child = require_child_id(&item, "rel_remove")?;
+            let parent = require_parent_id(&item, "rel_remove")?;
+            let kind = item.kind.unwrap_or_else(|| "parent".to_string());
+            publish_edge(store, actor, false, child, parent, kind, false, outcomes)?;
+        }
+        "note" => {
+            let id = require_item_id(&item, "note")?;
+            let note_kind = item.note_kind.unwrap_or_else(|| "note".to_string());
+            let text = item
+                .text
+                .ok_or_else(|| MoteError::Invalid("batch note requires text".into()))?;
+            if !validate_note_kind(&note_kind) {
+                return Err(MoteError::Invalid(format!(
+                    "invalid note_kind `{note_kind}` (expected one of: {})",
+                    op::VALID_NOTE_KINDS.join(" | ")
+                )));
+            }
+            let op = make_note(
+                actor.to_string(),
+                id.clone(),
+                note_kind,
+                text,
+                Timestamp::now(),
+            );
+            record_published_op(store, &op, "note", Some(id), None, None, outcomes)?;
+        }
+        other => {
+            return Err(MoteError::Invalid(format!(
+                "unknown batch action `{other}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_item_id(item: &BatchItem, action: &str) -> MoteResult<String> {
+    item.id
+        .clone()
+        .ok_or_else(|| MoteError::Invalid(format!("batch {action} requires id")))
+}
+
+fn require_child_id(item: &BatchItem, action: &str) -> MoteResult<String> {
+    item.child
+        .clone()
+        .or_else(|| item.id.clone())
+        .ok_or_else(|| MoteError::Invalid(format!("batch {action} requires child or entity")))
+}
+
+fn require_parent_id(item: &BatchItem, action: &str) -> MoteResult<String> {
+    item.parent
+        .clone()
+        .ok_or_else(|| MoteError::Invalid(format!("batch {action} requires parent")))
+}
+
+fn item_tags(mut item: BatchItem) -> MoteResult<Vec<String>> {
+    if let Some(tag) = item.tag.take() {
+        item.tags.insert(0, tag);
+    }
+    if item.tags.is_empty() {
+        return Err(MoteError::Invalid(
+            "batch tag action requires tag or tags".into(),
+        ));
+    }
+    Ok(item.tags)
+}
+
+fn publish_new_spec(
+    store: &Store,
+    actor: &str,
+    spec: NewSpec,
+    outcomes: &mut Vec<BatchOutcome>,
+) -> MoteResult<Option<String>> {
+    if spec.title.trim().is_empty() {
+        return Err(MoteError::Invalid(
+            "batch create title must be non-empty".into(),
+        ));
+    }
+    if let Some(p) = spec.priority {
+        if !(0..=3).contains(&p) {
+            return Err(MoteError::Invalid(format!("priority {p} out of 0..=3")));
+        }
+    }
+
+    let bead_id = match spec.id {
+        Some(custom) => {
+            ids::validate_external_bead_id(&custom)?;
+            custom
+        }
+        None => ids::new_bead_id(),
+    };
+    let mut set = ScalarSet {
+        title: Some(spec.title),
+        priority: spec.priority,
+        body: spec.body,
+        assignee: spec.assignee,
+        ..Default::default()
+    };
+    set.status = Some(Status::Open);
+
+    let create = make_create(actor.to_string(), bead_id.clone(), set, Timestamp::now());
+    let accepted = record_published_op(
+        store,
+        &create,
+        "create",
+        Some(bead_id.clone()),
+        None,
+        None,
+        outcomes,
+    )?;
+    if !accepted {
+        record_skip(
+            "create_children",
+            Some(bead_id.clone()),
+            None,
+            None,
+            "create rejected",
+            outcomes,
+        );
+        return Ok(None);
+    }
+
+    for tag in spec.tags {
+        publish_tag(store, actor, true, bead_id.clone(), tag, outcomes)?;
+    }
+    for dep in spec.deps {
+        let (parent, kind) = dep.into_parent_kind("blocks");
+        publish_edge(
+            store,
+            actor,
+            true,
+            bead_id.clone(),
+            parent,
+            kind,
+            true,
+            outcomes,
+        )?;
+    }
+    for rel in spec.relations {
+        let (parent, kind) = rel.into_parent_kind("parent");
+        publish_edge(
+            store,
+            actor,
+            true,
+            bead_id.clone(),
+            parent,
+            kind,
+            false,
+            outcomes,
+        )?;
+    }
+
+    Ok(Some(bead_id))
+}
+
+fn publish_tag(
+    store: &Store,
+    actor: &str,
+    add: bool,
+    id: String,
+    tag: String,
+    outcomes: &mut Vec<BatchOutcome>,
+) -> MoteResult<bool> {
+    let op = make_tag(
+        add,
+        actor.to_string(),
+        id.clone(),
+        tag.clone(),
+        Timestamp::now(),
+    );
+    record_published_op(
+        store,
+        &op,
+        if add { "tag_add" } else { "tag_remove" },
+        Some(id),
+        None,
+        Some(tag),
+        outcomes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_edge(
+    store: &Store,
+    actor: &str,
+    add: bool,
+    child: String,
+    parent: String,
+    edge_kind: String,
+    blocking: bool,
+    outcomes: &mut Vec<BatchOutcome>,
+) -> MoteResult<bool> {
+    let (op, action) = if blocking {
+        (
+            make_dep(
+                add,
+                actor.to_string(),
+                child.clone(),
+                parent.clone(),
+                edge_kind.clone(),
+                Timestamp::now(),
+            ),
+            if add { "dep_add" } else { "dep_remove" },
+        )
+    } else {
+        (
+            make_rel(
+                add,
+                actor.to_string(),
+                child.clone(),
+                parent.clone(),
+                edge_kind.clone(),
+                Timestamp::now(),
+            ),
+            if add { "rel_add" } else { "rel_remove" },
+        )
+    };
+    record_published_op(
+        store,
+        &op,
+        action,
+        Some(child),
+        Some(parent),
+        Some(edge_kind),
+        outcomes,
+    )
+}
+
+fn record_published_op(
+    store: &Store,
+    op: &op::Op,
+    action: &str,
+    entity: Option<String>,
+    parent: Option<String>,
+    kind: Option<String>,
+    outcomes: &mut Vec<BatchOutcome>,
+) -> MoteResult<bool> {
+    let name = publish::publish_op(store, op)?;
+    let state = reducer::replay_store(store)?;
+    let op_id = name.as_str().to_string();
+    let accepted = state.was_accepted(&op_id);
+    let reason = if accepted {
+        None
+    } else {
+        state
+            .rejection_reason(&op_id)
+            .or_else(|| Some("unknown".into()))
+    };
+    outcomes.push(BatchOutcome {
+        action: action.to_string(),
+        entity,
+        parent,
+        kind,
+        op_id: Some(op_id),
+        status: if accepted { "accepted" } else { "rejected" }.to_string(),
+        reason,
+    });
+    Ok(accepted)
+}
+
+fn record_skip(
+    action: &str,
+    entity: Option<String>,
+    parent: Option<String>,
+    kind: Option<&str>,
+    reason: &str,
+    outcomes: &mut Vec<BatchOutcome>,
+) {
+    outcomes.push(BatchOutcome {
+        action: action.to_string(),
+        entity,
+        parent,
+        kind: kind.map(str::to_string),
+        op_id: None,
+        status: "skipped".to_string(),
+        reason: Some(reason.to_string()),
+    });
+}
+
+fn print_batch_report(outcomes: &[BatchOutcome], json_mode: bool) -> MoteResult<i32> {
+    let accepted = outcomes.iter().filter(|o| o.status == "accepted").count();
+    let rejected = outcomes.iter().filter(|o| o.status == "rejected").count();
+    let skipped = outcomes.iter().filter(|o| o.status == "skipped").count();
+    if json_mode {
+        let v = serde_json::json!({
+            "accepted": accepted,
+            "rejected": rejected,
+            "skipped": skipped,
+            "results": outcomes,
+        });
+        println!("{}", serde_json::to_string(&v)?);
+    } else {
+        for outcome in outcomes {
+            let entity = outcome.entity.as_deref().unwrap_or("-");
+            let parent = outcome.parent.as_deref().unwrap_or("-");
+            let kind = outcome.kind.as_deref().unwrap_or("-");
+            let op_id = outcome.op_id.as_deref().unwrap_or("-");
+            match outcome.reason.as_deref() {
+                Some(reason) => println!(
+                    "{} {} entity={} parent={} kind={} op={} reason={}",
+                    outcome.status, outcome.action, entity, parent, kind, op_id, reason
+                ),
+                None => println!(
+                    "{} {} entity={} parent={} kind={} op={}",
+                    outcome.status, outcome.action, entity, parent, kind, op_id
+                ),
+            }
+        }
+    }
+    Ok(if rejected > 0 || skipped > 0 { 2 } else { 0 })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -902,6 +1566,9 @@ fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResul
             "assignee": bead.assignee,
             "tags": bead.tags.iter().collect::<Vec<_>>(),
             "deps": bead.deps.iter().map(|(p, k)| serde_json::json!({"parent": p, "kind": k})).collect::<Vec<_>>(),
+            "relations": bead.rels.iter().map(|(p, k)| serde_json::json!({"parent": p, "kind": k})).collect::<Vec<_>>(),
+            "children": state.relation_children_of(&id).iter().map(|(b, k)| bead_edge_json(b, k)).collect::<Vec<_>>(),
+            "dependents": state.dependency_children_of(&id).iter().map(|(b, k)| bead_edge_json(b, k)).collect::<Vec<_>>(),
             "notes": bead.notes.iter().map(|n| serde_json::json!({
                 "op_id": n.op_id, "kind": n.note_kind, "actor": n.actor, "ts": n.ts, "text": n.text,
             })).collect::<Vec<_>>(),
@@ -937,6 +1604,33 @@ fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResul
                 .collect();
             println!("{}", parts.join(", "));
         }
+        if !bead.rels.is_empty() {
+            print!("rels:     ");
+            let parts: Vec<String> = bead
+                .rels
+                .iter()
+                .map(|(p, k)| format!("{p} ({k})"))
+                .collect();
+            println!("{}", parts.join(", "));
+        }
+        let children = state.relation_children_of(&id);
+        if !children.is_empty() {
+            print!("children: ");
+            let parts: Vec<String> = children
+                .iter()
+                .map(|(b, k)| format!("{} ({k})", b.id))
+                .collect();
+            println!("{}", parts.join(", "));
+        }
+        let dependents = state.dependency_children_of(&id);
+        if !dependents.is_empty() {
+            print!("dependents: ");
+            let parts: Vec<String> = dependents
+                .iter()
+                .map(|(b, k)| format!("{} ({k})", b.id))
+                .collect();
+            println!("{}", parts.join(", "));
+        }
         if !bead.notes.is_empty() {
             println!("notes:");
             for n in &bead.notes {
@@ -953,13 +1647,107 @@ fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResul
     Ok(0)
 }
 
+fn bead_edge_json(bead: &Bead, kind: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": bead.id,
+        "title": bead.title,
+        "status": bead.status.as_str(),
+        "priority": bead.priority,
+        "kind": kind,
+        "tags": bead.tags.iter().collect::<Vec<_>>(),
+        "assignee": bead.assignee,
+    })
+}
+
+fn cmd_parents(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let state = reducer::replay_store(&store)?;
+    let bead = state
+        .beads
+        .get(&id)
+        .ok_or_else(|| MoteError::Invalid(format!("no such bead {id}")))?;
+
+    if json_mode {
+        let arr: Vec<_> = bead
+            .rels
+            .iter()
+            .map(|(parent, kind)| {
+                let parent_bead = state.beads.get(parent);
+                serde_json::json!({
+                    "id": parent,
+                    "kind": kind,
+                    "title": parent_bead.map(|b| b.title.as_str()),
+                    "status": parent_bead.map(|b| b.status.as_str()),
+                    "priority": parent_bead.map(|b| b.priority),
+                    "deleted": parent_bead.is_some_and(|b| b.is_deleted()),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&arr)?);
+    } else {
+        for (parent, kind) in &bead.rels {
+            match state.beads.get(parent) {
+                Some(b) => println!(
+                    "{:<24} ({:<8}) p{} {:<8} {}",
+                    parent,
+                    kind,
+                    b.priority,
+                    b.status.as_str(),
+                    b.title
+                ),
+                None => println!("{:<24} ({kind})", parent),
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn cmd_children(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let state = reducer::replay_store(&store)?;
+    if !state.beads.contains_key(&id) {
+        return Err(MoteError::Invalid(format!("no such bead {id}")));
+    }
+    let children = state.relation_children_of(&id);
+    print_edge_beads(children, json_mode)
+}
+
+fn cmd_dependents(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let state = reducer::replay_store(&store)?;
+    if !state.beads.contains_key(&id) {
+        return Err(MoteError::Invalid(format!("no such bead {id}")));
+    }
+    let dependents = state.dependency_children_of(&id);
+    print_edge_beads(dependents, json_mode)
+}
+
+fn print_edge_beads(beads: Vec<(&Bead, &str)>, json_mode: bool) -> MoteResult<i32> {
+    if json_mode {
+        let arr: Vec<_> = beads.iter().map(|(b, k)| bead_edge_json(b, k)).collect();
+        println!("{}", serde_json::to_string(&arr)?);
+    } else {
+        for (b, kind) in beads {
+            println!(
+                "{:<24} ({:<8}) p{} {:<8} {}",
+                b.id,
+                kind,
+                b.priority,
+                b.status.as_str(),
+                b.title
+            );
+        }
+    }
+    Ok(0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_ls(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
     json_mode: bool,
     status: Option<String>,
-    tag: Option<String>,
+    tags: Vec<String>,
     assignee: Option<String>,
     all: bool,
     ready: bool,
@@ -994,7 +1782,7 @@ fn cmd_ls(
                     return false;
                 }
             }
-            if let Some(t) = &tag {
+            for t in &tags {
                 if !b.tags.contains(t) {
                     return false;
                 }
@@ -1157,7 +1945,12 @@ fn cmd_note(
     verify_accept(&store, &name)
 }
 
-fn cmd_dep(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: DepCmd) -> MoteResult<i32> {
+fn cmd_dep(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    quiet: bool,
+    cmd: DepCmd,
+) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let (add, child, parent, kind) = match cmd {
@@ -1172,7 +1965,48 @@ fn cmd_dep(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: DepCmd) -> 
             kind,
         } => (false, child, parent, kind),
     };
+    if !quiet && looks_like_containment_dep_kind(&kind) {
+        let rel_cmd = if add { "add" } else { "rm" };
+        eprintln!(
+            "warning: dep --kind {kind} is still a blocking dependency; use `mote rel {rel_cmd} --kind {kind}` for non-blocking containment"
+        );
+    }
     let op = make_dep(add, actor, child, parent, kind, Timestamp::now());
+    let name = publish::publish_op(&store, &op)?;
+    verify_accept(&store, &name)
+}
+
+fn looks_like_containment_dep_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "parent"
+            | "child"
+            | "children"
+            | "subtask"
+            | "sub-task"
+            | "epic"
+            | "contains"
+            | "containment"
+            | "hierarchy"
+    )
+}
+
+fn cmd_rel(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: RelCmd) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let actor = store.resolve_actor(actor_flag)?;
+    let (add, child, parent, kind) = match cmd {
+        RelCmd::Add {
+            child,
+            parent,
+            kind,
+        } => (true, child, parent, kind),
+        RelCmd::Rm {
+            child,
+            parent,
+            kind,
+        } => (false, child, parent, kind),
+    };
+    let op = make_rel(add, actor, child, parent, kind, Timestamp::now());
     let name = publish::publish_op(&store, &op)?;
     verify_accept(&store, &name)
 }
@@ -1180,13 +2014,19 @@ fn cmd_dep(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: DepCmd) -> 
 fn cmd_tag(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: TagCmd) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
-    let (add, id, tag) = match cmd {
-        TagCmd::Add { id, tag } => (true, id, tag),
-        TagCmd::Rm { id, tag } => (false, id, tag),
+    let (add, id, tags) = match cmd {
+        TagCmd::Add { id, tags } => (true, id, tags),
+        TagCmd::Rm { id, tag } => (false, id, vec![tag]),
     };
-    let op = make_tag(add, actor, id, tag, Timestamp::now());
-    let name = publish::publish_op(&store, &op)?;
-    verify_accept(&store, &name)
+    let mut had_failure = false;
+    for tag in tags {
+        let op = make_tag(add, actor.clone(), id.clone(), tag, Timestamp::now());
+        let name = publish::publish_op(&store, &op)?;
+        if verify_accept(&store, &name)? != 0 {
+            had_failure = true;
+        }
+    }
+    Ok(if had_failure { 2 } else { 0 })
 }
 
 fn cmd_close(actor_flag: Option<&str>, store_flag: Option<&Path>, id: String) -> MoteResult<i32> {
@@ -2546,6 +3386,202 @@ fn maybe_test_sleep(var: &str) {
 
 #[cfg(not(debug_assertions))]
 fn maybe_test_sleep(_var: &str) {}
+
+struct BundledSkill {
+    name: &'static str,
+    description: &'static str,
+    files: &'static [(&'static str, &'static str)],
+}
+
+const BUNDLED_SKILLS: &[BundledSkill] = &[
+    BundledSkill {
+        name: "mote-tracker",
+        description: "Local daemonless issue tracker, claims, path reservations, notes, and handoffs.",
+        files: &[
+            ("SKILL.md", include_str!("../skills/mote-tracker/SKILL.md")),
+            (
+                "agents/openai.yaml",
+                include_str!("../skills/mote-tracker/agents/openai.yaml"),
+            ),
+        ],
+    },
+    BundledSkill {
+        name: "mote-message-board",
+        description: "Forum-style cross-agent discussion: topics, posts, replies, threads, sticky, unread.",
+        files: &[
+            (
+                "SKILL.md",
+                include_str!("../skills/mote-message-board/SKILL.md"),
+            ),
+            (
+                "agents/openai.yaml",
+                include_str!("../skills/mote-message-board/agents/openai.yaml"),
+            ),
+        ],
+    },
+];
+
+const AGENT_DIRS: &[(&str, &str)] = &[("claude", ".claude/skills"), ("codex", ".codex/skills")];
+
+fn cmd_skills(json_mode: bool, quiet: bool, cmd: SkillsCmd) -> MoteResult<i32> {
+    match cmd {
+        SkillsCmd::List => cmd_skills_list(json_mode),
+        SkillsCmd::Install {
+            user,
+            repo,
+            agents,
+            force,
+        } => cmd_skills_install(user, repo, agents, force, json_mode, quiet),
+    }
+}
+
+fn cmd_skills_list(json_mode: bool) -> MoteResult<i32> {
+    if json_mode {
+        let arr: Vec<_> = BUNDLED_SKILLS
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "files": s.files.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&arr)?);
+    } else {
+        for skill in BUNDLED_SKILLS {
+            println!("{}  {}", skill.name, skill.description);
+        }
+    }
+    Ok(0)
+}
+
+fn cmd_skills_install(
+    user: bool,
+    repo: Option<PathBuf>,
+    agents: Vec<String>,
+    force: bool,
+    json_mode: bool,
+    quiet: bool,
+) -> MoteResult<i32> {
+    if !user && repo.is_none() {
+        return Err(MoteError::Invalid(
+            "specify --user (install for the current user) or --repo <path> (install into a repo)"
+                .into(),
+        ));
+    }
+
+    let known: Vec<&str> = AGENT_DIRS.iter().map(|(n, _)| *n).collect();
+    let selected: Vec<String> = if agents.is_empty() {
+        known.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        for a in &agents {
+            if !known.contains(&a.as_str()) {
+                return Err(MoteError::Invalid(format!(
+                    "unknown agent '{}' (known: {})",
+                    a,
+                    known.join(",")
+                )));
+            }
+        }
+        agents
+    };
+
+    let home = if user {
+        let h =
+            std::env::var_os("HOME").ok_or_else(|| MoteError::Invalid("HOME is not set".into()))?;
+        Some(PathBuf::from(h))
+    } else {
+        None
+    };
+
+    let mut installed: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut skipped: Vec<(String, String, PathBuf)> = Vec::new();
+
+    for (agent_name, repo_subpath) in AGENT_DIRS {
+        if !selected.iter().any(|a| a == agent_name) {
+            continue;
+        }
+        let target_base: PathBuf = if let Some(ref h) = home {
+            h.join(format!(".{agent_name}")).join("skills")
+        } else {
+            repo.as_ref().unwrap().join(repo_subpath)
+        };
+
+        for skill in BUNDLED_SKILLS {
+            let dest = target_base.join(skill.name);
+            let dest_meta = fs::symlink_metadata(&dest).ok();
+            if dest_meta.is_some() && !force {
+                skipped.push((
+                    (*agent_name).to_string(),
+                    skill.name.to_string(),
+                    dest.clone(),
+                ));
+                continue;
+            }
+            if let Some(meta) = dest_meta {
+                if meta.file_type().is_symlink() || meta.file_type().is_file() {
+                    fs::remove_file(&dest)?;
+                } else {
+                    fs::remove_dir_all(&dest)?;
+                }
+            }
+            fs::create_dir_all(&dest)?;
+            for (rel, content) in skill.files {
+                let file_path = dest.join(rel);
+                if let Some(parent) = file_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&file_path, content)?;
+            }
+            installed.push(((*agent_name).to_string(), skill.name.to_string(), dest));
+        }
+    }
+
+    if json_mode {
+        let installed_json: Vec<_> = installed
+            .iter()
+            .map(|(a, s, p)| {
+                serde_json::json!({
+                    "agent": a,
+                    "skill": s,
+                    "path": p.display().to_string(),
+                    "status": "installed",
+                })
+            })
+            .collect();
+        let skipped_json: Vec<_> = skipped
+            .iter()
+            .map(|(a, s, p)| {
+                serde_json::json!({
+                    "agent": a,
+                    "skill": s,
+                    "path": p.display().to_string(),
+                    "status": "skipped",
+                })
+            })
+            .collect();
+        let v = serde_json::json!({
+            "installed": installed_json,
+            "skipped": skipped_json,
+        });
+        println!("{}", serde_json::to_string(&v)?);
+    } else {
+        for (_a, _s, p) in &installed {
+            println!("installed: {}", p.display());
+        }
+        if !quiet {
+            for (_a, _s, p) in &skipped {
+                eprintln!(
+                    "skipped (exists; rerun with --force to overwrite): {}",
+                    p.display()
+                );
+            }
+        }
+    }
+
+    Ok(0)
+}
 
 fn open_store(override_path: Option<&Path>) -> MoteResult<Store> {
     if let Some(p) = override_path {
