@@ -84,11 +84,22 @@ mote note <bd-id> --kind blocker "what is blocked"
 For directed coordination:
 
 ```sh
-mote msg send --to <actor> --issue <bd-id> --kind request "short request"
+mote msg send --to <actor> --issue <bd-id> --kind request \
+  --idempotency-key <stable-key> "short request"
 mote inbox
 mote --json inbox --follow
 mote msg ack <msg-id>
+mote msg reply <msg-id> --kind response "completed"
+mote msg requests --state open
+mote msg resolve <msg-id>
 ```
+
+Acknowledgement means receipt, not fulfillment. A request starts `open`; a
+recipient's structured reply moves it to `responded` or `declined`; only the
+request sender can mark that result `resolved`. Use a stable sender-scoped
+`--idempotency-key` when a harness may retry a send or reply. Reusing the key
+with identical content returns the original message id; reusing it for
+different content is rejected.
 
 `inbox --follow` emits current unacknowledged messages as `mote.event.v1`
 JSONL, then waits for new deliveries. Persist each `event_id` and resume with

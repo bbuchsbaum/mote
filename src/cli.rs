@@ -13,12 +13,12 @@ use crate::errors::{MoteError, MoteResult};
 use crate::ids;
 use crate::op::{
     self, ScalarSet, Status, make_board_post, make_board_read, make_board_sticky, make_board_topic,
-    make_claim, make_close, make_create, make_delete, make_dep, make_msg_ack, make_msg_send,
-    make_note, make_patch, make_rel, make_release, make_reserve_close, make_reserve_open, make_tag,
-    validate_msg_kind, validate_note_kind,
+    make_claim, make_close, make_create, make_delete, make_dep, make_msg_ack, make_msg_resolve,
+    make_msg_send_with_metadata, make_note, make_patch, make_rel, make_release, make_reserve_close,
+    make_reserve_open, make_tag, validate_msg_kind, validate_note_kind,
 };
 use crate::reducer;
-use crate::state::Bead;
+use crate::state::{Bead, MsgRecord, RequestState};
 use crate::{fsck, publish, repo::Store};
 
 #[derive(Parser, Debug)]
@@ -433,8 +433,35 @@ pub enum MsgCmd {
         /// Message kind (note | request | handoff | blocked | fyi)
         #[arg(long = "kind", default_value = "note")]
         msg_kind: String,
+        /// Sender-scoped retry key; an identical retry returns the first msg-id
+        #[arg(long)]
+        idempotency_key: Option<String>,
         /// Body text (positional)
         text: String,
+    },
+    /// Respond to or decline an open request
+    Reply {
+        /// Root request msg-id
+        msg_id: String,
+        /// Reply kind (response | decline)
+        #[arg(long = "kind", default_value = "response")]
+        msg_kind: String,
+        /// Sender-scoped retry key; an identical retry returns the first msg-id
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Body text (positional)
+        text: String,
+    },
+    /// List request lifecycles involving the current actor
+    Requests {
+        /// Filter by state (open | responded | declined | resolved)
+        #[arg(long = "state")]
+        request_state: Option<String>,
+    },
+    /// Mark a responded or declined request resolved (request sender only)
+    Resolve {
+        /// Root request msg-id
+        msg_id: String,
     },
     /// Acknowledge receipt of a message
     Ack {
@@ -611,7 +638,7 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             cmd_claim(cli.actor.as_deref(), cli.store.as_deref(), id, ttl)
         }
         Command::Release { id } => cmd_release(cli.actor.as_deref(), cli.store.as_deref(), id),
-        Command::Msg { cmd } => cmd_msg(cli.actor.as_deref(), cli.store.as_deref(), cmd),
+        Command::Msg { cmd } => cmd_msg(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd),
         Command::Discuss { cmd } => {
             cmd_discuss(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
         }
@@ -2152,7 +2179,111 @@ fn cmd_release(actor_flag: Option<&str>, store_flag: Option<&Path>, id: String) 
     verify_accept(&store, &name)
 }
 
-fn cmd_msg(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: MsgCmd) -> MoteResult<i32> {
+#[derive(Clone)]
+struct MessageDraft {
+    to: String,
+    entity: Option<String>,
+    reservation: Option<String>,
+    msg_kind: String,
+    body: String,
+    reply_to: Option<String>,
+    correlation_id: Option<String>,
+    idempotency_key: Option<String>,
+}
+
+fn message_matches_draft(message: &MsgRecord, draft: &MessageDraft) -> bool {
+    let correlation_matches = match draft.correlation_id.as_deref() {
+        Some(correlation) => message.correlation_id.as_deref() == Some(correlation),
+        None if draft.msg_kind == "request" => true,
+        None => message.correlation_id.is_none(),
+    };
+    message.to == draft.to
+        && message.entity == draft.entity
+        && message.reservation == draft.reservation
+        && message.msg_kind == draft.msg_kind
+        && message.body == draft.body
+        && message.reply_to == draft.reply_to
+        && correlation_matches
+}
+
+fn existing_idempotent_message(
+    state: &crate::state::State,
+    actor: &str,
+    draft: &MessageDraft,
+) -> MoteResult<Option<String>> {
+    let Some(key) = draft.idempotency_key.as_deref() else {
+        return Ok(None);
+    };
+    if !op::validate_idempotency_key(key) {
+        return Err(MoteError::Invalid(
+            "--idempotency-key must be 1..=128 trimmed printable characters".into(),
+        ));
+    }
+    let Some(existing) = state.message_by_idempotency(actor, key) else {
+        return Ok(None);
+    };
+    if message_matches_draft(existing, draft) {
+        Ok(Some(existing.msg_id.clone()))
+    } else {
+        Err(MoteError::Invalid(format!(
+            "idempotency key `{key}` is already used by {} with different message content",
+            existing.msg_id
+        )))
+    }
+}
+
+fn publish_message(store: &Store, actor: String, draft: MessageDraft) -> MoteResult<i32> {
+    let state = reducer::replay_store(store)?;
+    if let Some(existing) = existing_idempotent_message(&state, &actor, &draft)? {
+        println!("{existing}");
+        return Ok(0);
+    }
+
+    let msg_id = ids::new_msg_id();
+    let correlation_id = if draft.msg_kind == "request" && draft.correlation_id.is_none() {
+        Some(msg_id.clone())
+    } else {
+        draft.correlation_id.clone()
+    };
+    let op = make_msg_send_with_metadata(
+        actor.clone(),
+        msg_id.clone(),
+        draft.to.clone(),
+        draft.entity.clone(),
+        draft.reservation.clone(),
+        draft.msg_kind.clone(),
+        draft.body.clone(),
+        draft.reply_to.clone(),
+        correlation_id,
+        draft.idempotency_key.clone(),
+        Timestamp::now(),
+    );
+    let name = publish::publish_op(store, &op)?;
+    let state = reducer::replay_store(store)?;
+    if state.was_accepted(name.as_str()) {
+        println!("{msg_id}");
+        return Ok(0);
+    }
+
+    // Two publishers can race after both pass the preflight read. Treat the
+    // losing duplicate as the same successful send when its content matches.
+    if let Some(existing) = existing_idempotent_message(&state, &actor, &draft)? {
+        println!("{existing}");
+        return Ok(0);
+    }
+    let reason = state
+        .rejection_reason(name.as_str())
+        .unwrap_or_else(|| "unknown".into());
+    eprintln!("rejected: {reason}");
+    Ok(2)
+}
+
+fn cmd_msg(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    cmd: MsgCmd,
+) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     match cmd {
@@ -2161,6 +2292,7 @@ fn cmd_msg(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: MsgCmd) -> 
             issue,
             reservation,
             msg_kind,
+            idempotency_key,
             text,
         } => {
             if !validate_msg_kind(&msg_kind) {
@@ -2169,28 +2301,151 @@ fn cmd_msg(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: MsgCmd) -> 
                     op::VALID_MSG_KINDS.join(" | ")
                 )));
             }
-            let msg_id = ids::new_msg_id();
-            let op = make_msg_send(
+            if op::VALID_REPLY_KINDS.contains(&msg_kind.as_str()) {
+                return Err(MoteError::Invalid(format!(
+                    "message kind `{msg_kind}` requires `mote msg reply <request-id>`"
+                )));
+            }
+            publish_message(
+                &store,
                 actor,
-                msg_id.clone(),
-                to,
-                issue,
-                reservation,
-                msg_kind,
-                text,
-                Timestamp::now(),
-            );
-            let name = publish::publish_op(&store, &op)?;
-            // Print msg_id on stdout so callers can ack later.
-            println!("{msg_id}");
-            verify_accept(&store, &name)
+                MessageDraft {
+                    to,
+                    entity: issue,
+                    reservation,
+                    msg_kind,
+                    body: text,
+                    reply_to: None,
+                    correlation_id: None,
+                    idempotency_key,
+                },
+            )
         }
         MsgCmd::Ack { msg_id } => {
             let op = make_msg_ack(actor, msg_id, Timestamp::now());
             let name = publish::publish_op(&store, &op)?;
             verify_accept(&store, &name)
         }
+        MsgCmd::Reply {
+            msg_id,
+            msg_kind,
+            idempotency_key,
+            text,
+        } => {
+            if !op::VALID_REPLY_KINDS.contains(&msg_kind.as_str()) {
+                return Err(MoteError::Invalid(format!(
+                    "invalid reply kind `{msg_kind}` (expected one of: {})",
+                    op::VALID_REPLY_KINDS.join(" | ")
+                )));
+            }
+            let state = reducer::replay_store(&store)?;
+            let request = state
+                .messages
+                .get(&msg_id)
+                .ok_or_else(|| MoteError::Invalid(format!("no such request `{msg_id}`")))?;
+            if request.reply_to.is_some() || request.msg_kind != "request" {
+                return Err(MoteError::Invalid(format!(
+                    "message `{msg_id}` is not a root request"
+                )));
+            }
+            if request.to != actor {
+                return Err(MoteError::Invalid(format!(
+                    "request `{msg_id}` is addressed to {}, not {actor}",
+                    request.to
+                )));
+            }
+            let draft = MessageDraft {
+                to: request.from.clone(),
+                entity: request.entity.clone(),
+                reservation: request.reservation.clone(),
+                msg_kind,
+                body: text,
+                reply_to: Some(msg_id.clone()),
+                correlation_id: Some(
+                    request
+                        .correlation_id
+                        .clone()
+                        .unwrap_or_else(|| msg_id.clone()),
+                ),
+                idempotency_key,
+            };
+            if request.request_state != Some(RequestState::Open) {
+                if let Some(existing) = existing_idempotent_message(&state, &actor, &draft)? {
+                    println!("{existing}");
+                    return Ok(0);
+                }
+                return Err(MoteError::Invalid(format!(
+                    "request `{msg_id}` is not open"
+                )));
+            }
+            publish_message(&store, actor, draft)
+        }
+        MsgCmd::Requests { request_state } => {
+            let requested = match request_state.as_deref() {
+                Some(value) => Some(RequestState::parse(value).ok_or_else(|| {
+                    MoteError::Invalid(format!(
+                        "invalid request state `{value}` (expected open | responded | declined | resolved)"
+                    ))
+                })?),
+                None => None,
+            };
+            let state = reducer::replay_store(&store)?;
+            let requests: Vec<&MsgRecord> = state
+                .requests_for(&actor)
+                .into_iter()
+                .filter(|request| requested.is_none_or(|s| request.request_state == Some(s)))
+                .collect();
+            if json_mode {
+                let rows: Vec<_> = requests
+                    .iter()
+                    .map(|request| request_json(request))
+                    .collect();
+                println!("{}", serde_json::to_string(&rows)?);
+            } else {
+                for request in requests {
+                    println!(
+                        "{}  {}  from={}  to={}  state={}  {}",
+                        request.msg_id,
+                        request.sent_ts,
+                        request.from,
+                        request.to,
+                        request
+                            .request_state
+                            .expect("requests_for returned a non-request")
+                            .as_str(),
+                        request.body
+                    );
+                }
+            }
+            Ok(0)
+        }
+        MsgCmd::Resolve { msg_id } => {
+            let op = make_msg_resolve(actor, msg_id, Timestamp::now());
+            let name = publish::publish_op(&store, &op)?;
+            verify_accept(&store, &name)
+        }
     }
+}
+
+fn request_json(request: &MsgRecord) -> serde_json::Value {
+    serde_json::json!({
+        "msg_id": request.msg_id,
+        "from": request.from,
+        "to": request.to,
+        "entity": request.entity,
+        "reservation": request.reservation,
+        "msg_kind": request.msg_kind,
+        "body": request.body,
+        "reply_to": request.reply_to,
+        "correlation_id": request.correlation_id,
+        "idempotency_key": request.idempotency_key,
+        "request_state": request.request_state.map(RequestState::as_str),
+        "response_msg_id": request.response_msg_id,
+        "resolved_op_id": request.resolved_op_id,
+        "resolved_ts": request.resolved_ts,
+        "sent_ts": request.sent_ts,
+        "ack_ts": request.ack_ts,
+    })
 }
 
 fn cmd_discuss(
@@ -2700,6 +2955,11 @@ fn cmd_inbox(
                     "reservation": m.reservation,
                     "msg_kind": m.msg_kind,
                     "body": m.body,
+                    "reply_to": m.reply_to,
+                    "correlation_id": m.correlation_id,
+                    "idempotency_key": m.idempotency_key,
+                    "request_state": m.request_state.map(RequestState::as_str),
+                    "response_msg_id": m.response_msg_id,
                     "sent_ts": m.sent_ts,
                 })
             })
@@ -2793,8 +3053,10 @@ fn inbox_event_matches(
     from: Option<&str>,
     kind: Option<&str>,
 ) -> bool {
-    event.event_type == "message.sent"
-        && event.data["to"].as_str() == Some(actor)
+    matches!(
+        event.event_type.as_str(),
+        "message.sent" | "message.responded" | "message.declined"
+    ) && event.data["to"].as_str() == Some(actor)
         && issue.is_none_or(|i| event.data["entity"].as_str() == Some(i))
         && from.is_none_or(|f| event.actor == f)
         && kind.is_none_or(|k| event.data["msg_kind"].as_str() == Some(k))

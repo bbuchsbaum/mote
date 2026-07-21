@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Serialize;
+
 use crate::op::Status;
 
 #[derive(Debug, Clone)]
@@ -66,8 +68,8 @@ pub struct State {
     /// Per-entity history in filename order. Includes both accepted and rejected
     /// ops so `mote history --include-rejected` is a simple lookup.
     pub history: BTreeMap<String, Vec<HistoryEntry>>,
-    /// Ops that did not bind to any entity (e.g. malformed JSON, or msg_send /
-    /// msg_ack without an `entity` reference) live here.
+    /// Ops that did not bind to any entity (e.g. malformed JSON, or message
+    /// operations without an `entity` reference) live here.
     pub orphan_history: Vec<HistoryEntry>,
     /// All messages, indexed by `msg_id`. Both unacked and acked.
     pub messages: BTreeMap<String, MsgRecord>,
@@ -118,6 +120,36 @@ impl ReservationState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RequestState {
+    Open,
+    Responded,
+    Declined,
+    Resolved,
+}
+
+impl RequestState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Responded => "responded",
+            Self::Declined => "declined",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "responded" => Some(Self::Responded),
+            "declined" => Some(Self::Declined),
+            "resolved" => Some(Self::Resolved),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MsgRecord {
     pub msg_id: String,
@@ -127,6 +159,14 @@ pub struct MsgRecord {
     pub reservation: Option<String>,
     pub msg_kind: String,
     pub body: String,
+    pub reply_to: Option<String>,
+    pub correlation_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    /// Present only on root request messages.
+    pub request_state: Option<RequestState>,
+    pub response_msg_id: Option<String>,
+    pub resolved_op_id: Option<String>,
+    pub resolved_ts: Option<String>,
     pub sent_ts: String,
     pub sent_op_id: String,
     pub ack_op_id: Option<String>,
@@ -291,6 +331,24 @@ impl State {
             .collect();
         msgs.sort_by(|a, b| a.sent_op_id.cmp(&b.sent_op_id));
         msgs
+    }
+
+    /// Root request messages involving `actor`, in send-order.
+    pub fn requests_for<'a>(&'a self, actor: &str) -> Vec<&'a MsgRecord> {
+        let mut requests: Vec<&MsgRecord> = self
+            .messages
+            .values()
+            .filter(|m| m.request_state.is_some() && (m.from == actor || m.to == actor))
+            .collect();
+        requests.sort_by(|a, b| a.sent_op_id.cmp(&b.sent_op_id));
+        requests
+    }
+
+    /// Accepted message carrying a sender-scoped idempotency key.
+    pub fn message_by_idempotency<'a>(&'a self, actor: &str, key: &str) -> Option<&'a MsgRecord> {
+        self.messages
+            .values()
+            .find(|m| m.from == actor && m.idempotency_key.as_deref() == Some(key))
     }
 
     /// All discussion-board posts, optionally filtered by topic, in send-order.

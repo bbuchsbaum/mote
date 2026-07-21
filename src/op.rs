@@ -243,10 +243,29 @@ pub struct MsgSendOp {
     pub reservation: Option<String>,
     pub msg_kind: String,
     pub body: String,
+    /// Parent request for a structured response or decline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    /// Stable request conversation identifier. Request roots default to their
+    /// own `msg_id`; replies inherit the root's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Sender-scoped retry key. Accepted keys are unique per actor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MsgAckOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub msg_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgResolveOp {
     pub v: u32,
     pub op: String,
     pub ts: String,
@@ -349,6 +368,7 @@ pub enum Op {
     Release(ReleaseOp),
     MsgSend(MsgSendOp),
     MsgAck(MsgAckOp),
+    MsgResolve(MsgResolveOp),
     BoardPost(BoardPostOp),
     BoardRead(BoardReadOp),
     BoardTopic(BoardTopicOp),
@@ -372,6 +392,7 @@ impl Op {
             Op::Release(o) => &o.op,
             Op::MsgSend(o) => &o.op,
             Op::MsgAck(o) => &o.op,
+            Op::MsgResolve(o) => &o.op,
             Op::BoardPost(o) => &o.op,
             Op::BoardRead(o) => &o.op,
             Op::BoardTopic(o) => &o.op,
@@ -395,6 +416,7 @@ impl Op {
             Op::Release(o) => &o.actor,
             Op::MsgSend(o) => &o.actor,
             Op::MsgAck(o) => &o.actor,
+            Op::MsgResolve(o) => &o.actor,
             Op::BoardPost(o) => &o.actor,
             Op::BoardRead(o) => &o.actor,
             Op::BoardTopic(o) => &o.actor,
@@ -418,6 +440,7 @@ impl Op {
             Op::Release(o) => &o.ts,
             Op::MsgSend(o) => &o.ts,
             Op::MsgAck(o) => &o.ts,
+            Op::MsgResolve(o) => &o.ts,
             Op::BoardPost(o) => &o.ts,
             Op::BoardRead(o) => &o.ts,
             Op::BoardTopic(o) => &o.ts,
@@ -428,8 +451,8 @@ impl Op {
     }
 
     /// Returns the entity (bead id) this op acts on, or `None` for op kinds
-    /// that are not entity-scoped (`msg_ack`, `reserve_close`; `msg_send` may
-    /// optionally reference an entity).
+    /// that are not entity-scoped (`msg_ack`, `msg_resolve`, `reserve_close`;
+    /// `msg_send` may optionally reference an entity).
     pub fn entity(&self) -> Option<&str> {
         match self {
             Op::Create(o) => Some(&o.entity),
@@ -443,7 +466,7 @@ impl Op {
             Op::Claim(o) => Some(&o.entity),
             Op::Release(o) => Some(&o.entity),
             Op::MsgSend(o) => o.entity.as_deref(),
-            Op::MsgAck(_) => None,
+            Op::MsgAck(_) | Op::MsgResolve(_) => None,
             Op::BoardPost(_) => None,
             Op::BoardRead(_) => None,
             Op::BoardTopic(_) => None,
@@ -470,6 +493,7 @@ impl Op {
             Op::Release(_) => "release",
             Op::MsgSend(_) => "msg_send",
             Op::MsgAck(_) => "msg_ack",
+            Op::MsgResolve(_) => "msg_resolve",
             Op::BoardPost(_) => "board_post",
             Op::BoardRead(_) => "board_read",
             Op::BoardTopic(_) => "board_topic",
@@ -665,6 +689,35 @@ pub fn make_msg_send(
     body: String,
     ts: jiff::Timestamp,
 ) -> Op {
+    make_msg_send_with_metadata(
+        actor,
+        msg_id,
+        to,
+        entity,
+        reservation,
+        msg_kind,
+        body,
+        None,
+        None,
+        None,
+        ts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn make_msg_send_with_metadata(
+    actor: String,
+    msg_id: String,
+    to: String,
+    entity: Option<BeadId>,
+    reservation: Option<String>,
+    msg_kind: String,
+    body: String,
+    reply_to: Option<String>,
+    correlation_id: Option<String>,
+    idempotency_key: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
     Op::MsgSend(MsgSendOp {
         v: 1,
         op: String::new(),
@@ -676,6 +729,9 @@ pub fn make_msg_send(
         reservation,
         msg_kind,
         body,
+        reply_to,
+        correlation_id,
+        idempotency_key,
     })
 }
 
@@ -718,6 +774,16 @@ pub fn make_reserve_close(
 
 pub fn make_msg_ack(actor: String, msg_id: String, ts: jiff::Timestamp) -> Op {
     Op::MsgAck(MsgAckOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        msg_id,
+    })
+}
+
+pub fn make_msg_resolve(actor: String, msg_id: String, ts: jiff::Timestamp) -> Op {
+    Op::MsgResolve(MsgResolveOp {
         v: 1,
         op: String::new(),
         ts: ids::format_rfc3339(ts),
@@ -792,7 +858,10 @@ pub fn make_board_sticky(actor: String, post_id: String, sticky: bool, ts: jiff:
 }
 
 pub const VALID_NOTE_KINDS: &[&str] = &["note", "progress", "decision", "handoff", "blocker"];
-pub const VALID_MSG_KINDS: &[&str] = &["note", "request", "handoff", "blocked", "fyi"];
+pub const VALID_MSG_KINDS: &[&str] = &[
+    "note", "request", "response", "decline", "handoff", "blocked", "fyi",
+];
+pub const VALID_REPLY_KINDS: &[&str] = &["response", "decline"];
 
 pub fn validate_note_kind(k: &str) -> bool {
     VALID_NOTE_KINDS.contains(&k)
@@ -800,6 +869,13 @@ pub fn validate_note_kind(k: &str) -> bool {
 
 pub fn validate_msg_kind(k: &str) -> bool {
     VALID_MSG_KINDS.contains(&k)
+}
+
+pub fn validate_idempotency_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.chars().count() <= 128
+        && key.trim() == key
+        && !key.chars().any(char::is_control)
 }
 
 /// `BTreeSet` is an internal helper exposed for callers; not currently used by

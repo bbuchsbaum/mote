@@ -119,10 +119,14 @@ mote claim bd-... --ttl 1800
 mote release bd-...
 
 # Message plane.
-mote msg send --to bob --issue bd-... --kind request "please take tests"
+mote msg send --to bob --issue bd-... --kind request \
+  --idempotency-key tests-request-1 "please take tests"
 mote inbox
 mote --json inbox --follow       # current unacked messages, then new deliveries
 mote msg ack msg-...
+mote msg reply msg-... --kind response "tests are passing"
+mote msg requests --state responded
+mote msg resolve msg-...
 
 # Discussion plane.
 mote discuss topic new planning --title "Planning" --description "Coordination thread"
@@ -201,9 +205,17 @@ They are safe to leave running while agents are writing to the store.
   `--interval` fallback scan. Without `--follow`, existing matching events are
   emitted and the command exits.
 - `mote inbox --follow` first emits the actor's existing filtered unacked
-  messages, then emits new matching `message.sent` events. Pass `--after
-  <event-id>` to either follow surface to resume from a previously persisted
-  cursor rather than replaying current inbox state.
+  messages, then emits new matching message delivery events (`message.sent`,
+  `message.responded`, or `message.declined`). Pass `--after <event-id>` to
+  either follow surface to resume from a previously persisted cursor rather
+  than replaying current inbox state.
+- Request messages have a lifecycle independent of acknowledgement. `msg ack`
+  means only that the recipient saw the delivery. `msg reply` records a
+  correlated `response` or `decline`; the original sender then closes the
+  lifecycle with `msg resolve`. `msg requests --state
+  open|responded|declined|resolved` lists request roots involving the current
+  actor. Sender-scoped `--idempotency-key` values make identical send/reply
+  retries return the original message id without creating a duplicate message.
 - `mote ui` opens a four-tab terminal dashboard (Overview / Beads / Discussion
   / Activity) with full per-bead detail, recent op history (including
   rejected ops with their reasons), and incremental refresh on filesystem

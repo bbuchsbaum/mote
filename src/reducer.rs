@@ -8,11 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::op::{
     BoardPostOp, BoardReadOp, BoardStickyOp, BoardTopicOp, ClaimOp, CloseOp, CreateOp, DeleteOp,
-    DepOp, MsgAckOp, MsgSendOp, NoteOp, Op, PatchOp, RelOp, ReleaseOp, ReserveCloseOp,
-    ReserveOpenOp, ScalarSet, Status, TagOp, validate_msg_kind, validate_note_kind,
+    DepOp, MsgAckOp, MsgResolveOp, MsgSendOp, NoteOp, Op, PatchOp, RelOp, ReleaseOp,
+    ReserveCloseOp, ReserveOpenOp, ScalarSet, Status, TagOp, VALID_REPLY_KINDS,
+    validate_idempotency_key, validate_msg_kind, validate_note_kind,
 };
 use crate::repo::Store;
-use crate::state::{Bead, HistoryEntry, State};
+use crate::state::{Bead, HistoryEntry, RequestState, State};
 
 /// Replay a sequence of ops, in the given filename order, into a fresh State.
 pub fn replay<I>(ops: I) -> State
@@ -109,6 +110,7 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
         Op::Release(o) => apply_release(state, op_id, kind, &actor, &ts, o),
         Op::MsgSend(o) => apply_msg_send(state, op_id, kind, &actor, &ts, o),
         Op::MsgAck(o) => apply_msg_ack(state, op_id, kind, &actor, &ts, o),
+        Op::MsgResolve(o) => apply_msg_resolve(state, op_id, kind, &actor, &ts, o),
         Op::BoardPost(o) => apply_board_post(state, op_id, kind, &actor, &ts, o),
         Op::BoardRead(o) => apply_board_read(state, op_id, kind, &actor, &ts, o),
         Op::BoardTopic(o) => apply_board_topic(state, op_id, kind, &actor, &ts, o),
@@ -823,54 +825,90 @@ fn compute_lease_until(ts: &str, ttl_s: u32) -> Result<String, String> {
     Ok(crate::ids::format_rfc3339(lease_until))
 }
 
+fn reject_message(
+    state: &mut State,
+    entity: Option<&str>,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    reason: String,
+) {
+    match entity {
+        Some(entity) => reject(state, entity, op_id, kind, actor, ts, reason),
+        None => state.push_history(None, HistoryEntry::rejected(op_id, kind, actor, ts, reason)),
+    }
+}
+
 fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, o: MsgSendOp) {
     let MsgSendOp {
         msg_id,
         to,
-        entity,
-        reservation,
+        mut entity,
+        mut reservation,
         msg_kind,
         body,
+        reply_to,
+        mut correlation_id,
+        idempotency_key,
         ..
     } = o;
 
-    let bind_entity = entity.as_deref();
-
     if !validate_msg_kind(&msg_kind) {
-        if let Some(e) = bind_entity {
-            reject(
+        reject_message(
+            state,
+            entity.as_deref(),
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("invalid msg_kind: {msg_kind}"),
+        );
+        return;
+    }
+    if state.messages.contains_key(&msg_id) {
+        reject_message(
+            state,
+            entity.as_deref(),
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("duplicate msg_id {msg_id}"),
+        );
+        return;
+    }
+    if let Some(key) = idempotency_key.as_deref() {
+        if !validate_idempotency_key(key) {
+            reject_message(
                 state,
-                e,
+                entity.as_deref(),
                 op_id,
                 kind,
                 actor,
                 ts,
-                format!("invalid msg_kind: {msg_kind}"),
+                "idempotency_key must be 1..=128 trimmed printable characters".into(),
             );
-        } else {
-            state.push_history(
-                None,
-                HistoryEntry::rejected(
-                    op_id,
-                    kind,
-                    actor,
-                    ts,
-                    format!("invalid msg_kind: {msg_kind}"),
+            return;
+        }
+        if let Some(existing) = state.message_by_idempotency(actor, key) {
+            reject_message(
+                state,
+                entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!(
+                    "idempotency_key `{key}` already used by {}",
+                    existing.msg_id
                 ),
             );
+            return;
         }
-        return;
     }
-    if state.messages.contains_key(&msg_id) {
-        let reason = format!("duplicate msg_id {msg_id}");
-        if let Some(e) = bind_entity {
-            reject(state, e, op_id, kind, actor, ts, reason);
-        } else {
-            state.push_history(None, HistoryEntry::rejected(op_id, kind, actor, ts, reason));
-        }
-        return;
-    }
-    if let Some(e) = bind_entity {
+
+    if let Some(e) = entity.as_deref() {
         if !state.beads.contains_key(e) {
             reject(
                 state,
@@ -885,6 +923,158 @@ fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &
         }
     }
 
+    let mut request_state = None;
+    let mut reply_transition = None;
+    if let Some(parent_id) = reply_to.as_deref() {
+        let Some(parent) = state.messages.get(parent_id).cloned() else {
+            reject_message(
+                state,
+                entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("no such reply_to request {parent_id}"),
+            );
+            return;
+        };
+        if parent.reply_to.is_some() || parent.msg_kind != "request" {
+            reject_message(
+                state,
+                parent.entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("msg {parent_id} is not a root request"),
+            );
+            return;
+        }
+        if !VALID_REPLY_KINDS.contains(&msg_kind.as_str()) {
+            reject_message(
+                state,
+                parent.entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                "structured replies must use kind response or decline".into(),
+            );
+            return;
+        }
+        if parent.to != actor {
+            reject_message(
+                state,
+                parent.entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!(
+                    "request {parent_id} addressed to {}, not {actor}",
+                    parent.to
+                ),
+            );
+            return;
+        }
+        if to != parent.from {
+            reject_message(
+                state,
+                parent.entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("reply to {parent_id} must be addressed to {}", parent.from),
+            );
+            return;
+        }
+        if parent.request_state != Some(RequestState::Open) {
+            reject_message(
+                state,
+                parent.entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("request {parent_id} is not open"),
+            );
+            return;
+        }
+        if entity.is_some() && entity != parent.entity {
+            reject_message(
+                state,
+                parent.entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("reply to {parent_id} must use the request entity"),
+            );
+            return;
+        }
+        if reservation.is_some() && reservation != parent.reservation {
+            reject_message(
+                state,
+                parent.entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("reply to {parent_id} must use the request reservation"),
+            );
+            return;
+        }
+        let parent_correlation = parent
+            .correlation_id
+            .clone()
+            .unwrap_or_else(|| parent.msg_id.clone());
+        if correlation_id
+            .as_deref()
+            .is_some_and(|value| value != parent_correlation)
+        {
+            reject_message(
+                state,
+                parent.entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("reply to {parent_id} has a mismatched correlation_id"),
+            );
+            return;
+        }
+        entity = parent.entity.clone();
+        reservation = parent.reservation.clone();
+        correlation_id = Some(parent_correlation);
+        let next = if msg_kind == "response" {
+            RequestState::Responded
+        } else {
+            RequestState::Declined
+        };
+        reply_transition = Some((parent_id.to_string(), next));
+    } else {
+        if VALID_REPLY_KINDS.contains(&msg_kind.as_str()) {
+            reject_message(
+                state,
+                entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("{msg_kind} requires reply_to"),
+            );
+            return;
+        }
+        if msg_kind == "request" {
+            correlation_id.get_or_insert_with(|| msg_id.clone());
+            request_state = Some(RequestState::Open);
+        }
+    }
+
+    let bind_entity = entity.clone();
+    let response_msg_id = msg_id.clone();
+
     state.messages.insert(
         msg_id.clone(),
         crate::state::MsgRecord {
@@ -895,6 +1085,13 @@ fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &
             reservation,
             msg_kind,
             body,
+            reply_to,
+            correlation_id,
+            idempotency_key,
+            request_state,
+            response_msg_id: None,
+            resolved_op_id: None,
+            resolved_ts: None,
             sent_ts: ts.to_string(),
             sent_op_id: op_id.to_string(),
             ack_op_id: None,
@@ -902,7 +1099,19 @@ fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &
         },
     );
 
-    state.push_history(bind_entity, HistoryEntry::accepted(op_id, kind, actor, ts));
+    if let Some((parent_id, next)) = reply_transition {
+        let parent = state
+            .messages
+            .get_mut(&parent_id)
+            .expect("validated request disappeared during reducer step");
+        parent.request_state = Some(next);
+        parent.response_msg_id = Some(response_msg_id);
+    }
+
+    state.push_history(
+        bind_entity.as_deref(),
+        HistoryEntry::accepted(op_id, kind, actor, ts),
+    );
 }
 
 fn apply_msg_ack(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, o: MsgAckOp) {
@@ -955,6 +1164,94 @@ fn apply_msg_ack(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
     msg.ack_op_id = Some(op_id.to_string());
     msg.ack_ts = Some(ts.to_string());
 
+    state.push_history(
+        bind_entity.as_deref(),
+        HistoryEntry::accepted(op_id, kind, actor, ts),
+    );
+}
+
+fn apply_msg_resolve(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: MsgResolveOp,
+) {
+    let MsgResolveOp { msg_id, .. } = o;
+    let Some(request) = state.messages.get(&msg_id).cloned() else {
+        reject_message(
+            state,
+            None,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("no such request {msg_id}"),
+        );
+        return;
+    };
+    if request.reply_to.is_some() || request.msg_kind != "request" {
+        reject_message(
+            state,
+            request.entity.as_deref(),
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("msg {msg_id} is not a root request"),
+        );
+        return;
+    }
+    if request.from != actor {
+        reject_message(
+            state,
+            request.entity.as_deref(),
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("only request sender {} may resolve {msg_id}", request.from),
+        );
+        return;
+    }
+    match request.request_state {
+        Some(RequestState::Responded | RequestState::Declined) => {}
+        Some(RequestState::Open) => {
+            reject_message(
+                state,
+                request.entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("request {msg_id} is still open"),
+            );
+            return;
+        }
+        Some(RequestState::Resolved) => {
+            reject_message(
+                state,
+                request.entity.as_deref(),
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("request {msg_id} already resolved"),
+            );
+            return;
+        }
+        None => unreachable!("validated root request without request_state"),
+    }
+
+    let request = state
+        .messages
+        .get_mut(&msg_id)
+        .expect("validated request disappeared during reducer step");
+    request.request_state = Some(RequestState::Resolved);
+    request.resolved_op_id = Some(op_id.to_string());
+    request.resolved_ts = Some(ts.to_string());
+    let bind_entity = request.entity.clone();
     state.push_history(
         bind_entity.as_deref(),
         HistoryEntry::accepted(op_id, kind, actor, ts),

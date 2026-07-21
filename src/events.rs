@@ -289,10 +289,23 @@ fn event_from_op(store_id: &str, op: Op) -> MoteResult<EventEnvelope> {
     let op_id = op.op_id().to_string();
     let ts = op.ts().to_string();
     let actor = op.actor().to_string();
+    let request_state = match &op {
+        Op::MsgSend(o) if o.reply_to.is_none() && o.msg_kind == "request" => Some("open"),
+        Op::MsgSend(o) if o.msg_kind == "response" => Some("responded"),
+        Op::MsgSend(o) if o.msg_kind == "decline" => Some("declined"),
+        Op::MsgResolve(_) => Some("resolved"),
+        _ => None,
+    };
     let mut data = serde_json::to_value(&op)?;
     if let Some(obj) = data.as_object_mut() {
         for key in ["v", "op", "ts", "actor", "kind"] {
             obj.remove(key);
+        }
+        if let Some(request_state) = request_state {
+            obj.insert(
+                "request_state".to_string(),
+                Value::String(request_state.to_string()),
+            );
         }
     }
     Ok(EventEnvelope {
@@ -312,7 +325,7 @@ fn event_from_op(store_id: &str, op: Op) -> MoteResult<EventEnvelope> {
 fn event_category(op: &Op) -> &'static str {
     match op {
         Op::Claim(_) | Op::Release(_) => "claim",
-        Op::MsgSend(_) | Op::MsgAck(_) => "message",
+        Op::MsgSend(_) | Op::MsgAck(_) | Op::MsgResolve(_) => "message",
         Op::BoardPost(_) | Op::BoardRead(_) | Op::BoardTopic(_) | Op::BoardSticky(_) => {
             "discussion"
         }
@@ -336,8 +349,11 @@ fn event_type(op: &Op) -> &'static str {
         Op::Delete(_) => "issue.deleted",
         Op::Claim(_) => "claim.acquired",
         Op::Release(_) => "claim.released",
+        Op::MsgSend(o) if o.msg_kind == "response" => "message.responded",
+        Op::MsgSend(o) if o.msg_kind == "decline" => "message.declined",
         Op::MsgSend(_) => "message.sent",
         Op::MsgAck(_) => "message.acknowledged",
+        Op::MsgResolve(_) => "message.resolved",
         Op::BoardPost(_) => "discussion.posted",
         Op::BoardRead(_) => "discussion.read",
         Op::BoardTopic(_) => "discussion.topic_created",
@@ -356,6 +372,10 @@ fn op_relates_to_actor(op: &Op, state: &State, actor: &str) -> bool {
         Op::Claim(o) => o.to == actor,
         Op::MsgSend(o) => o.to == actor,
         Op::MsgAck(o) => state
+            .messages
+            .get(&o.msg_id)
+            .is_some_and(|m| m.from == actor || m.to == actor),
+        Op::MsgResolve(o) => state
             .messages
             .get(&o.msg_id)
             .is_some_and(|m| m.from == actor || m.to == actor),
