@@ -4,15 +4,11 @@
 //! `reducer::replay_store`. Writes are produced by the regular CLI; this
 //! command is a passive observer.
 
-use std::sync::mpsc::{Receiver, channel};
-use std::thread;
-use std::time::{Duration, Instant};
-
 use jiff::Timestamp;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::Value;
 
-use crate::errors::{MoteError, MoteResult};
+use crate::errors::MoteResult;
+use crate::events::StoreWatcher;
 use crate::ids;
 use crate::reducer;
 use crate::repo::Store;
@@ -28,63 +24,19 @@ pub fn run(
 ) -> MoteResult<i32> {
     let actor = actor.map(String::from);
 
-    // Emit a starting snapshot before installing the watcher so a fresh viewer
-    // always sees the current state, not just future deltas.
+    // Subscribe before the first snapshot. If an op lands while that snapshot
+    // is replaying, the queued notification causes a second replay rather than
+    // leaving the display stale until the fallback tick.
+    let watcher = StoreWatcher::new(store, interval_s)?;
+
+    // A fresh viewer always sees the current state, not just future changes.
     emit_snapshot(store, actor.as_deref(), json_mode)?;
 
-    let (tx, rx) = channel::<()>();
-
-    // FS watcher on the ops/ directory. The reducer's contract is "filenames
-    // in lex order"; new ops appear as Create events.
-    let tx_fs = tx.clone();
-    let mut watcher: RecommendedWatcher =
-        notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                if matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                ) {
-                    let _ = tx_fs.send(());
-                }
-            }
-        })
-        .map_err(|e| MoteError::Other(format!("watch: install watcher: {e}")))?;
-    watcher
-        .watch(&store.ops_dir(), RecursiveMode::NonRecursive)
-        .map_err(|e| MoteError::Other(format!("watch: subscribe ops_dir: {e}")))?;
-
-    // Periodic safety tick: re-emit every `interval_s` even if no FS event was
-    // observed (network filesystems, sandboxed watchers, lease expiry).
-    let tx_tick = tx.clone();
-    let interval = Duration::from_secs(interval_s.max(1));
-    thread::spawn(move || {
-        loop {
-            thread::sleep(interval);
-            if tx_tick.send(()).is_err() {
-                break;
-            }
-        }
-    });
-
-    loop {
-        if rx.recv().is_err() {
-            break;
-        }
-        drain_for(&rx, Duration::from_millis(150));
+    while watcher.wait() {
         emit_snapshot(store, actor.as_deref(), json_mode)?;
     }
 
     Ok(0)
-}
-
-/// Coalesce a burst of events into a single redraw.
-fn drain_for(rx: &Receiver<()>, window: Duration) {
-    let deadline = Instant::now() + window;
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        if rx.recv_timeout(remaining).is_err() {
-            return;
-        }
-    }
 }
 
 fn emit_snapshot(store: &Store, actor: Option<&str>, json_mode: bool) -> MoteResult<()> {

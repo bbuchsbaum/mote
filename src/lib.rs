@@ -6,6 +6,7 @@
 pub mod canonical;
 pub mod cli;
 pub mod errors;
+pub mod events;
 pub mod fsck;
 pub mod ids;
 pub mod op;

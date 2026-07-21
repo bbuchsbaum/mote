@@ -1,6 +1,6 @@
 //! Clap definitions and dispatcher.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -202,6 +202,15 @@ pub enum Command {
         /// Filter by msg_kind
         #[arg(long)]
         kind: Option<String>,
+        /// Stream existing unacked messages, then new deliveries as JSONL/events
+        #[arg(long)]
+        follow: bool,
+        /// Resume follow mode after an event/op id instead of emitting current inbox state
+        #[arg(long)]
+        after: Option<String>,
+        /// Periodic fallback scan interval in seconds
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
     },
 
     /// Reserve one or more repo-relative paths under an issue
@@ -270,6 +279,25 @@ pub enum Command {
 
     /// Compact overview of board state
     Board,
+
+    /// Emit accepted operation events, optionally following for new events
+    Events {
+        /// Event categories: issue, claim, reservation, message, discussion, or all
+        #[arg(long = "kind", value_delimiter = ',')]
+        kinds: Vec<String>,
+        /// Include only events authored by or directly related to this actor
+        #[arg(long = "for-actor")]
+        for_actor: Option<String>,
+        /// Emit only events after this event/op id
+        #[arg(long)]
+        after: Option<String>,
+        /// Continue waiting for new events
+        #[arg(long)]
+        follow: bool,
+        /// Periodic fallback scan interval in seconds
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+    },
 
     /// Stream snapshots whenever the op log changes. Read-only.
     Watch {
@@ -587,13 +615,23 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         Command::Discuss { cmd } => {
             cmd_discuss(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
         }
-        Command::Inbox { issue, from, kind } => cmd_inbox(
+        Command::Inbox {
+            issue,
+            from,
+            kind,
+            follow,
+            after,
+            interval,
+        } => cmd_inbox(
             cli.actor.as_deref(),
             cli.store.as_deref(),
             cli.json,
             issue,
             from,
             kind,
+            follow,
+            after,
+            interval,
         ),
         Command::Reserve { paths, issue, ttl } => cmd_reserve(
             cli.actor.as_deref(),
@@ -643,6 +681,22 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         }
         Command::WhoHas { path } => cmd_who_has(cli.store.as_deref(), cli.json, path),
         Command::Board => cmd_board(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
+        Command::Events {
+            kinds,
+            for_actor,
+            after,
+            follow,
+            interval,
+        } => cmd_events(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            kinds,
+            for_actor,
+            after,
+            follow,
+            interval,
+        ),
         Command::Watch { interval } => cmd_watch(
             cli.actor.as_deref(),
             cli.store.as_deref(),
@@ -2590,6 +2644,7 @@ fn normalize_discussion_topic(topic: &str) -> MoteResult<String> {
     Ok(topic.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_inbox(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
@@ -2597,9 +2652,29 @@ fn cmd_inbox(
     issue: Option<String>,
     from: Option<String>,
     kind: Option<String>,
+    follow: bool,
+    after: Option<String>,
+    interval: u64,
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
+
+    if follow {
+        return cmd_inbox_follow(
+            &store,
+            &actor,
+            json_mode,
+            issue.as_deref(),
+            from.as_deref(),
+            kind.as_deref(),
+            after.as_deref(),
+            interval,
+        );
+    }
+    if after.is_some() {
+        return Err(MoteError::Invalid("inbox --after requires --follow".into()));
+    }
+
     let state = reducer::replay_store(&store)?;
     let messages = state.inbox_for(&actor);
     let filtered: Vec<&crate::state::MsgRecord> = messages
@@ -2640,6 +2715,89 @@ fn cmd_inbox(
         }
     }
     Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_inbox_follow(
+    store: &Store,
+    actor: &str,
+    json_mode: bool,
+    issue: Option<&str>,
+    from: Option<&str>,
+    kind: Option<&str>,
+    after: Option<&str>,
+    interval: u64,
+) -> MoteResult<i32> {
+    let filter = crate::events::EventFilter::messages_for(actor);
+    let mut tailer = crate::events::EventTailer::new(store, after, interval)?;
+
+    // Without a cursor, begin with the inbox as it existed at the tailer's
+    // baseline. Replaying exactly those names avoids duplicating a message that
+    // arrives while the follow stream is being established.
+    if after.is_none() {
+        let baseline = crate::events::state_for_names(store, tailer.initial_names())?;
+        let unacked: BTreeSet<String> = baseline
+            .inbox_for(actor)
+            .into_iter()
+            .filter(|m| {
+                issue.is_none_or(|i| m.entity.as_deref() == Some(i))
+                    && from.is_none_or(|f| m.from == f)
+                    && kind.is_none_or(|k| m.msg_kind == k)
+            })
+            .map(|m| m.msg_id.clone())
+            .collect();
+        let initial =
+            crate::events::accepted_events_for_names(store, tailer.initial_names(), &filter)?;
+        for event in initial
+            .iter()
+            .filter(|event| inbox_event_matches(event, actor, issue, from, kind))
+            .filter(|event| {
+                event.data["msg_id"]
+                    .as_str()
+                    .is_some_and(|msg_id| unacked.contains(msg_id))
+            })
+        {
+            crate::events::write_event(event, json_mode)?;
+        }
+    }
+
+    // Emit cursor catch-up before notification setup, then install the watcher
+    // and scan once more to close that installation gap.
+    for event in tailer
+        .poll(store, &filter)?
+        .iter()
+        .filter(|event| inbox_event_matches(event, actor, issue, from, kind))
+    {
+        crate::events::write_event(event, json_mode)?;
+    }
+    tailer.start(store)?;
+    loop {
+        for event in tailer
+            .poll(store, &filter)?
+            .iter()
+            .filter(|event| inbox_event_matches(event, actor, issue, from, kind))
+        {
+            crate::events::write_event(event, json_mode)?;
+        }
+        if !tailer.wait() {
+            break;
+        }
+    }
+    Ok(0)
+}
+
+fn inbox_event_matches(
+    event: &crate::events::EventEnvelope,
+    actor: &str,
+    issue: Option<&str>,
+    from: Option<&str>,
+    kind: Option<&str>,
+) -> bool {
+    event.event_type == "message.sent"
+        && event.data["to"].as_str() == Some(actor)
+        && issue.is_none_or(|i| event.data["entity"].as_str() == Some(i))
+        && from.is_none_or(|f| event.actor == f)
+        && kind.is_none_or(|k| event.data["msg_kind"].as_str() == Some(k))
 }
 
 fn cmd_reserve(
@@ -3154,6 +3312,46 @@ fn cmd_board(
         }
         println!("inbox:        {inbox_count} unacked");
         println!("discussion:   {discussion_unread_count} unread");
+    }
+    Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_events(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    kinds: Vec<String>,
+    for_actor: Option<String>,
+    after: Option<String>,
+    follow: bool,
+    interval: u64,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    // An explicit global --actor is a convenient shorthand for --for-actor on
+    // this read-only command. Persisted/env actor identity does not silently
+    // filter oversight output.
+    let actor_filter = for_actor.or_else(|| actor_flag.map(str::to_string));
+    let filter = crate::events::EventFilter::new(&kinds, actor_filter)?;
+
+    if follow {
+        let mut tailer = crate::events::EventTailer::new(&store, after.as_deref(), interval)?;
+        for event in tailer.poll(&store, &filter)? {
+            crate::events::write_event(&event, json_mode)?;
+        }
+        tailer.start(&store)?;
+        loop {
+            for event in tailer.poll(&store, &filter)? {
+                crate::events::write_event(&event, json_mode)?;
+            }
+            if !tailer.wait() {
+                break;
+            }
+        }
+    } else {
+        for event in crate::events::accepted_events(&store, after.as_deref(), &filter)? {
+            crate::events::write_event(&event, json_mode)?;
+        }
     }
     Ok(0)
 }

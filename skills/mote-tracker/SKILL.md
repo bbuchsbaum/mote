@@ -86,8 +86,13 @@ For directed coordination:
 ```sh
 mote msg send --to <actor> --issue <bd-id> --kind request "short request"
 mote inbox
+mote --json inbox --follow
 mote msg ack <msg-id>
 ```
+
+`inbox --follow` emits current unacknowledged messages as `mote.event.v1`
+JSONL, then waits for new deliveries. Persist each `event_id` and resume with
+`mote --json inbox --follow --after <event-id>` after restarting a harness.
 
 Use the public forum-style board via the separate `$mote-message-board` skill.
 
@@ -121,11 +126,17 @@ other agents write.
 ```sh
 mote watch            # board-style snapshot that re-renders on every store change
 mote --json watch     # one JSON snapshot per change, for piping into jq or a UI
+mote --json events --kind message,reservation --follow
 mote ui               # interactive TUI dashboard
 ```
 
 `mote watch --interval <secs>` sets the periodic fallback tick (default 5) so
 lease expiry is reflected even without new ops.
+
+`mote events` emits accepted operations as versioned JSONL. Filter with
+`--kind issue,claim,reservation,message,discussion`, `--for-actor <actor>`, and
+`--after <event-id>`. Follow mode uses filesystem notifications plus the same
+periodic fallback scan and remains read-only.
 
 `mote ui` opens a four-tab dashboard (Overview / Beads / Discussion / Activity)
 with per-bead detail and recent op history, including rejected ops and their

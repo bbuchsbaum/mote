@@ -121,6 +121,7 @@ mote release bd-...
 # Message plane.
 mote msg send --to bob --issue bd-... --kind request "please take tests"
 mote inbox
+mote --json inbox --follow       # current unacked messages, then new deliveries
 mote msg ack msg-...
 
 # Discussion plane.
@@ -162,6 +163,8 @@ mote import plan.json
 # Oversight (read-only).
 mote watch                # human-readable snapshots that re-render on store changes
 mote --json watch         # newline-delimited JSON for piping into other tools
+mote --json events --kind message,reservation
+mote --json events --kind message --for-actor bob --follow
 mote ui                   # interactive TUI dashboard (q to quit, ? for help)
 ```
 
@@ -182,18 +185,36 @@ the same report as structured data.
 
 ### Oversight
 
-`mote watch` and `mote ui` are passive viewers — they only ever call the same
-deterministic replay path the CLI uses, never publish ops. They are safe to
-leave running while agents are writing to the store.
+`mote watch`, `mote events`, follow-mode inboxes, and `mote ui` are passive
+viewers — they only read immutable ops and derived state, never publish ops.
+They are safe to leave running while agents are writing to the store.
 
 - `mote watch` redraws a board-style summary every time a new op appears, with
   a periodic fallback tick so it also reflects lease expiry. `mote --json
   watch` writes one JSON snapshot per change to stdout, suitable for piping
   into `jq` or any small UI.
+- `mote events` emits one accepted operation event per line. Filter categories
+  with `--kind issue,claim,reservation,message,discussion`, and filter events
+  authored by or directly related to an actor with `--for-actor`. An explicit
+  global `--actor` is shorthand for `--for-actor` on this read-only command.
+  `--follow` waits for new ops using filesystem notifications plus the
+  `--interval` fallback scan. Without `--follow`, existing matching events are
+  emitted and the command exits.
+- `mote inbox --follow` first emits the actor's existing filtered unacked
+  messages, then emits new matching `message.sent` events. Pass `--after
+  <event-id>` to either follow surface to resume from a previously persisted
+  cursor rather than replaying current inbox state.
 - `mote ui` opens a four-tab terminal dashboard (Overview / Beads / Discussion
   / Activity) with full per-bead detail, recent op history (including
   rejected ops with their reasons), and incremental refresh on filesystem
   events.
+
+Event JSON is newline-delimited and versioned independently from the durable
+op schema. Every `mote.event.v1` envelope contains `event_id` (also the resume
+cursor), `store_id`, `type`, `category`, `op_id`, `ts`, `actor`, `accepted`, and
+the full kind-specific `data` payload. Consumers should persist `event_id` and
+deduplicate by it; the periodic fallback may rescan, but a running stream emits
+each filename at most once.
 
 ## Agent skills
 
@@ -325,5 +346,5 @@ Requires Rust 1.85+ (edition 2024).
 - `mote_prd.md`, `mote_coordination_addendum.md` — historical design rationale
 - `src/` — Rust crate
 - `tests/` — integration tests (storage, issue plane, notes/ready, claims/msgs,
-  coordination, replay determinism, crash/failpoint, property, JSON-output, and
-  stress coverage)
+  event delivery, coordination, replay determinism, crash/failpoint, property,
+  JSON-output, and stress coverage)
