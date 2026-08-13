@@ -564,6 +564,48 @@ fn actor_command_persists_shows_and_clears_local_identity() {
 }
 
 #[test]
+fn mote_store_env_routes_commands_and_explicit_flag_wins() {
+    let store_dir = TempDir::new().unwrap();
+    let client_dir = TempDir::new().unwrap();
+    init_store(&store_dir);
+
+    let via_env = Command::new(mote_bin())
+        .args(["--json", "--actor", "alice", "doctor"])
+        .env("MOTE_STORE", store_dir.path())
+        .env_remove("MOTE_ACTOR")
+        .current_dir(client_dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        via_env.status.code(),
+        Some(0),
+        "MOTE_STORE routing failed: {}",
+        String::from_utf8_lossy(&via_env.stderr)
+    );
+    let env_json: Value = serde_json::from_slice(&via_env.stdout).unwrap();
+    assert_eq!(
+        env_json["store_root"],
+        store_dir.path().join(".mote").display().to_string()
+    );
+
+    let via_flag = Command::new(mote_bin())
+        .arg("--store")
+        .arg(store_dir.path())
+        .args(["--json", "--actor", "alice", "doctor"])
+        .env("MOTE_STORE", client_dir.path().join("missing"))
+        .env_remove("MOTE_ACTOR")
+        .current_dir(client_dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        via_flag.status.code(),
+        Some(0),
+        "--store did not override MOTE_STORE: {}",
+        String::from_utf8_lossy(&via_flag.stderr)
+    );
+}
+
+#[test]
 fn doctor_reports_clean_store_and_actor_readiness() {
     let td = TempDir::new().unwrap();
     init_store(&td);

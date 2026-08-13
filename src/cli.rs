@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use jiff::Timestamp;
@@ -32,7 +33,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub actor: Option<String>,
 
-    /// Override store path (default: walk up from cwd looking for .mote/)
+    /// Override store path (then MOTE_STORE; default: discover from cwd)
     #[arg(long, global = true)]
     pub store: Option<PathBuf>,
 
@@ -53,7 +54,7 @@ pub enum Command {
     /// Initialize a `.mote/` store in the current directory
     Init,
 
-    /// Manage the local actor identity in `.mote/local/actor`
+    /// Manage actor identity and inspect actors observed in this store
     Actor {
         #[command(subcommand)]
         cmd: ActorCmd,
@@ -202,9 +203,15 @@ pub enum Command {
         /// Filter by msg_kind
         #[arg(long)]
         kind: Option<String>,
-        /// Stream existing unacked messages, then new deliveries as JSONL/events
-        #[arg(long)]
+        /// Stream existing unacked messages, then new deliveries
+        #[arg(long, conflicts_with = "wait")]
         follow: bool,
+        /// Return pending messages, or wait for the next delivery and exit
+        #[arg(long, conflicts_with = "follow")]
+        wait: bool,
+        /// Maximum seconds to wait (default: 60; requires --wait)
+        #[arg(long, requires = "wait")]
+        timeout: Option<u64>,
         /// Resume follow mode after an event/op id instead of emitting current inbox state
         #[arg(long)]
         after: Option<String>,
@@ -364,6 +371,8 @@ pub enum ActorCmd {
     Set { actor: String },
     /// Show the actor identity that would be used for this invocation
     Show,
+    /// List actors observed in accepted operations or message recipients
+    List,
     /// Remove the persisted local actor identity
     Clear,
 }
@@ -647,6 +656,8 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             from,
             kind,
             follow,
+            wait,
+            timeout,
             after,
             interval,
         } => cmd_inbox(
@@ -657,6 +668,8 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             from,
             kind,
             follow,
+            wait,
+            timeout,
             after,
             interval,
         ),
@@ -802,6 +815,28 @@ fn cmd_actor(
             }
             Ok(0)
         }
+        ActorCmd::List => {
+            let state = reducer::replay_store(&store)?;
+            let current = store.resolve_actor(actor_flag).ok();
+            let actors = actor_summaries(&state, current.as_deref());
+            if json_mode {
+                println!("{}", serde_json::to_string(&actors)?);
+            } else {
+                for actor in actors {
+                    let marker = if actor.current { "*" } else { " " };
+                    println!(
+                        "{marker} {}  last={}  claims={}  reservations={}  inbox={}  open-requests={}",
+                        actor.actor,
+                        actor.last_activity_ts.as_deref().unwrap_or("-"),
+                        actor.active_claims,
+                        actor.active_reservations,
+                        actor.inbox_unacked,
+                        actor.incoming_open_requests,
+                    );
+                }
+            }
+            Ok(0)
+        }
         ActorCmd::Clear => {
             match fs::remove_file(&actor_path) {
                 Ok(()) => {}
@@ -838,6 +873,95 @@ fn normalize_actor(actor: &str) -> MoteResult<String> {
 struct ActorResolution {
     actor: String,
     source: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct ActorActivity {
+    last_activity_ts: Option<String>,
+    last_activity_op_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActorSummary {
+    actor: String,
+    current: bool,
+    last_activity_ts: Option<String>,
+    last_activity_op_id: Option<String>,
+    active_claims: usize,
+    active_reservations: usize,
+    inbox_unacked: usize,
+    incoming_open_requests: usize,
+}
+
+fn actor_summaries(state: &crate::state::State, current: Option<&str>) -> Vec<ActorSummary> {
+    let mut activity: BTreeMap<String, ActorActivity> = BTreeMap::new();
+    if let Some(actor) = current {
+        activity.entry(actor.to_string()).or_default();
+    }
+
+    for entry in state
+        .history
+        .values()
+        .flatten()
+        .chain(state.orphan_history.iter())
+        .filter(|entry| entry.accepted && entry.actor != "?")
+    {
+        let actor = activity.entry(entry.actor.clone()).or_default();
+        if actor
+            .last_activity_op_id
+            .as_deref()
+            .is_none_or(|op_id| entry.op_id.as_str() > op_id)
+        {
+            actor.last_activity_ts = Some(entry.ts.clone());
+            actor.last_activity_op_id = Some(entry.op_id.clone());
+        }
+    }
+
+    for message in state.messages.values() {
+        activity.entry(message.from.clone()).or_default();
+        activity.entry(message.to.clone()).or_default();
+    }
+    for bead in state.beads.values() {
+        if let Some(claim) = &bead.claim {
+            activity.entry(claim.claimed_by.clone()).or_default();
+        }
+    }
+    for reservation in state.reservations.values() {
+        activity.entry(reservation.actor.clone()).or_default();
+    }
+
+    let now = ids::format_rfc3339(Timestamp::now());
+    activity
+        .into_iter()
+        .map(|(name, activity)| ActorSummary {
+            current: current == Some(name.as_str()),
+            active_claims: state
+                .beads
+                .values()
+                .filter(|bead| {
+                    bead.claim
+                        .as_ref()
+                        .is_some_and(|claim| claim.claimed_by == name && claim.is_live(&now))
+                })
+                .count(),
+            active_reservations: state
+                .reservations
+                .values()
+                .filter(|reservation| reservation.actor == name && reservation.is_active(&now))
+                .count(),
+            inbox_unacked: state.inbox_for(&name).len(),
+            incoming_open_requests: state
+                .messages
+                .values()
+                .filter(|message| {
+                    message.to == name && message.request_state == Some(RequestState::Open)
+                })
+                .count(),
+            actor: name,
+            last_activity_ts: activity.last_activity_ts,
+            last_activity_op_id: activity.last_activity_op_id,
+        })
+        .collect()
 }
 
 fn resolve_actor_with_source(
@@ -2908,6 +3032,8 @@ fn cmd_inbox(
     from: Option<String>,
     kind: Option<String>,
     follow: bool,
+    wait: bool,
+    timeout: Option<u64>,
     after: Option<String>,
     interval: u64,
 ) -> MoteResult<i32> {
@@ -2929,22 +3055,52 @@ fn cmd_inbox(
     if after.is_some() {
         return Err(MoteError::Invalid("inbox --after requires --follow".into()));
     }
+    if wait {
+        return cmd_inbox_wait(
+            &store,
+            &actor,
+            json_mode,
+            issue.as_deref(),
+            from.as_deref(),
+            kind.as_deref(),
+            Duration::from_secs(timeout.unwrap_or(60)),
+            interval,
+        );
+    }
 
     let state = reducer::replay_store(&store)?;
-    let messages = state.inbox_for(&actor);
-    let filtered: Vec<&crate::state::MsgRecord> = messages
+    let filtered = filtered_inbox(
+        &state,
+        &actor,
+        issue.as_deref(),
+        from.as_deref(),
+        kind.as_deref(),
+    );
+    write_inbox_messages(&filtered, json_mode)?;
+    Ok(0)
+}
+
+fn filtered_inbox<'a>(
+    state: &'a crate::state::State,
+    actor: &str,
+    issue: Option<&str>,
+    from: Option<&str>,
+    kind: Option<&str>,
+) -> Vec<&'a MsgRecord> {
+    state
+        .inbox_for(actor)
         .into_iter()
         .filter(|m| {
-            issue
-                .as_deref()
-                .is_none_or(|i| m.entity.as_deref() == Some(i))
-                && from.as_deref().is_none_or(|f| m.from == f)
-                && kind.as_deref().is_none_or(|k| m.msg_kind == k)
+            issue.is_none_or(|i| m.entity.as_deref() == Some(i))
+                && from.is_none_or(|f| m.from == f)
+                && kind.is_none_or(|k| m.msg_kind == k)
         })
-        .collect();
+        .collect()
+}
 
+fn write_inbox_messages(messages: &[&MsgRecord], json_mode: bool) -> MoteResult<()> {
     if json_mode {
-        let arr: Vec<_> = filtered
+        let arr: Vec<_> = messages
             .iter()
             .map(|m| {
                 serde_json::json!({
@@ -2966,7 +3122,7 @@ fn cmd_inbox(
             .collect();
         println!("{}", serde_json::to_string(&arr)?);
     } else {
-        for m in &filtered {
+        for m in messages {
             let issue_s = m.entity.as_deref().unwrap_or("-");
             println!(
                 "{}  {}  from={}  issue={}  kind={}  {}",
@@ -2974,6 +3130,72 @@ fn cmd_inbox(
             );
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_inbox_wait(
+    store: &Store,
+    actor: &str,
+    json_mode: bool,
+    issue: Option<&str>,
+    from: Option<&str>,
+    kind: Option<&str>,
+    timeout: Duration,
+    interval: u64,
+) -> MoteResult<i32> {
+    let filter = crate::events::EventFilter::messages_for(actor);
+    let mut tailer = crate::events::EventTailer::new(store, None, interval)?;
+    let baseline = crate::events::state_for_names(store, tailer.initial_names())?;
+    let pending = filtered_inbox(&baseline, actor, issue, from, kind);
+    if !pending.is_empty() {
+        write_inbox_messages(&pending, json_mode)?;
+        return Ok(0);
+    }
+    if timeout.is_zero() {
+        write_inbox_messages(&[], json_mode)?;
+        return Ok(0);
+    }
+
+    tailer.start(store)?;
+    if tailer
+        .poll(store, &filter)?
+        .iter()
+        .any(|event| inbox_event_matches(event, actor, issue, from, kind))
+    {
+        let state = reducer::replay_store(store)?;
+        let messages = filtered_inbox(&state, actor, issue, from, kind);
+        write_inbox_messages(&messages, json_mode)?;
+        return Ok(0);
+    }
+
+    let started = Instant::now();
+    let fallback = Duration::from_secs(interval.max(1));
+    while let Some(remaining) = timeout.checked_sub(started.elapsed()) {
+        if remaining.is_zero() {
+            break;
+        }
+        // Scan at the fallback cadence even if the platform watcher is quiet.
+        // The final iteration uses the shorter remaining deadline.
+        let _ = tailer.wait_timeout(remaining.min(fallback));
+        if tailer
+            .poll(store, &filter)?
+            .iter()
+            .any(|event| inbox_event_matches(event, actor, issue, from, kind))
+        {
+            let state = reducer::replay_store(store)?;
+            let messages = filtered_inbox(&state, actor, issue, from, kind);
+            write_inbox_messages(&messages, json_mode)?;
+            return Ok(0);
+        }
+    }
+
+    // The filesystem watcher is a latency optimization, not the source of
+    // truth. Replay once at the deadline so a missed/coalesced notification or
+    // a fallback tick racing the timeout cannot hide a durable delivery.
+    let state = reducer::replay_store(store)?;
+    let messages = filtered_inbox(&state, actor, issue, from, kind);
+    write_inbox_messages(&messages, json_mode)?;
     Ok(0)
 }
 
@@ -3017,7 +3239,7 @@ fn cmd_inbox_follow(
                     .is_some_and(|msg_id| unacked.contains(msg_id))
             })
         {
-            crate::events::write_event(event, json_mode)?;
+            crate::events::write_inbox_event(event, json_mode)?;
         }
     }
 
@@ -3028,7 +3250,7 @@ fn cmd_inbox_follow(
         .iter()
         .filter(|event| inbox_event_matches(event, actor, issue, from, kind))
     {
-        crate::events::write_event(event, json_mode)?;
+        crate::events::write_inbox_event(event, json_mode)?;
     }
     tailer.start(store)?;
     loop {
@@ -3037,7 +3259,7 @@ fn cmd_inbox_follow(
             .iter()
             .filter(|event| inbox_event_matches(event, actor, issue, from, kind))
         {
-            crate::events::write_event(event, json_mode)?;
+            crate::events::write_inbox_event(event, json_mode)?;
         }
         if !tailer.wait() {
             break;
@@ -3260,8 +3482,10 @@ fn cmd_begin(
     // Step 3: move open work out of the ready queue after the claim lands.
     if let Some(bead) = state2.beads.get(&id) {
         if bead.status == Status::Open {
-            let mut set = ScalarSet::default();
-            set.status = Some(Status::Doing);
+            let set = ScalarSet {
+                status: Some(Status::Doing),
+                ..ScalarSet::default()
+            };
             let mut expect = BTreeMap::new();
             expect.insert("status".to_string(), clock_for(bead, "status")?);
             let status_op = make_patch(actor.clone(), id.clone(), expect, set, Timestamp::now());
@@ -4044,7 +4268,10 @@ fn cmd_skills_install(
 }
 
 fn open_store(override_path: Option<&Path>) -> MoteResult<Store> {
-    if let Some(p) = override_path {
+    let env_path = std::env::var_os("MOTE_STORE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    if let Some(p) = override_path.or(env_path.as_deref()) {
         let candidate = if p.ends_with(".mote") {
             p.to_path_buf()
         } else {

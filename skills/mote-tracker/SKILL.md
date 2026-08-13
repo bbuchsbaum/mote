@@ -16,8 +16,11 @@ Run from the repo root or a subdirectory:
 ```sh
 mote doctor
 mote actor show
+mote actor list
 mote board
 mote ready
+mote inbox
+mote msg requests --state open
 ```
 
 If no store exists:
@@ -28,7 +31,11 @@ mote actor set <stable-actor-name>
 mote doctor
 ```
 
-Use one stable actor name for a workstream, not a new actor per command.
+Use one stable actor name for a workstream, not a new actor per command. When
+multiple agent terminals share a store, set a distinct `MOTE_ACTOR` in each
+terminal; do not make the processes compete over the shared
+`.mote/local/actor` file. When agents in separate worktrees share one
+coordination store, set the same `MOTE_STORE` path in each terminal.
 
 ## Pick Or Create Work
 
@@ -87,6 +94,7 @@ For directed coordination:
 mote msg send --to <actor> --issue <bd-id> --kind request \
   --idempotency-key <stable-key> "short request"
 mote inbox
+mote --json inbox --wait --timeout 60
 mote --json inbox --follow
 mote msg ack <msg-id>
 mote msg reply <msg-id> --kind response "completed"
@@ -101,9 +109,18 @@ request sender can mark that result `resolved`. Use a stable sender-scoped
 with identical content returns the original message id; reusing it for
 different content is rejected.
 
-`inbox --follow` emits current unacknowledged messages as `mote.event.v1`
-JSONL, then waits for new deliveries. Persist each `event_id` and resume with
-`mote --json inbox --follow --after <event-id>` after restarting a harness.
+Use `inbox --wait` at a coordination boundary when the agent should return
+pending messages immediately or wait once for a reply. It exits after one
+delivery or the timeout and uses the same output shape as ordinary `inbox`.
+
+`--json inbox --follow` emits current unacknowledged messages as
+`mote.event.v1` JSONL, then waits for new deliveries. Persist each `event_id`
+and resume with `mote --json inbox --follow --after <event-id>` after restarting
+a harness. Without `--json`, follow mode prints compact human message lines.
+
+Check `mote inbox` at startup, before a long wait, and before completion or
+handoff. Acknowledge a message only after its content has actually been
+incorporated into the agent's work; stream delivery alone is not receipt.
 
 Use the public forum-style board via the separate `$mote-message-board` skill.
 

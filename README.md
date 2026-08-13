@@ -98,6 +98,7 @@ All planes share the same publication mechanism and reducer.
 mote init
 mote actor set alice
 mote actor show
+mote actor list
 
 # Issue plane.
 mote new "Fix auth bug" -p 1 --tag backend
@@ -122,6 +123,7 @@ mote release bd-...
 mote msg send --to bob --issue bd-... --kind request \
   --idempotency-key tests-request-1 "please take tests"
 mote inbox
+mote --json inbox --wait --timeout 60  # pending mail, or one bounded wait
 mote --json inbox --follow       # current unacked messages, then new deliveries
 mote msg ack msg-...
 mote msg reply msg-... --kind response "tests are passing"
@@ -208,7 +210,12 @@ They are safe to leave running while agents are writing to the store.
   messages, then emits new matching message delivery events (`message.sent`,
   `message.responded`, or `message.declined`). Pass `--after <event-id>` to
   either follow surface to resume from a previously persisted cursor rather
-  than replaying current inbox state.
+  than replaying current inbox state. Human follow output is a compact message
+  line; `--json` retains the stable `mote.event.v1` envelope.
+- `mote inbox --wait` returns the current filtered inbox immediately when it is
+  non-empty. Otherwise it waits for one matching delivery, replays the inbox,
+  prints it in the same shape as ordinary `mote inbox`, and exits. The default
+  timeout is 60 seconds; `--timeout 0` is a non-blocking check.
 - Request messages have a lifecycle independent of acknowledgement. `msg ack`
   means only that the recipient saw the delivery. `msg reply` records a
   correlated `response` or `decline`; the original sender then closes the
@@ -273,15 +280,46 @@ default is both). Existing skill directories are left untouched; rerun with
 Re-running `mote skills install --user --force` after `cargo install ... --force`
 is the supported way to refresh installed skills when mote is upgraded.
 
-### Actor identity
+### Concurrent terminal setup
 
-Resolved in this exact order:
+`.mote/local/actor` is shared by every process using the same store. For two
+concurrent agent terminals, give each process its own environment identity
+instead of repeatedly changing that shared convenience file:
+
+```sh
+# terminal A
+export MOTE_ACTOR=agent-a
+
+# terminal B
+export MOTE_ACTOR=agent-b
+```
+
+When separate Git worktrees should coordinate through one store, also export
+the same store root or its parent in both terminals:
+
+```sh
+export MOTE_STORE=/path/to/main-checkout/.mote
+```
+
+`mote actor list` derives known actors and their last accepted activity, active
+claims/reservations, unacknowledged inbox count, and incoming open-request count
+without adding registration or heartbeat state.
+
+### Actor and store resolution
+
+Actor identity is resolved in this exact order:
 
 1. `--actor` CLI flag
 2. `MOTE_ACTOR` environment variable
 3. `.mote/local/actor` file
 
 If unresolved, mutating commands exit with code 3.
+
+Store location is resolved in this order:
+
+1. `--store` CLI flag
+2. `MOTE_STORE` environment variable
+3. walk upward from the current directory looking for `.mote/`
 
 ### Exit codes
 

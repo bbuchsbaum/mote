@@ -18,8 +18,18 @@ respect reservations themselves.
    ```sh
    mote actor set <actor>
    ```
-3. Inspect the current board:
+   For concurrent terminals sharing a store, prefer a distinct environment
+   identity per process instead of changing the shared local actor file:
    ```sh
+   export MOTE_ACTOR=<actor>
+   ```
+   Set `MOTE_STORE` as well when separate worktrees share one coordination
+   store.
+3. Inspect known actors, incoming coordination, and the current board:
+   ```sh
+   mote actor list
+   mote inbox
+   mote msg requests --state open
    mote board
    mote ready
    ```
@@ -50,7 +60,12 @@ Use notes for material state changes:
 mote note <bd-id> --kind progress "what changed"
 mote note <bd-id> --kind blocker "what is blocked"
 mote msg send --to <actor> --issue <bd-id> --kind request "short request"
+mote --json inbox --wait --timeout 60
 ```
+
+Check the inbox before a long wait and before completion or handoff. Acknowledge
+a message only after incorporating it; delivery by a follow stream is not an
+acknowledgement.
 
 Keep reservations narrow. Reserve directories only when the work truly needs a
 directory-wide claim. Use git worktrees for broad or long-running changes that

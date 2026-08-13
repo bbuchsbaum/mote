@@ -197,6 +197,52 @@ fn json_inbox_schema() {
 }
 
 #[test]
+fn json_actor_list_includes_authors_and_message_recipients() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let id = new_bead(&td, "issue", "alice", &[]);
+
+    let sent = Command::new(mote_bin())
+        .args([
+            "msg", "send", "--to", "bob", "--issue", &id, "--kind", "request", "hi", "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(sent.status.success());
+
+    let v = run_json(&td, &["--actor", "bob", "actor", "list"]);
+    let actors = v.as_array().expect("actor list JSON must be an array");
+    assert_eq!(actors.len(), 2);
+    for actor in actors {
+        assert_obj_has_str(actor, "actor");
+        for key in [
+            "active_claims",
+            "active_reservations",
+            "inbox_unacked",
+            "incoming_open_requests",
+        ] {
+            assert_obj_has_int(actor, key);
+        }
+        assert!(actor["current"].is_boolean());
+        assert!(actor.get("last_activity_ts").is_some());
+        assert!(actor.get("last_activity_op_id").is_some());
+    }
+
+    let alice = actors
+        .iter()
+        .find(|actor| actor["actor"] == "alice")
+        .unwrap();
+    assert_eq!(alice["current"], false);
+    assert!(alice["last_activity_ts"].is_string());
+    let bob = actors.iter().find(|actor| actor["actor"] == "bob").unwrap();
+    assert_eq!(bob["current"], true);
+    assert_eq!(bob["inbox_unacked"], 1);
+    assert_eq!(bob["incoming_open_requests"], 1);
+}
+
+#[test]
 fn json_preflight_schema_clear_and_conflict() {
     let td = TempDir::new().unwrap();
     init_store(&td);

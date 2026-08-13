@@ -235,3 +235,126 @@ fn inbox_follow_starts_with_filtered_unacked_messages() {
     child.kill().unwrap();
     let _ = child.wait();
 }
+
+#[test]
+fn human_inbox_follow_uses_compact_message_output() {
+    let _follow_guard = FOLLOW_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let issue = new_bead(&td, "alice");
+    send_message(&td, "alice", "bob", &issue, "request", "take tests");
+
+    let mut child = Command::new(mote_bin())
+        .args(["inbox", "--actor", "bob", "--follow"])
+        .current_dir(td.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let line = read_follow_line(&mut child, Duration::from_secs(2));
+    assert!(line.starts_with("[request] alice -> bob  msg=msg-"));
+    assert!(line.contains(&format!("issue={issue}")));
+    assert!(line.ends_with("take tests\n"));
+    assert!(!line.contains("mote.event.v1"));
+
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+#[test]
+fn inbox_wait_returns_after_a_new_delivery() {
+    let _follow_guard = FOLLOW_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let issue = new_bead(&td, "alice");
+
+    let child = Command::new(mote_bin())
+        .args([
+            "--json",
+            "inbox",
+            "--actor",
+            "bob",
+            "--wait",
+            "--timeout",
+            "5",
+            "--interval",
+            "1",
+        ])
+        .current_dir(td.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(100));
+    send_message(&td, "alice", "bob", &issue, "request", "wake once");
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "wait failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let messages: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let messages = messages.as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["body"], "wake once");
+    assert_eq!(messages[0]["to"], "bob");
+}
+
+#[test]
+fn inbox_wait_returns_an_existing_pending_message_immediately() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let issue = new_bead(&td, "alice");
+    send_message(&td, "alice", "bob", &issue, "request", "already here");
+
+    let started = Instant::now();
+    let out = Command::new(mote_bin())
+        .args([
+            "--json",
+            "inbox",
+            "--actor",
+            "bob",
+            "--wait",
+            "--timeout",
+            "5",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "pending inbox should not wait for the timeout"
+    );
+    let messages: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(messages[0]["body"], "already here");
+}
+
+#[test]
+fn inbox_wait_timeout_zero_returns_an_empty_inbox() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+
+    let out = Command::new(mote_bin())
+        .args([
+            "--json",
+            "inbox",
+            "--actor",
+            "bob",
+            "--wait",
+            "--timeout",
+            "0",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let messages: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(messages, serde_json::json!([]));
+}

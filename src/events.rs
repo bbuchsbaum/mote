@@ -149,6 +149,14 @@ impl StoreWatcher {
         drain_for(&self.rx, Duration::from_millis(150));
         true
     }
+
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        if self.rx.recv_timeout(timeout).is_err() {
+            return false;
+        }
+        drain_for(&self.rx, Duration::from_millis(150));
+        true
+    }
 }
 
 /// Tracks op filenames already observed by a follow-mode consumer. It keeps a
@@ -208,6 +216,12 @@ impl EventTailer {
 
     pub fn wait(&self) -> bool {
         self.watcher.as_ref().is_some_and(StoreWatcher::wait)
+    }
+
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        self.watcher
+            .as_ref()
+            .is_some_and(|watcher| watcher.wait_timeout(timeout))
     }
 }
 
@@ -278,6 +292,43 @@ pub fn write_event(event: &EventEnvelope, json_mode: bool) -> MoteResult<()> {
             event.event_id, event.ts, event.event_type, event.actor, event.data
         )?;
     }
+    out.flush()?;
+    Ok(())
+}
+
+/// Write an inbox delivery as stable JSON or a compact, single-line human
+/// notification. The human projection stays deliberately separate from the
+/// generic event view so scripts can continue to rely on `mote.event.v1`.
+pub fn write_inbox_event(event: &EventEnvelope, json_mode: bool) -> MoteResult<()> {
+    if json_mode {
+        return write_event(event, true);
+    }
+
+    let kind = event.data["msg_kind"]
+        .as_str()
+        .unwrap_or(event.event_type.as_str());
+    let to = event.data["to"].as_str().unwrap_or("?");
+    let msg_id = event.data["msg_id"].as_str().unwrap_or("?");
+    let body = event.data["body"]
+        .as_str()
+        .unwrap_or("")
+        .replace(['\n', '\r'], " ");
+    let issue = event.data["entity"]
+        .as_str()
+        .map(|value| format!("  issue={value}"))
+        .unwrap_or_default();
+    let reply = event.data["reply_to"]
+        .as_str()
+        .map(|value| format!("  reply-to={value}"))
+        .unwrap_or_default();
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(
+        out,
+        "[{kind}] {} -> {to}  msg={msg_id}{issue}{reply}  {body}",
+        event.actor
+    )?;
     out.flush()?;
     Ok(())
 }

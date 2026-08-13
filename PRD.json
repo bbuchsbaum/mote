@@ -117,7 +117,8 @@
       "bead_id": "bd-<ULID>  e.g. bd-01JXYZABCDEFGHJKMNPQRSTVWX",
       "reservation_id": "rv-<ULID>  e.g. rv-01JV5YQ4P0QF5X1W1Y6T2V8H9A",
       "msg_id": "msg-<ULID>  e.g. msg-01JV6ZR5Q1RG6Y2X2Z7U3W9JBC",
-      "actor": "Free-form short string, e.g. 'claude-fixer' or 'bbuchsbaum'. Resolved in this exact order: 1) --actor CLI flag, 2) MOTE_ACTOR env var, 3) .mote/local/actor file. No FORMAT.json fallback. No global config file in v1. If unresolved, mutating commands exit with code 3."
+      "actor": "Free-form short string, e.g. 'claude-fixer' or 'bbuchsbaum'. Resolved in this exact order: 1) --actor CLI flag, 2) MOTE_ACTOR env var, 3) .mote/local/actor file. No FORMAT.json fallback. No global config file in v1. If unresolved, mutating commands exit with code 3.",
+      "store_resolution": "Existing stores are resolved in this exact order: 1) --store CLI flag, 2) MOTE_STORE env var, 3) walk upward from cwd looking for .mote/. An explicit path may name the .mote directory or its parent."
     },
     "reading_state_v1": "Scan .mote/ops/ once, sort filenames lexicographically, replay deterministically into an in-memory state struct. No snapshots, no inotify."
   },
@@ -400,12 +401,13 @@
   "cli": {
     "global_flags": {
       "--actor <s>":   "override actor identity for this invocation",
-      "--store <dir>": "override store path (default: walk up from cwd looking for .mote/)",
+      "--store <dir>": "override store path (then MOTE_STORE; default: walk up from cwd looking for .mote/)",
       "--json":        "machine-readable output where applicable",
       "--quiet":       "suppress non-essential stderr"
     },
     "commands": [
       { "name": "init",      "synopsis": "mote init", "description": "Create .mote/ in the current dir if absent; write FORMAT.json; create tmp/, ops/, local/. Idempotent." },
+      { "name": "actor",     "synopsis": "mote actor set|show|clear ... | mote actor list", "description": "Manage the shared local actor convenience file or derive known actors from accepted activity, message recipients, claims, and reservations. actor list is read-only and reports last activity plus current coordination counts." },
       { "name": "new",       "synopsis": "mote new \"<title>\" [-p N] [--body STR] [--tag T]... [--dep ID]...", "description": "Publish a `create` op (plus tag_add/dep_add ops for any --tag / --dep). Prints the new bd-id." },
       { "name": "set",       "synopsis": "mote set <id> field=value...", "description": "Publish a scalar `patch` op. expect clocks are taken from the current replayed state at command time. Multiple field=value pairs allowed; all packed into one op. Exit 2 on conflict." },
       { "name": "show",      "synopsis": "mote show <id>", "description": "Render full bead state (scalars + tags + deps + relations + notes + claim + active reservations), including downward relation children and blocking dependents." },
@@ -430,7 +432,7 @@
       { "name": "begin",     "synopsis": "mote begin <id> --paths <p>... [--note STR] [--ttl s]", "description": "Compound: publishes `reserve_open`, then `claim`, then optional `note`. On reserve_open conflict: exit 2 immediately, no further ops. On claim conflict after reservation: emit compensating `reserve_close` and exit 2." },
       { "name": "handoff",   "synopsis": "mote handoff <id> --to <actor> [--note STR] [--release]", "description": "Compound: publishes a handoff `note`, then a reassigning `claim` to <actor>, then `reserve_close` for current actor's reservations on the issue (only if --release)." },
       { "name": "done",      "synopsis": "mote done <id> [--note STR]", "description": "Compound: publishes a completion `note` (note_kind=note), `close`, then `reserve_close` for current actor's reservations on the issue, then `release` of any current claim by this actor." },
-      { "name": "inbox",     "synopsis": "mote inbox [--issue ID] [--from ACTOR] [--kind K] [--follow [--after EVENT]]", "description": "List msg_send ops with to == self.actor and no msg_ack from self. In follow mode, emit current unacked messages as versioned events, then stream new matching sent/responded/declined deliveries; --after resumes from an event id." },
+      { "name": "inbox",     "synopsis": "mote inbox [--issue ID] [--from ACTOR] [--kind K] [--wait [--timeout S] | --follow [--after EVENT]]", "description": "List msg_send ops with to == self.actor and no msg_ack from self. Wait mode returns pending messages or blocks once for a matching delivery and exits, preserving ordinary inbox output shape. Follow mode streams deliveries with compact human output or versioned JSON events; --after resumes JSON/event consumption from an event id." },
       { "name": "msg",       "synopsis": "mote msg send --to <actor> [--issue ID] [--reservation RV] [--kind K] [--idempotency-key KEY] \"<text>\"  |  mote msg reply <request-id> [--kind response|decline] [--idempotency-key KEY] \"<text>\"  |  mote msg requests [--state STATE]  |  mote msg ack|resolve <msg-id>", "description": "Publish direct messages, acknowledge receipt, correlate request replies, query derived request state, and resolve completed request lifecycles." },
       { "name": "discuss",   "synopsis": "mote discuss topic new <topic> [--title T] [--body B]  |  mote discuss post [--topic TOPIC] [--reply-to POST] \"<text>\"  |  mote discuss sticky|unsticky <post-id>  |  mote discuss list [--topic TOPIC] [--limit N]  |  mote discuss search <query> [--topic TOPIC] [--limit N]  |  mote discuss unread [--topic TOPIC] [--limit N]  |  mote discuss mark-read [--topic TOPIC]  |  mote discuss replies <post-id>  |  mote discuss thread <post-id>  |  mote discuss topics", "description": "Publish and read public cross-agent message-board topics, posts, sticky state, replies, thread views, search results, activity summaries, and per-actor unread state." },
       { "name": "who-has",   "synopsis": "mote who-has <path>", "description": "List live reservations whose paths overlap <path>." },
@@ -551,6 +553,17 @@
           "msg_resolve op plus CLI: msg reply, msg requests, msg resolve, and idempotent send/reply retries."
         ],
         "exit_criteria": "Acceptance test A16 passes; legacy replay, participant permissions, acknowledgement independence, response/decline transitions, resolution, idempotency conflict, JSON query, and message event coverage are automated."
+      },
+      {
+        "id": "M9",
+        "name": "Terminal messaging ergonomics",
+        "deliverables": [
+          "MOTE_STORE environment routing with explicit --store precedence for shared coordination across worktrees.",
+          "Read-only actor list derived from accepted activity and coordination state without registration or heartbeats.",
+          "Bounded inbox --wait plus compact human follow output, reusing the existing event tailer.",
+          "Canonical agent guidance for per-terminal MOTE_ACTOR identities and inbox checks at coordination boundaries."
+        ],
+        "exit_criteria": "Acceptance test A17 passes; environment precedence, actor JSON shape, pending/timeout/new-delivery wait behavior, and human follow output have automated coverage without op-schema changes."
       }
     ],
     "acceptance_tests": [
@@ -569,7 +582,8 @@
       { "id": "A13", "name": "Discussion topics and sticky posts", "spec": "alice creates an empty topic; search returns the topic with creation metadata; posts update topic last_activity; a sticky post sorts first in discuss list and appears as sticky in search; unsticky clears the state and topic sticky_count.", "source_alignment": ["message board follow-up request"] },
       { "id": "A14", "name": "Forum thread and topic read workflow", "spec": "A root post, reply, and nested reply render parent-before-child in discuss thread with indentation; mark-read --topic hides only that topic's read posts while leaving unread posts in other topics visible.", "source_alignment": ["agent forum workflow request"] },
       { "id": "A15", "name": "Incremental event delivery", "spec": "Start a versioned message event stream after a persisted cursor, publish a local message for the filtered actor, and observe exactly one full message event under one second during normal filesystem notification delivery and no later than the configured fallback interval when notifications are disabled.", "source_alignment": ["local harness event-delivery assessment"] },
-      { "id": "A16", "name": "Structured request lifecycle", "spec": "alice sends an idempotent request to bob; retry returns the original msg_id; bob ack leaves it open; bob replies response or decline and the root advances accordingly; only alice can resolve it; msg requests and message events expose the durable correlation and lifecycle.", "source_alignment": ["local harness request-reply assessment"] }
+      { "id": "A16", "name": "Structured request lifecycle", "spec": "alice sends an idempotent request to bob; retry returns the original msg_id; bob ack leaves it open; bob replies response or decline and the root advances accordingly; only alice can resolve it; msg requests and message events expose the durable correlation and lifecycle.", "source_alignment": ["local harness request-reply assessment"] },
+      { "id": "A17", "name": "Terminal messaging ergonomics", "spec": "Two terminal actors share one store through MOTE_STORE; actor list discovers both; bob inbox --wait returns a newly delivered request and exits; a zero timeout returns an empty inbox; human follow output is a compact single-line message while JSON remains mote.event.v1.", "source_alignment": ["terminal-to-terminal messaging assessment"] }
     ]
   },
 
