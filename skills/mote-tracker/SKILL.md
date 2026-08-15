@@ -37,6 +37,39 @@ terminal; do not make the processes compete over the shared
 `.mote/local/actor` file. When agents in separate worktrees share one
 coordination store, set the same `MOTE_STORE` path in each terminal.
 
+## Session Identity
+
+Open a session at the start of a working stint so other sessions can see you:
+
+```sh
+eval "$(mote session start --as <session-name> --label 'what you are doing')"
+mote session list
+mote session renew            # extends the lease; --ttl <seconds> to change it
+mote session end              # when the stint is over
+```
+
+`session start` prints `export MOTE_ACTOR=...` and `export MOTE_SESSION=...` on
+stdout because a CLI cannot set its parent shell's environment; `eval` applies
+them. Everything you publish afterwards carries that per-session byline.
+
+This matters because same-actor reservations never conflict. Two sessions
+sharing one actor name can hold the same paths with neither `mote preflight`
+nor `mote who-has` reporting anything. `mote doctor` surfaces that overlap,
+concurrent leases sharing an actor, and generic names like `claude` or `agent`.
+Treat those warnings as a signal that your coordination primitives are not
+telling you the truth.
+
+Before starting work, check what other sessions are touching:
+
+```sh
+mote in-flight
+mote --json in-flight --minutes 30
+```
+
+One invocation shows live sessions, path reservations, `doing` beads with their
+claim holder, and recently active discussion topics. Recent commits are
+included as advisory Git context, labelled as such; `--no-git` omits them.
+
 ## Pick Or Create Work
 
 Inspect ready work:
@@ -66,6 +99,16 @@ If clear, begin and reserve:
 
 ```sh
 mote begin <bd-id> --paths <path> [<path> ...] --note "starting"
+```
+
+`begin` reserves the paths, claims the bead, and moves open work to `doing`, so
+it leaves `mote ready` and a second session will not pull it.
+
+When the work came from a board thread, announce the claim there in the same
+command so board readers and `mote ready` pollers learn about it together:
+
+```sh
+mote begin <bd-id> --paths <path> --announce <topic>
 ```
 
 Keep reservations narrow. Reserve directories only when the change truly spans the directory.
@@ -152,17 +195,21 @@ replay the op log and never publish ops, so they are safe to leave running while
 other agents write.
 
 ```sh
+mote in-flight        # one-shot: sessions, reservations, doing work, active topics
 mote watch            # board-style snapshot that re-renders on every store change
 mote --json watch     # one JSON snapshot per change, for piping into jq or a UI
 mote --json events --kind message,reservation --follow
 mote ui               # interactive TUI dashboard
 ```
 
+Use `mote in-flight` for a single answer to "who is touching what right now?"
+and `mote watch` or `mote ui` when you want to keep observing.
+
 `mote watch --interval <secs>` sets the periodic fallback tick (default 5) so
 lease expiry is reflected even without new ops.
 
 `mote events` emits accepted operations as versioned JSONL. Filter with
-`--kind issue,claim,reservation,message,discussion`, `--for-actor <actor>`, and
+`--kind issue,claim,reservation,message,discussion,session`, `--for-actor <actor>`, and
 `--after <event-id>`. Follow mode uses filesystem notifications plus the same
 periodic fallback scan and remains read-only.
 

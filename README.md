@@ -62,8 +62,9 @@ All planes share the same publication mechanism and reducer.
 | Issue    | `create`, `patch`, `tag_add`, `tag_remove`, `dep_add`, `dep_remove`, `rel_add`, `rel_remove`, `note`, `close`, `delete` |
 | Path     | `reserve_open`, `reserve_close`                                        |
 | Message  | `msg_send`, `msg_ack`                                                  |
-| Discussion | `board_topic`, `board_post`, `board_sticky`, `board_read`            |
+| Discussion | `board_topic`, `board_post`, `board_sticky`, `board_read`, `board_route` |
 | Lease    | `claim`, `release`                                                     |
+| Session  | `session_start`, `session_end`                                          |
 
 ### Conflict semantics
 
@@ -90,6 +91,16 @@ All planes share the same publication mechanism and reducer.
   marked sticky. Actors can mark the board read to poll for new external posts
   later, either globally or for a single topic. Thread views show a post with
   its nested reply history so agent reasoning remains reconstructable.
+- **Discussion routing** links a post or topic to the beads it produced.
+  `route_state` is `open` (nothing declared), `needs_bead` (actionable, not yet
+  tracked), `routed` (linked to one or more beads), or `resolved` (no tracker
+  action needed). Links accumulate — routing a post to a second bead does not
+  erase the first. Because only an explicit `needs_bead` counts as unrouted,
+  `mote discuss unrouted` reports declared state rather than guessing from
+  prose.
+- **Session leases** are TTL leases over an identity rather than a work item.
+  Several sessions may legitimately share one actor name; a lease is what makes
+  each of them individually visible to `mote in-flight` and `mote doctor`.
 
 ## CLI quick start
 
@@ -146,6 +157,23 @@ mote discuss topics
 # Or create a topic and seed a visible first post:
 mote discuss topic new planning-2 --title "Planning 2" --body "Initial proposal"
 
+# Discussion routing: keep the argument on the board, the execution in beads.
+mote discuss decision --topic planning --body "Consensus: split parser first"
+mote discuss summary  --topic planning --body "Current state: 1 open question"
+mote discuss summary  --topic planning          # read the pinned summary back
+mote discuss needs-bead post-...                # actionable, not yet tracked
+mote discuss route post-... --issue bd-...      # link an existing bead
+mote discuss route --topic planning --issue bd-...
+mote discuss promote post-... --title "Split the parser" --tag parser
+mote discuss resolve post-...                   # no tracker action needed
+mote discuss unrouted                           # what still needs a bead
+
+# Session plane: one identity per session, not one per checkout.
+eval "$(mote session start --as parser-session --label 'parser work')"
+mote session list
+mote session renew --ttl 7200
+mote session end
+
 # Path plane.
 mote reserve src/auth/ tests/auth/ --issue bd-... --ttl 3600
 mote unreserve rv-...
@@ -154,9 +182,11 @@ mote who-has src/auth/token.rs
 
 # Compounds (each is a sequence of single-mutation ops with compensation on partial failure).
 mote begin   bd-... --paths src/auth/ --note "taking auth"
+mote begin   bd-... --paths src/auth/ --announce planning  # also post the claim
 mote handoff bd-... --to bob --note "tests remain" --release
 mote done    bd-... --note "shipped"
 mote board
+mote in-flight            # sessions, reservations, doing work, active topics
 
 # Diagnostics.
 mote doctor
@@ -199,8 +229,13 @@ They are safe to leave running while agents are writing to the store.
   a periodic fallback tick so it also reflects lease expiry. `mote --json
   watch` writes one JSON snapshot per change to stdout, suitable for piping
   into `jq` or any small UI.
+- `mote in-flight` answers "what is being touched right now?" in one shot:
+  live session leases, path reservations, `doing` beads with their claim
+  holder, and topics active inside `--minutes`. Everything but the commit list
+  is replayed from the op log; recent commits are read from Git, labelled
+  advisory, and suppressed by `--no-git`.
 - `mote events` emits one accepted operation event per line. Filter categories
-  with `--kind issue,claim,reservation,message,discussion`, and filter events
+  with `--kind issue,claim,reservation,message,discussion,session`, and filter events
   authored by or directly related to an actor with `--for-actor`. An explicit
   global `--actor` is shorthand for `--for-actor` on this read-only command.
   `--follow` waits for new ops using filesystem notifications plus the
@@ -293,6 +328,24 @@ export MOTE_ACTOR=agent-a
 # terminal B
 export MOTE_ACTOR=agent-b
 ```
+
+`mote session start` does the same thing and leaves a lease behind, so the
+other sessions can see you:
+
+```sh
+eval "$(mote session start --as agent-a --label 'auth refactor')"
+```
+
+A CLI cannot set its parent shell's environment, so `session start` prints the
+`export` lines on stdout for you to `eval`; the diagnostics go to stderr.
+
+Sharing one identity across concurrent sessions is not an error, but it is
+lossy: same-actor reservations never conflict, so two sessions can hold the
+same paths and neither `mote preflight` nor `mote who-has` will say so.
+`mote doctor` reports that overlap, concurrent leases sharing an actor, and
+generic actor names like `claude` or `agent`. It does not try to infer
+concurrency from process ids — every mote invocation is its own process, so
+that would flag ordinary sequential use.
 
 When separate Git worktrees should coordinate through one store, also export
 the same store root or its parent in both terminals:

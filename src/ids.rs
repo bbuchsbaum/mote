@@ -70,6 +70,10 @@ pub fn new_post_id() -> String {
     format!("post-{}", Ulid::new())
 }
 
+pub fn new_session_id() -> String {
+    format!("sess-{}", Ulid::new())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OpName(String);
 
@@ -290,6 +294,7 @@ mod tests {
         assert!(new_reservation_id().starts_with("rv-"));
         assert!(new_msg_id().starts_with("msg-"));
         assert!(new_post_id().starts_with("post-"));
+        assert!(new_session_id().starts_with("sess-"));
     }
 
     #[test]

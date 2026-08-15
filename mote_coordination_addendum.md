@@ -659,10 +659,12 @@ That gives you:
 
 without recreating the brittleness you are trying to escape.
 
-## 18. Session, in-flight, and discussion routing roadmap
+## 18. Session, in-flight, and discussion routing
 
 Recent multi-agent use exposed three follow-on needs that should share one
-design surface instead of becoming separate ad hoc commands.
+design surface instead of becoming separate ad hoc commands. All of the
+capabilities below have shipped; §18.5 records where the implementation
+departed from this design and why.
 
 ### 18.1 Session identity
 
@@ -737,3 +739,52 @@ not a second, competing task tracker.
    without scraping prose.
 5. Board-to-bead promotion creates or links issue work without turning topic
    bodies into the source of truth.
+
+All five are met.
+
+### 18.5 Implementation notes
+
+**Routing is a single op, not four commands.** `board_route` carries a target
+(post or topic), a `route_state`, and an optional bead. `route`, `needs-bead`,
+and `resolve` are surfaces over that one op, which keeps the derived state a
+single field rather than three independent flags that can disagree.
+
+`needs_bead` is declared, never inferred. An unmarked post is `open`, which is
+not the same as "needs a bead" — otherwise every casual remark would land in
+the unrouted queue and the queue would be ignored. Routing links accumulate: a
+discussion can produce several beads, and routing to a second must not erase
+the first.
+
+**Decisions and summaries are post kinds, not separate ops.** `board_post`
+gained an optional `post_kind` (`post` | `decision` | `summary`). A topic keeps
+a pointer to its newest summary and a count of its decisions, so "where did
+this land?" is a lookup rather than a re-read. Newest summary wins: a summary
+is a pointer to current state, not a log.
+
+**Doctor does not use pids to detect concurrency.** §18.1 asked for a warning
+when the actor file "has been used by more than one concurrent process". That
+is not observable from pids here: every mote invocation is its own process, so
+distinct pids describe any ordinary sequence of commands and the warning would
+fire constantly. The checks that actually discriminate are
+
+- two live reservations held by one actor covering a common path — impossible
+  for a single session working on one thing, and invisible to `preflight` and
+  `who-has` because same-actor reservations do not conflict;
+- more than one live session lease under one actor;
+- identity resolved from `.mote/local/actor` while several sessions are live;
+- an actor name from the generic-default list (`claude`, `agent`, `assistant`, …).
+
+These are coordination hazards rather than store corruption, so they are
+reported as warnings and leave the exit code at 0.
+
+**`mote in-flight` includes advisory Git context.** §18.2 rules out inferring
+hidden state from Git "unless such context is explicitly marked as advisory".
+Recent commits are the one thing a replay genuinely cannot know and the one
+most likely to reveal that work was already shipped, so they are included under
+an explicit advisory label and suppressed with `--no-git`. Every other section
+is replay-only.
+
+**Same-actor reservation overlap is still accepted.** Rejecting it would be a
+protocol change that breaks legitimate re-reservation, and it would punish the
+common single-session case to catch the multi-session one. The overlap is
+reported by `mote doctor` instead; per-session identity is the actual fix.

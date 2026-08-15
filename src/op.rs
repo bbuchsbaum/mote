@@ -284,6 +284,60 @@ pub struct BoardPostOp {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// `post` (default), `decision`, or `summary`. A `summary` post becomes the
+    /// topic's pinned current-state pointer; a `decision` post is counted so
+    /// readers can find the thread's conclusions without re-reading it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_kind: Option<String>,
+}
+
+/// Routing op: link a discussion post or topic to tracker work, or declare
+/// that it still needs (or no longer needs) tracker action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardRouteOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    /// Exactly one of `post_id` / `topic` identifies the routing target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// One of `VALID_ROUTE_STATES`.
+    pub route_state: String,
+    /// Bead this discussion routes to. Required for `routed`, forbidden otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<BeadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// TTL-bounded session lease. Distinguishes concurrent sessions that would
+/// otherwise be indistinguishable behind one persisted actor identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStartOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub session_id: String,
+    pub ttl_s: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Publishing process id, recorded so `mote doctor` can tell one long
+    /// session from several concurrent ones sharing an identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEndOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,6 +427,9 @@ pub enum Op {
     BoardRead(BoardReadOp),
     BoardTopic(BoardTopicOp),
     BoardSticky(BoardStickyOp),
+    BoardRoute(BoardRouteOp),
+    SessionStart(SessionStartOp),
+    SessionEnd(SessionEndOp),
     ReserveOpen(ReserveOpenOp),
     ReserveClose(ReserveCloseOp),
 }
@@ -397,6 +454,9 @@ impl Op {
             Op::BoardRead(o) => &o.op,
             Op::BoardTopic(o) => &o.op,
             Op::BoardSticky(o) => &o.op,
+            Op::BoardRoute(o) => &o.op,
+            Op::SessionStart(o) => &o.op,
+            Op::SessionEnd(o) => &o.op,
             Op::ReserveOpen(o) => &o.op,
             Op::ReserveClose(o) => &o.op,
         }
@@ -421,6 +481,9 @@ impl Op {
             Op::BoardRead(o) => &o.actor,
             Op::BoardTopic(o) => &o.actor,
             Op::BoardSticky(o) => &o.actor,
+            Op::BoardRoute(o) => &o.actor,
+            Op::SessionStart(o) => &o.actor,
+            Op::SessionEnd(o) => &o.actor,
             Op::ReserveOpen(o) => &o.actor,
             Op::ReserveClose(o) => &o.actor,
         }
@@ -445,14 +508,19 @@ impl Op {
             Op::BoardRead(o) => &o.ts,
             Op::BoardTopic(o) => &o.ts,
             Op::BoardSticky(o) => &o.ts,
+            Op::BoardRoute(o) => &o.ts,
+            Op::SessionStart(o) => &o.ts,
+            Op::SessionEnd(o) => &o.ts,
             Op::ReserveOpen(o) => &o.ts,
             Op::ReserveClose(o) => &o.ts,
         }
     }
 
     /// Returns the entity (bead id) this op acts on, or `None` for op kinds
-    /// that are not entity-scoped (`msg_ack`, `msg_resolve`, `reserve_close`;
-    /// `msg_send` may optionally reference an entity).
+    /// that are not entity-scoped (`msg_ack`, `msg_resolve`, `reserve_close`,
+    /// the discussion ops, and the session ops; `msg_send` may optionally
+    /// reference an entity). `board_route` names a bead but acts on the
+    /// discussion target, so its history stays in the discussion plane.
     pub fn entity(&self) -> Option<&str> {
         match self {
             Op::Create(o) => Some(&o.entity),
@@ -471,6 +539,8 @@ impl Op {
             Op::BoardRead(_) => None,
             Op::BoardTopic(_) => None,
             Op::BoardSticky(_) => None,
+            Op::BoardRoute(_) => None,
+            Op::SessionStart(_) | Op::SessionEnd(_) => None,
             Op::ReserveOpen(o) => Some(&o.entity),
             Op::ReserveClose(_) => None,
         }
@@ -498,6 +568,9 @@ impl Op {
             Op::BoardRead(_) => "board_read",
             Op::BoardTopic(_) => "board_topic",
             Op::BoardSticky(_) => "board_sticky",
+            Op::BoardRoute(_) => "board_route",
+            Op::SessionStart(_) => "session_start",
+            Op::SessionEnd(_) => "session_end",
             Op::ReserveOpen(_) => "reserve_open",
             Op::ReserveClose(_) => "reserve_close",
         }
@@ -800,6 +873,19 @@ pub fn make_board_post(
     reply_to: Option<String>,
     ts: jiff::Timestamp,
 ) -> Op {
+    make_board_post_of_kind(actor, post_id, topic, body, reply_to, None, ts)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn make_board_post_of_kind(
+    actor: String,
+    post_id: String,
+    topic: String,
+    body: String,
+    reply_to: Option<String>,
+    post_kind: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
     Op::BoardPost(BoardPostOp {
         v: 1,
         op: String::new(),
@@ -809,6 +895,59 @@ pub fn make_board_post(
         topic,
         body,
         reply_to,
+        post_kind,
+    })
+}
+
+pub fn make_board_route(
+    actor: String,
+    post_id: Option<String>,
+    topic: Option<String>,
+    route_state: String,
+    entity: Option<BeadId>,
+    note: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
+    Op::BoardRoute(BoardRouteOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        post_id,
+        topic,
+        route_state,
+        entity,
+        note,
+    })
+}
+
+pub fn make_session_start(
+    actor: String,
+    session_id: String,
+    ttl_s: u32,
+    label: Option<String>,
+    pid: Option<u32>,
+    ts: jiff::Timestamp,
+) -> Op {
+    Op::SessionStart(SessionStartOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        session_id,
+        ttl_s,
+        label,
+        pid,
+    })
+}
+
+pub fn make_session_end(actor: String, session_id: String, ts: jiff::Timestamp) -> Op {
+    Op::SessionEnd(SessionEndOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        session_id,
     })
 }
 
@@ -862,9 +1001,21 @@ pub const VALID_MSG_KINDS: &[&str] = &[
     "note", "request", "response", "decline", "handoff", "blocked", "fyi",
 ];
 pub const VALID_REPLY_KINDS: &[&str] = &["response", "decline"];
+pub const VALID_POST_KINDS: &[&str] = &["post", "decision", "summary"];
+/// Routing states a discussion post or topic can carry. `open` is the implicit
+/// default and is also writable, so a resolved thread can be reopened.
+pub const VALID_ROUTE_STATES: &[&str] = &["open", "needs_bead", "routed", "resolved"];
 
 pub fn validate_note_kind(k: &str) -> bool {
     VALID_NOTE_KINDS.contains(&k)
+}
+
+pub fn validate_post_kind(k: &str) -> bool {
+    VALID_POST_KINDS.contains(&k)
+}
+
+pub fn validate_route_state(s: &str) -> bool {
+    VALID_ROUTE_STATES.contains(&s)
 }
 
 pub fn validate_msg_kind(k: &str) -> bool {

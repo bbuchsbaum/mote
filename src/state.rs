@@ -85,6 +85,8 @@ pub struct State {
     pub board_topic_read_cursors: BTreeMap<(String, String), String>,
     /// All reservations, indexed by `reservation_id`. Both live and closed.
     pub reservations: BTreeMap<String, ReservationState>,
+    /// All session leases, indexed by `session_id`. Both live and ended.
+    pub sessions: BTreeMap<String, SessionRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +175,62 @@ pub struct MsgRecord {
     pub ack_ts: Option<String>,
 }
 
+/// Whether a discussion post or topic still needs tracker action.
+///
+/// `Open` is the implicit default: nothing has been declared about the target,
+/// which is not the same as "needs a bead". Only `NeedsBead` is an explicit
+/// claim that the discussion is actionable and unrouted, so
+/// `mote discuss unrouted` answers a question about declared state rather than
+/// guessing from prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteState {
+    #[default]
+    Open,
+    NeedsBead,
+    Routed,
+    Resolved,
+}
+
+impl RouteState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::NeedsBead => "needs_bead",
+            Self::Routed => "routed",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "needs_bead" => Some(Self::NeedsBead),
+            "routed" => Some(Self::Routed),
+            "resolved" => Some(Self::Resolved),
+            _ => None,
+        }
+    }
+}
+
+/// Derived routing state attached to a post or a topic.
+#[derive(Debug, Clone, Default)]
+pub struct RouteRecord {
+    pub state: RouteState,
+    /// Beads this discussion target has been linked to, in id order.
+    pub issues: BTreeSet<String>,
+    pub updated_by: Option<String>,
+    pub updated_ts: Option<String>,
+    pub updated_op_id: Option<String>,
+}
+
+impl RouteRecord {
+    /// `true` when the target has been declared actionable but carries no bead.
+    pub fn needs_action(&self) -> bool {
+        self.state == RouteState::NeedsBead
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BoardPostRecord {
     pub post_id: String,
@@ -180,8 +238,10 @@ pub struct BoardPostRecord {
     pub topic: String,
     pub body: String,
     pub reply_to: Option<String>,
+    pub post_kind: String,
     pub sticky: bool,
     pub sticky_op_id: Option<String>,
+    pub route: RouteRecord,
     pub sent_ts: String,
     pub sent_op_id: String,
 }
@@ -199,6 +259,33 @@ pub struct BoardTopicRecord {
     pub last_activity_op_id: String,
     pub post_count: usize,
     pub sticky_count: usize,
+    pub decision_count: usize,
+    /// Most recent `summary` post, i.e. the topic's pinned current state.
+    pub summary_post_id: Option<String>,
+    pub route: RouteRecord,
+}
+
+/// A TTL-bounded session lease. Multiple concurrent sessions may share one
+/// actor name; the lease is what makes them individually visible.
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub actor: String,
+    pub label: Option<String>,
+    pub pid: Option<u32>,
+    pub ttl_s: u32,
+    pub started_ts: String,
+    pub started_op_id: String,
+    pub lease_until_ts: String,
+    pub ended_ts: Option<String>,
+    pub ended_op_id: Option<String>,
+}
+
+impl SessionRecord {
+    /// Live means not explicitly ended and not past its lease.
+    pub fn is_live(&self, now_ts: &str) -> bool {
+        self.ended_ts.is_none() && now_ts < self.lease_until_ts.as_str()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -429,6 +516,70 @@ impl State {
                 .then_with(|| a.sent_op_id.cmp(&b.sent_op_id))
         });
         posts
+    }
+
+    /// Discussion targets that have been declared actionable but carry no bead,
+    /// in send-order for posts and topic order for topics. This is the state
+    /// behind "which discussions still need tracker action?".
+    pub fn unrouted_posts<'a>(&'a self, topic: Option<&str>) -> Vec<&'a BoardPostRecord> {
+        let mut posts: Vec<&BoardPostRecord> = self
+            .board_posts
+            .values()
+            .filter(|p| p.route.needs_action() && topic.is_none_or(|t| p.topic == t))
+            .collect();
+        posts.sort_by(|a, b| a.sent_op_id.cmp(&b.sent_op_id));
+        posts
+    }
+
+    pub fn unrouted_topics<'a>(&'a self, topic: Option<&str>) -> Vec<&'a BoardTopicRecord> {
+        self.board_topics
+            .values()
+            .filter(|t| t.route.needs_action() && topic.is_none_or(|wanted| t.topic == wanted))
+            .collect()
+    }
+
+    /// Discussion posts and topics linked to `bead_id`, so a bead can be traced
+    /// back to the thread that produced it.
+    pub fn discussion_sources_for<'a>(
+        &'a self,
+        bead_id: &str,
+    ) -> (Vec<&'a BoardPostRecord>, Vec<&'a BoardTopicRecord>) {
+        let mut posts: Vec<&BoardPostRecord> = self
+            .board_posts
+            .values()
+            .filter(|p| p.route.issues.contains(bead_id))
+            .collect();
+        posts.sort_by(|a, b| a.sent_op_id.cmp(&b.sent_op_id));
+        let topics: Vec<&BoardTopicRecord> = self
+            .board_topics
+            .values()
+            .filter(|t| t.route.issues.contains(bead_id))
+            .collect();
+        (posts, topics)
+    }
+
+    /// Live session leases as-of `now_ts`, in start order.
+    pub fn live_sessions(&self, now_ts: &str) -> Vec<&SessionRecord> {
+        let mut sessions: Vec<&SessionRecord> = self
+            .sessions
+            .values()
+            .filter(|s| s.is_live(now_ts))
+            .collect();
+        sessions.sort_by(|a, b| {
+            a.actor
+                .cmp(&b.actor)
+                .then_with(|| a.started_op_id.cmp(&b.started_op_id))
+        });
+        sessions
+    }
+
+    /// Live session leases held under `actor`. More than one means concurrent
+    /// sessions are sharing a single identity.
+    pub fn live_sessions_for(&self, actor: &str, now_ts: &str) -> Vec<&SessionRecord> {
+        self.live_sessions(now_ts)
+            .into_iter()
+            .filter(|s| s.actor == actor)
+            .collect()
     }
 
     /// Discussion topics ordered by current activity, newest first.

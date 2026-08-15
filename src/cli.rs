@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::errors::{MoteError, MoteResult};
 use crate::ids;
 use crate::op::{
-    self, ScalarSet, Status, make_board_post, make_board_read, make_board_sticky, make_board_topic,
-    make_claim, make_close, make_create, make_delete, make_dep, make_msg_ack, make_msg_resolve,
-    make_msg_send_with_metadata, make_note, make_patch, make_rel, make_release, make_reserve_close,
-    make_reserve_open, make_tag, validate_msg_kind, validate_note_kind,
+    self, ScalarSet, Status, make_board_post, make_board_read, make_board_route, make_board_sticky,
+    make_board_topic, make_claim, make_close, make_create, make_delete, make_dep, make_msg_ack,
+    make_msg_resolve, make_msg_send_with_metadata, make_note, make_patch, make_rel, make_release,
+    make_reserve_close, make_reserve_open, make_session_end, make_session_start, make_tag,
+    validate_msg_kind, validate_note_kind,
 };
 use crate::reducer;
 use crate::state::{Bead, MsgRecord, RequestState};
@@ -260,6 +261,9 @@ pub enum Command {
         note: Option<String>,
         #[arg(long)]
         ttl: Option<u32>,
+        /// Also post a one-line claim to this discussion topic
+        #[arg(long)]
+        announce: Option<String>,
     },
 
     /// Compound: handoff note + claim transfer + optional reservation release
@@ -283,6 +287,22 @@ pub enum Command {
 
     /// Show live reservations whose paths overlap a given path
     WhoHas { path: String },
+
+    /// Manage per-session identity so concurrent sessions stay distinguishable
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
+
+    /// One-shot view of what is actively being worked on right now
+    InFlight {
+        /// Treat discussion topics touched within this many minutes as active
+        #[arg(long, default_value_t = 60)]
+        minutes: u64,
+        /// Omit the advisory recent-commit section
+        #[arg(long)]
+        no_git: bool,
+    },
 
     /// Compact overview of board state
     Board,
@@ -362,6 +382,41 @@ pub enum SkillsCmd {
         /// Overwrite existing skill directories
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SessionCmd {
+    /// Open a session lease and print the `export MOTE_ACTOR=...` line to activate it
+    Start {
+        /// Actor identity for this session (default: the resolved actor)
+        #[arg(long = "as")]
+        as_actor: Option<String>,
+        /// Lease duration in seconds
+        #[arg(long, default_value_t = 14400)]
+        ttl: u32,
+        /// Free-text description of what this session is doing
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Extend an existing session lease
+    Renew {
+        /// Session id (default: `MOTE_SESSION`)
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        ttl: Option<u32>,
+    },
+    /// List session leases
+    List {
+        /// Include ended and expired sessions
+        #[arg(long)]
+        all: bool,
+    },
+    /// End a session lease
+    End {
+        /// Session id (default: `MOTE_SESSION`)
+        id: Option<String>,
     },
 }
 
@@ -550,6 +605,72 @@ pub enum DiscussCmd {
     Unsticky { post_id: String },
     /// List topics with post counts
     Topics,
+    /// Record a decision on a topic as a sticky, retrievable post
+    Decision {
+        #[arg(long, default_value = "general")]
+        topic: String,
+        /// Decision text
+        #[arg(long)]
+        body: Option<String>,
+        /// Decision text (positional; alternatively use --body)
+        text: Option<String>,
+    },
+    /// Set or show a topic's pinned current-state summary
+    Summary {
+        #[arg(long, default_value = "general")]
+        topic: String,
+        /// Summary text; omit to print the topic's current summary
+        #[arg(long)]
+        body: Option<String>,
+        /// Summary text (positional; alternatively use --body)
+        text: Option<String>,
+    },
+    /// Link a post or topic to a bead
+    Route {
+        /// Post to route (omit and pass --topic to route a whole topic)
+        post_id: Option<String>,
+        #[arg(long, conflicts_with = "post_id")]
+        topic: Option<String>,
+        /// Bead this discussion routes to
+        #[arg(long = "issue")]
+        issue: String,
+        /// Optional note recorded on the bead
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Flag a post or topic as actionable but not yet routed to a bead
+    NeedsBead {
+        post_id: Option<String>,
+        #[arg(long, conflicts_with = "post_id")]
+        topic: Option<String>,
+    },
+    /// Mark a post or topic as no longer needing tracker action
+    Resolve {
+        post_id: Option<String>,
+        #[arg(long, conflicts_with = "post_id")]
+        topic: Option<String>,
+    },
+    /// List discussion flagged as needing tracker action
+    Unrouted {
+        #[arg(long)]
+        topic: Option<String>,
+    },
+    /// Create a bead from a post and route the post to it
+    Promote {
+        post_id: String,
+        /// Bead title (default: the post's first line)
+        #[arg(long)]
+        title: Option<String>,
+        /// Bead body (default: the post body, with board provenance appended)
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        priority: Option<i32>,
+        #[arg(long = "tag", value_delimiter = ',')]
+        tags: Vec<String>,
+        #[arg(long = "dep", value_delimiter = ',')]
+        deps: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -695,6 +816,7 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             paths,
             note,
             ttl,
+            announce,
         } => cmd_begin(
             cli.actor.as_deref(),
             cli.store.as_deref(),
@@ -702,6 +824,7 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             paths,
             note,
             ttl,
+            announce,
         ),
         Command::Handoff {
             id,
@@ -720,6 +843,16 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             cmd_done(cli.actor.as_deref(), cli.store.as_deref(), id, note)
         }
         Command::WhoHas { path } => cmd_who_has(cli.store.as_deref(), cli.json, path),
+        Command::Session { cmd } => {
+            cmd_session(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
+        }
+        Command::InFlight { minutes, no_git } => cmd_in_flight(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            minutes,
+            !no_git,
+        ),
         Command::Board => cmd_board(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
         Command::Events {
             kinds,
@@ -2608,31 +2741,9 @@ fn cmd_discuss(
                     "discussion post text must be non-empty".into(),
                 ));
             }
-            let post_id = ids::new_post_id();
-            let op = make_board_post(
-                actor,
-                post_id.clone(),
-                topic.clone(),
-                text,
-                reply_to.clone(),
-                Timestamp::now(),
-            );
-            let name = publish::publish_op(&store, &op)?;
-            let code = verify_accept(&store, &name)?;
-            if code == 0 {
-                if json_mode {
-                    let v = serde_json::json!({
-                        "post_id": post_id,
-                        "topic": topic,
-                        "reply_to": reply_to,
-                    });
-                    println!("{}", serde_json::to_string(&v)?);
-                } else {
-                    println!("{post_id}");
-                    eprintln!("posted {post_id} to topic {topic}");
-                }
-            }
-            Ok(code)
+            publish_discussion_post(
+                &store, actor, &topic, text, reply_to, None, json_mode, "posted",
+            )
         }
         DiscussCmd::List { topic, limit } => {
             let state = reducer::replay_store(&store)?;
@@ -2759,19 +2870,33 @@ fn cmd_discuss(
                     initial_post_id = Some(post_id);
                 }
 
+                // Report the post count the board will actually show, so a
+                // caller never has to guess whether its text became visible.
+                let state = reducer::replay_store(&store)?;
+                let posts = state
+                    .board_topics
+                    .get(&topic)
+                    .map(|t| t.post_count)
+                    .unwrap_or(0);
+
                 if json_mode {
                     let v = serde_json::json!({
                         "topic": topic,
                         "initial_post_id": initial_post_id,
+                        "posts": posts,
+                        "visible_in_list": posts > 0,
                     });
                     println!("{}", serde_json::to_string(&v)?);
                 } else {
                     println!("{topic}");
                     match initial_post_id.as_deref() {
-                        Some(post_id) => {
-                            eprintln!("created topic {topic} with initial post {post_id}")
-                        }
-                        None => eprintln!("created topic {topic} with no posts"),
+                        Some(post_id) => eprintln!(
+                            "created topic {topic} with initial post {post_id} (posts={posts})"
+                        ),
+                        None => eprintln!(
+                            "created topic {topic} with no posts (posts=0); \
+                             run `mote discuss post --topic {topic} --body ...` to make it visible"
+                        ),
                     }
                 }
                 Ok(0)
@@ -2811,7 +2936,512 @@ fn cmd_discuss(
             let state = reducer::replay_store(&store)?;
             print_discussion_topics(state.board_topics_by_activity(), json_mode)
         }
+        DiscussCmd::Decision { topic, body, text } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let topic = normalize_discussion_topic(&topic)?;
+            let text = require_post_text(text, body, "decision")?;
+            let (code, post_id) = publish_discussion_post_id(
+                &store,
+                actor.clone(),
+                &topic,
+                text,
+                None,
+                Some("decision".to_string()),
+                json_mode,
+                "recorded decision",
+            )?;
+            if code == 0 {
+                // Decisions are what late arrivals need first, so pin them.
+                let op = make_board_sticky(actor, post_id, true, Timestamp::now());
+                let name = publish::publish_op(&store, &op)?;
+                return verify_accept(&store, &name);
+            }
+            Ok(code)
+        }
+        DiscussCmd::Summary { topic, body, text } => {
+            let topic = normalize_discussion_topic(&topic)?;
+            let Some(text) = text.or(body) else {
+                // No text: read the pinned summary rather than write one.
+                let state = reducer::replay_store(&store)?;
+                return print_topic_summary(&state, &topic, json_mode);
+            };
+            if text.trim().is_empty() {
+                return Err(MoteError::Invalid("summary text must be non-empty".into()));
+            }
+            let actor = store.resolve_actor(actor_flag)?;
+            let (code, post_id) = publish_discussion_post_id(
+                &store,
+                actor.clone(),
+                &topic,
+                text,
+                None,
+                Some("summary".to_string()),
+                json_mode,
+                "set summary",
+            )?;
+            if code == 0 {
+                let op = make_board_sticky(actor, post_id, true, Timestamp::now());
+                let name = publish::publish_op(&store, &op)?;
+                return verify_accept(&store, &name);
+            }
+            Ok(code)
+        }
+        DiscussCmd::Route {
+            post_id,
+            topic,
+            issue,
+            note,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let (post_id, topic) = route_target(post_id, topic)?;
+            let op = make_board_route(
+                actor.clone(),
+                post_id.clone(),
+                topic.clone(),
+                "routed".into(),
+                Some(issue.clone()),
+                note.clone(),
+                Timestamp::now(),
+            );
+            let name = publish::publish_op(&store, &op)?;
+            let code = verify_accept(&store, &name)?;
+            if code == 0 {
+                // Mirror the link onto the bead so `mote show` carries the
+                // provenance without a board lookup.
+                let target = post_id
+                    .clone()
+                    .unwrap_or_else(|| format!("topic {}", topic.clone().unwrap_or_default()));
+                let text = match note {
+                    Some(note) => format!("routed from discussion {target}: {note}"),
+                    None => format!("routed from discussion {target}"),
+                };
+                let note_op = make_note(
+                    actor,
+                    issue.clone(),
+                    "decision".into(),
+                    text,
+                    Timestamp::now(),
+                );
+                let _ = publish::publish_op(&store, &note_op);
+                print_route_result(
+                    post_id.as_deref(),
+                    topic.as_deref(),
+                    "routed",
+                    Some(&issue),
+                    json_mode,
+                )?;
+            }
+            Ok(code)
+        }
+        DiscussCmd::NeedsBead { post_id, topic } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let (post_id, topic) = route_target(post_id, topic)?;
+            let op = make_board_route(
+                actor,
+                post_id.clone(),
+                topic.clone(),
+                "needs_bead".into(),
+                None,
+                None,
+                Timestamp::now(),
+            );
+            let name = publish::publish_op(&store, &op)?;
+            let code = verify_accept(&store, &name)?;
+            if code == 0 {
+                print_route_result(
+                    post_id.as_deref(),
+                    topic.as_deref(),
+                    "needs_bead",
+                    None,
+                    json_mode,
+                )?;
+            }
+            Ok(code)
+        }
+        DiscussCmd::Resolve { post_id, topic } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let (post_id, topic) = route_target(post_id, topic)?;
+            let op = make_board_route(
+                actor,
+                post_id.clone(),
+                topic.clone(),
+                "resolved".into(),
+                None,
+                None,
+                Timestamp::now(),
+            );
+            let name = publish::publish_op(&store, &op)?;
+            let code = verify_accept(&store, &name)?;
+            if code == 0 {
+                print_route_result(
+                    post_id.as_deref(),
+                    topic.as_deref(),
+                    "resolved",
+                    None,
+                    json_mode,
+                )?;
+            }
+            Ok(code)
+        }
+        DiscussCmd::Unrouted { topic } => {
+            let state = reducer::replay_store(&store)?;
+            let normalized_topic = topic
+                .as_deref()
+                .map(normalize_discussion_topic)
+                .transpose()?;
+            let posts = state.unrouted_posts(normalized_topic.as_deref());
+            let topics = state.unrouted_topics(normalized_topic.as_deref());
+            if json_mode {
+                let v = serde_json::json!({
+                    "topics": topics.iter().map(|t| topic_json(t)).collect::<Vec<_>>(),
+                    "posts": posts.iter().map(|p| board_post_json(p)).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string(&v)?);
+            } else {
+                for t in &topics {
+                    println!(
+                        "topic  {}  needs-bead  last={}  {}",
+                        t.topic, t.last_activity_ts, t.title
+                    );
+                }
+                for p in &posts {
+                    println!(
+                        "post   {}  needs-bead  {}  from={}  topic={}  {}",
+                        p.post_id, p.sent_ts, p.from, p.topic, p.body
+                    );
+                }
+            }
+            Ok(0)
+        }
+        DiscussCmd::Promote {
+            post_id,
+            title,
+            body,
+            priority,
+            tags,
+            deps,
+        } => cmd_discuss_promote(
+            &store, actor_flag, json_mode, post_id, title, body, priority, tags, deps,
+        ),
     }
+}
+
+/// Shared post publisher: mints the id, publishes, and reports the topic's
+/// resulting post count so callers can confirm the text is actually visible.
+/// Returns the minted post id alongside the exit code; callers that need to
+/// act on the post (e.g. pin it) use that rather than re-deriving it from
+/// state, which would be ambiguous under concurrent posting.
+#[allow(clippy::too_many_arguments)]
+fn publish_discussion_post_id(
+    store: &Store,
+    actor: String,
+    topic: &str,
+    text: String,
+    reply_to: Option<String>,
+    post_kind: Option<String>,
+    json_mode: bool,
+    verb: &str,
+) -> MoteResult<(i32, String)> {
+    let post_id = ids::new_post_id();
+    let op = op::make_board_post_of_kind(
+        actor,
+        post_id.clone(),
+        topic.to_string(),
+        text,
+        reply_to.clone(),
+        post_kind.clone(),
+        Timestamp::now(),
+    );
+    let name = publish::publish_op(store, &op)?;
+    let state = reducer::replay_store(store)?;
+    if !state.was_accepted(name.as_str()) {
+        let reason = state
+            .rejection_reason(name.as_str())
+            .unwrap_or_else(|| "unknown".into());
+        eprintln!("rejected: {reason}");
+        return Ok((2, post_id));
+    }
+    let posts = state
+        .board_topics
+        .get(topic)
+        .map(|t| t.post_count)
+        .unwrap_or(0);
+
+    if json_mode {
+        let v = serde_json::json!({
+            "post_id": post_id,
+            "topic": topic,
+            "reply_to": reply_to,
+            "post_kind": post_kind.as_deref().unwrap_or("post"),
+            "posts": posts,
+            "visible_in_list": state.board_posts.contains_key(&post_id),
+        });
+        println!("{}", serde_json::to_string(&v)?);
+    } else {
+        println!("{post_id}");
+        eprintln!("{verb} {post_id} in topic {topic} (posts={posts})");
+    }
+    Ok((0, post_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_discussion_post(
+    store: &Store,
+    actor: String,
+    topic: &str,
+    text: String,
+    reply_to: Option<String>,
+    post_kind: Option<String>,
+    json_mode: bool,
+    verb: &str,
+) -> MoteResult<i32> {
+    let (code, _) = publish_discussion_post_id(
+        store, actor, topic, text, reply_to, post_kind, json_mode, verb,
+    )?;
+    Ok(code)
+}
+
+fn require_post_text(text: Option<String>, body: Option<String>, what: &str) -> MoteResult<String> {
+    let text = match (text, body) {
+        (Some(_), Some(_)) => {
+            return Err(MoteError::Invalid(format!(
+                "provide {what} text either as positional text or --body, not both"
+            )));
+        }
+        (Some(text), None) | (None, Some(text)) => text,
+        (None, None) => {
+            return Err(MoteError::Invalid(format!(
+                "{what} text is required (positional text or --body)"
+            )));
+        }
+    };
+    if text.trim().is_empty() {
+        return Err(MoteError::Invalid(format!("{what} text must be non-empty")));
+    }
+    Ok(text)
+}
+
+/// Normalize a `post_id`-or-`--topic` target pair into exactly one of the two.
+fn route_target(
+    post_id: Option<String>,
+    topic: Option<String>,
+) -> MoteResult<(Option<String>, Option<String>)> {
+    match (post_id, topic) {
+        (Some(post_id), None) => Ok((Some(post_id), None)),
+        (None, Some(topic)) => Ok((None, Some(normalize_discussion_topic(&topic)?))),
+        (Some(_), Some(_)) => Err(MoteError::Invalid(
+            "pass a post id or --topic, not both".into(),
+        )),
+        (None, None) => Err(MoteError::Invalid(
+            "pass a post id or --topic to identify the routing target".into(),
+        )),
+    }
+}
+
+fn print_route_result(
+    post_id: Option<&str>,
+    topic: Option<&str>,
+    route_state: &str,
+    issue: Option<&str>,
+    json_mode: bool,
+) -> MoteResult<()> {
+    if json_mode {
+        let v = serde_json::json!({
+            "post_id": post_id,
+            "topic": topic,
+            "route_state": route_state,
+            "issue": issue,
+        });
+        println!("{}", serde_json::to_string(&v)?);
+    } else {
+        let target = match (post_id, topic) {
+            (Some(post_id), _) => format!("post {post_id}"),
+            (None, Some(topic)) => format!("topic {topic}"),
+            (None, None) => "?".to_string(),
+        };
+        match issue {
+            Some(issue) => println!("{target} route_state={route_state} issue={issue}"),
+            None => println!("{target} route_state={route_state}"),
+        }
+    }
+    Ok(())
+}
+
+fn print_topic_summary(
+    state: &crate::state::State,
+    topic: &str,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    let Some(record) = state.board_topics.get(topic) else {
+        return Err(MoteError::Invalid(format!(
+            "no such discussion topic {topic}"
+        )));
+    };
+    let summary = record
+        .summary_post_id
+        .as_deref()
+        .and_then(|id| state.board_posts.get(id));
+    if json_mode {
+        let v = serde_json::json!({
+            "topic": topic,
+            "summary_post_id": record.summary_post_id,
+            "summary": summary.map(|p| p.body.clone()),
+            "decision_count": record.decision_count,
+            "route_state": record.route.state.as_str(),
+            "issues": record.route.issues.iter().collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string(&v)?);
+    } else {
+        match summary {
+            Some(post) => {
+                println!("{}  {}  from={}", post.post_id, post.sent_ts, post.from);
+                println!("{}", post.body);
+            }
+            None => eprintln!(
+                "no summary for topic {topic}; \
+                 set one with `mote discuss summary --topic {topic} --body ...`"
+            ),
+        }
+    }
+    Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_discuss_promote(
+    store: &Store,
+    actor_flag: Option<&str>,
+    json_mode: bool,
+    post_id: String,
+    title: Option<String>,
+    body: Option<String>,
+    priority: Option<i32>,
+    tags: Vec<String>,
+    deps: Vec<String>,
+) -> MoteResult<i32> {
+    let actor = store.resolve_actor(actor_flag)?;
+    let state = reducer::replay_store(store)?;
+    let Some(post) = state.board_posts.get(&post_id) else {
+        return Err(MoteError::Invalid(format!("no such post {post_id}")));
+    };
+    if let Some(p) = priority {
+        if !(0..=3).contains(&p) {
+            return Err(MoteError::Invalid(format!("priority {p} out of 0..=3")));
+        }
+    }
+
+    // The post already carries the argument; the bead only needs a handle on it
+    // plus a pointer back, so the board never becomes a second task tracker.
+    let title = match title {
+        Some(title) if !title.trim().is_empty() => title,
+        _ => first_line_title(&post.body),
+    };
+    let provenance = format!(
+        "promoted from discussion post {} in topic {}",
+        post.post_id, post.topic
+    );
+    let body = match body {
+        Some(body) => format!("{body}\n\n{provenance}"),
+        None => format!("{}\n\n{provenance}", post.body),
+    };
+    let topic = post.topic.clone();
+
+    let bead_id = ids::new_bead_id();
+    let set = ScalarSet {
+        title: Some(title.clone()),
+        status: Some(Status::Open),
+        priority,
+        body: Some(body),
+        ..Default::default()
+    };
+    let create = make_create(actor.clone(), bead_id.clone(), set, Timestamp::now());
+    let create_name = publish::publish_op(store, &create)?;
+    let state = reducer::replay_store(store)?;
+    if !state.was_accepted(create_name.as_str()) {
+        let reason = state
+            .rejection_reason(create_name.as_str())
+            .unwrap_or_else(|| "unknown".into());
+        eprintln!("create rejected: {reason}");
+        return Ok(2);
+    }
+
+    let mut had_failure = false;
+    let mut names = Vec::new();
+    for t in &tags {
+        let op = make_tag(
+            true,
+            actor.clone(),
+            bead_id.clone(),
+            t.clone(),
+            Timestamp::now(),
+        );
+        names.push(publish::publish_op(store, &op)?);
+    }
+    for d in &deps {
+        let op = make_dep(
+            true,
+            actor.clone(),
+            bead_id.clone(),
+            d.clone(),
+            "blocks".into(),
+            Timestamp::now(),
+        );
+        names.push(publish::publish_op(store, &op)?);
+    }
+
+    // Route last: the link is only meaningful once the bead exists.
+    let route = make_board_route(
+        actor.clone(),
+        Some(post_id.clone()),
+        None,
+        "routed".into(),
+        Some(bead_id.clone()),
+        Some(format!("promoted to {bead_id}")),
+        Timestamp::now(),
+    );
+    names.push(publish::publish_op(store, &route)?);
+
+    let state = reducer::replay_store(store)?;
+    for n in &names {
+        if !state.was_accepted(n.as_str()) {
+            had_failure = true;
+            let reason = state
+                .rejection_reason(n.as_str())
+                .unwrap_or_else(|| "unknown".into());
+            eprintln!("{} rejected: {reason}", n.as_str());
+        }
+    }
+
+    if json_mode {
+        let v = serde_json::json!({
+            "id": bead_id,
+            "title": title,
+            "post_id": post_id,
+            "topic": topic,
+            "route_state": state
+                .board_posts
+                .get(&post_id)
+                .map(|p| p.route.state.as_str()),
+        });
+        println!("{}", serde_json::to_string(&v)?);
+    } else {
+        println!("{bead_id}");
+        eprintln!("promoted post {post_id} (topic {topic}) to {bead_id}");
+    }
+    Ok(if had_failure { 2 } else { 0 })
+}
+
+/// First non-empty line of a post body, truncated to a usable bead title.
+fn first_line_title(body: &str) -> String {
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("untitled");
+    if line.chars().count() <= 120 {
+        return line.to_string();
+    }
+    let truncated: String = line.chars().take(117).collect();
+    format!("{truncated}...")
 }
 
 fn print_discussion_topics(
@@ -2824,14 +3454,22 @@ fn print_discussion_topics(
     } else {
         for t in &topics {
             let explicit = if t.explicit { "explicit" } else { "implicit" };
+            let summary = if t.summary_post_id.is_some() {
+                "  summary=yes"
+            } else {
+                ""
+            };
             println!(
-                "{}  posts={}  sticky={}  created={}  last={}  {}  {}",
+                "{}  posts={}  sticky={}  decisions={}{}  created={}  last={}  {}{}  {}",
                 t.topic,
                 t.post_count,
                 t.sticky_count,
+                t.decision_count,
+                summary,
                 t.created_ts,
                 t.last_activity_ts,
                 explicit,
+                route_marker(&t.route),
                 t.title
             );
         }
@@ -2852,6 +3490,10 @@ fn topic_json(t: &crate::state::BoardTopicRecord) -> serde_json::Value {
         "last_activity_op_id": t.last_activity_op_id,
         "post_count": t.post_count,
         "sticky_count": t.sticky_count,
+        "decision_count": t.decision_count,
+        "summary_post_id": t.summary_post_id,
+        "route_state": t.route.state.as_str(),
+        "issues": t.route.issues.iter().collect::<Vec<_>>(),
     })
 }
 
@@ -2926,12 +3568,46 @@ fn print_board_posts(
             let reply = p.reply_to.as_deref().unwrap_or("-");
             let sticky = if p.sticky { " sticky" } else { "" };
             println!(
-                "{}{}  {}  from={}  topic={}  reply={}  {}",
-                p.post_id, sticky, p.sent_ts, p.from, p.topic, reply, p.body
+                "{}{}{}  {}  from={}  topic={}  reply={}{}  {}",
+                p.post_id,
+                sticky,
+                post_kind_marker(&p.post_kind),
+                p.sent_ts,
+                p.from,
+                p.topic,
+                reply,
+                route_marker(&p.route),
+                p.body
             );
         }
     }
     Ok(0)
+}
+
+/// Non-default post kinds are called out inline; a plain post prints nothing
+/// extra so existing output stays unchanged.
+fn post_kind_marker(post_kind: &str) -> String {
+    if post_kind == "post" {
+        String::new()
+    } else {
+        format!(" {post_kind}")
+    }
+}
+
+fn route_marker(route: &crate::state::RouteRecord) -> String {
+    if route.state == crate::state::RouteState::Open && route.issues.is_empty() {
+        return String::new();
+    }
+    let issues: Vec<&str> = route.issues.iter().map(String::as_str).collect();
+    if issues.is_empty() {
+        format!("  route={}", route.state.as_str())
+    } else {
+        format!(
+            "  route={} issues={}",
+            route.state.as_str(),
+            issues.join(",")
+        )
+    }
 }
 
 fn limit_board_posts_preserving_stickies(
@@ -3002,8 +3678,11 @@ fn board_post_json(p: &crate::state::BoardPostRecord) -> serde_json::Value {
         "topic": p.topic,
         "body": p.body,
         "reply_to": p.reply_to,
+        "post_kind": p.post_kind,
         "sticky": p.sticky,
         "sticky_op_id": p.sticky_op_id,
+        "route_state": p.route.state.as_str(),
+        "issues": p.route.issues.iter().collect::<Vec<_>>(),
         "sent_ts": p.sent_ts,
     })
 }
@@ -3413,6 +4092,7 @@ fn cmd_preflight(
     Ok(if conflicts.is_empty() { 0 } else { 2 })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_begin(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
@@ -3420,6 +4100,7 @@ fn cmd_begin(
     paths: Vec<String>,
     note: Option<String>,
     ttl: Option<u32>,
+    announce: Option<String>,
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
@@ -3430,9 +4111,16 @@ fn cmd_begin(
     if paths.is_empty() {
         return Err(MoteError::Invalid("at least one path required".into()));
     }
+    // Validate the topic before anything is published, so a typo cannot leave
+    // a reservation open with no matching board claim.
+    let announce = announce
+        .as_deref()
+        .map(normalize_discussion_topic)
+        .transpose()?;
 
     // Step 1: reserve_open
     let rv_id = ids::new_reservation_id();
+    let paths_for_announce = paths.join(", ");
     let reserve = make_reserve_open(
         actor.clone(),
         rv_id.clone(),
@@ -3507,8 +4195,41 @@ fn cmd_begin(
 
     // Step 4: optional progress note (best effort).
     if let Some(text) = note {
-        let note_op = make_note(actor, id, "progress".into(), text, Timestamp::now());
+        let note_op = make_note(
+            actor.clone(),
+            id.clone(),
+            "progress".into(),
+            text,
+            Timestamp::now(),
+        );
         let _ = publish::publish_op(&store, &note_op);
+    }
+
+    // Step 5: optional claim announcement on the source topic, so board readers
+    // see the claim at the same moment `mote ready` stops offering the work.
+    if let Some(topic) = announce {
+        let post_id = ids::new_post_id();
+        let body = format!("claiming {id} for {rv_id} on {}", paths_for_announce);
+        let post_op = make_board_post(
+            actor,
+            post_id.clone(),
+            topic.clone(),
+            body,
+            None,
+            Timestamp::now(),
+        );
+        let post_name = publish::publish_op(&store, &post_op)?;
+        let state = reducer::replay_store(&store)?;
+        if state.was_accepted(post_name.as_str()) {
+            eprintln!("announced {post_id} in topic {topic}");
+        } else {
+            let reason = state
+                .rejection_reason(post_name.as_str())
+                .unwrap_or_else(|| "unknown".into());
+            // The claim itself succeeded; a failed announcement is reported but
+            // does not roll back reserved and claimed work.
+            eprintln!("announce rejected: {reason}");
+        }
     }
 
     println!("{rv_id}");
@@ -3721,6 +4442,187 @@ fn cmd_who_has(store_flag: Option<&Path>, json_mode: bool, path: String) -> Mote
     Ok(0)
 }
 
+/// Session id for this invocation, from `MOTE_SESSION`.
+fn env_session_id() -> Option<String> {
+    std::env::var("MOTE_SESSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn cmd_session(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    cmd: SessionCmd,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+
+    match cmd {
+        SessionCmd::Start {
+            as_actor,
+            ttl,
+            label,
+        } => {
+            // `--as` is the identity for this session; without it we fall back
+            // to normal resolution so `session start` still works in a repo
+            // that has only ever had one actor.
+            let actor = match as_actor.as_deref() {
+                Some(name) if !name.trim().is_empty() => name.trim().to_string(),
+                Some(_) => return Err(MoteError::Invalid("--as must be non-empty".into())),
+                None => store.resolve_actor(actor_flag)?,
+            };
+            if ttl == 0 {
+                return Err(MoteError::Invalid("--ttl must be > 0".into()));
+            }
+            let session_id = ids::new_session_id();
+            let op = make_session_start(
+                actor.clone(),
+                session_id.clone(),
+                ttl,
+                label.clone(),
+                Some(std::process::id()),
+                Timestamp::now(),
+            );
+            let name = publish::publish_op(&store, &op)?;
+            let state = reducer::replay_store(&store)?;
+            if !state.was_accepted(name.as_str()) {
+                let reason = state
+                    .rejection_reason(name.as_str())
+                    .unwrap_or_else(|| "unknown".into());
+                eprintln!("rejected: {reason}");
+                return Ok(2);
+            }
+            let lease_until = state
+                .sessions
+                .get(&session_id)
+                .map(|s| s.lease_until_ts.clone())
+                .unwrap_or_default();
+
+            if json_mode {
+                let v = serde_json::json!({
+                    "session_id": session_id,
+                    "actor": actor,
+                    "ttl_s": ttl,
+                    "label": label,
+                    "lease_until_ts": lease_until,
+                    "activate": format!("export MOTE_ACTOR={actor}; export MOTE_SESSION={session_id}"),
+                });
+                println!("{}", serde_json::to_string(&v)?);
+            } else {
+                // stdout is shell-evalable on purpose: a CLI cannot set its
+                // parent shell's environment, so the caller must apply it.
+                println!("export MOTE_ACTOR={actor}");
+                println!("export MOTE_SESSION={session_id}");
+                eprintln!("session {session_id} for {actor} until {lease_until}");
+                eprintln!("activate with: eval \"$(mote session start --as {actor})\"");
+            }
+            Ok(0)
+        }
+        SessionCmd::Renew { id, ttl } => {
+            let Some(session_id) = id.or_else(env_session_id) else {
+                return Err(MoteError::Invalid(
+                    "no session id (pass --id or set MOTE_SESSION)".into(),
+                ));
+            };
+            let state = reducer::replay_store(&store)?;
+            let Some(session) = state.sessions.get(&session_id) else {
+                return Err(MoteError::Invalid(format!("no such session {session_id}")));
+            };
+            let ttl = ttl.unwrap_or(session.ttl_s);
+            let op = make_session_start(
+                session.actor.clone(),
+                session_id.clone(),
+                ttl,
+                session.label.clone(),
+                Some(std::process::id()),
+                Timestamp::now(),
+            );
+            let name = publish::publish_op(&store, &op)?;
+            let code = verify_accept(&store, &name)?;
+            if code == 0 {
+                let state = reducer::replay_store(&store)?;
+                let lease_until = state
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.lease_until_ts.clone())
+                    .unwrap_or_default();
+                if json_mode {
+                    let v = serde_json::json!({
+                        "session_id": session_id,
+                        "ttl_s": ttl,
+                        "lease_until_ts": lease_until,
+                    });
+                    println!("{}", serde_json::to_string(&v)?);
+                } else {
+                    println!("{session_id}");
+                    eprintln!("renewed until {lease_until}");
+                }
+            }
+            Ok(code)
+        }
+        SessionCmd::List { all } => {
+            let state = reducer::replay_store(&store)?;
+            let now = ids::format_rfc3339(Timestamp::now());
+            let sessions: Vec<&crate::state::SessionRecord> = if all {
+                state.sessions.values().collect()
+            } else {
+                state.live_sessions(&now)
+            };
+            if json_mode {
+                let arr: Vec<_> = sessions.iter().map(|s| session_json(s, &now)).collect();
+                println!("{}", serde_json::to_string(&arr)?);
+            } else {
+                for s in &sessions {
+                    let live = if s.is_live(&now) { "live" } else { "ended" };
+                    let pid = s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+                    let label = s.label.as_deref().unwrap_or("");
+                    println!(
+                        "{}  {}  {live}  pid={pid}  until={}  {label}",
+                        s.session_id, s.actor, s.lease_until_ts
+                    );
+                }
+            }
+            Ok(0)
+        }
+        SessionCmd::End { id } => {
+            let Some(session_id) = id.or_else(env_session_id) else {
+                return Err(MoteError::Invalid(
+                    "no session id (pass one or set MOTE_SESSION)".into(),
+                ));
+            };
+            let state = reducer::replay_store(&store)?;
+            // End under the session's own actor so a session can be closed out
+            // from a shell whose MOTE_ACTOR has already been unset.
+            let actor = match state.sessions.get(&session_id) {
+                Some(session) => session.actor.clone(),
+                None => return Err(MoteError::Invalid(format!("no such session {session_id}"))),
+            };
+            let op = make_session_end(actor, session_id.clone(), Timestamp::now());
+            let name = publish::publish_op(&store, &op)?;
+            let code = verify_accept(&store, &name)?;
+            if code == 0 {
+                println!("{session_id}");
+            }
+            Ok(code)
+        }
+    }
+}
+
+fn session_json(s: &crate::state::SessionRecord, now_ts: &str) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": s.session_id,
+        "actor": s.actor,
+        "label": s.label,
+        "pid": s.pid,
+        "ttl_s": s.ttl_s,
+        "started_ts": s.started_ts,
+        "lease_until_ts": s.lease_until_ts,
+        "ended_ts": s.ended_ts,
+        "live": s.is_live(now_ts),
+    })
+}
+
 fn cmd_board(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
@@ -3802,6 +4704,190 @@ fn cmd_board(
     Ok(0)
 }
 
+/// One-shot "what is being touched right now?" view.
+///
+/// Replay-only by construction: sessions, reservations, claims, `doing` work
+/// and recent topics all come from the op log. The commit list is advisory
+/// context read from Git and is labelled as such, because it is the one thing
+/// a replay cannot know.
+fn cmd_in_flight(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    minutes: u64,
+    include_git: bool,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let actor = store.resolve_actor(actor_flag).ok();
+    let state = reducer::replay_store(&store)?;
+    let now = Timestamp::now();
+    let now_ts = ids::format_rfc3339(now);
+    let cutoff = now
+        .checked_sub(jiff::SignedDuration::from_secs(minutes as i64 * 60))
+        .map(ids::format_rfc3339)
+        .unwrap_or_default();
+
+    let sessions = state.live_sessions(&now_ts);
+    let reservations: Vec<_> = state
+        .reservations
+        .values()
+        .filter(|r| r.is_active(&now_ts))
+        .collect();
+    let doing: Vec<&Bead> = state
+        .live_beads()
+        .filter(|b| b.status == Status::Doing)
+        .collect();
+    let claims: Vec<&Bead> = state
+        .live_beads()
+        .filter(|b| b.claim.as_ref().is_some_and(|c| c.is_live(&now_ts)))
+        .collect();
+    let topics: Vec<_> = state
+        .board_topics_by_activity()
+        .into_iter()
+        .filter(|t| t.last_activity_ts.as_str() >= cutoff.as_str())
+        .collect();
+    let commits = if include_git {
+        recent_commits(store.root(), minutes)
+    } else {
+        Vec::new()
+    };
+
+    if json_mode {
+        let v = serde_json::json!({
+            "actor": actor,
+            "now_ts": now_ts,
+            "window_minutes": minutes,
+            "sessions": sessions.iter().map(|s| session_json(s, &now_ts)).collect::<Vec<_>>(),
+            "reservations": reservations.iter().map(|r| serde_json::json!({
+                "reservation_id": r.reservation_id, "actor": r.actor, "entity": r.entity,
+                "paths": r.live_paths(), "lease_until_ts": r.lease_until_ts,
+            })).collect::<Vec<_>>(),
+            "doing": doing.iter().map(|b| serde_json::json!({
+                "id": b.id, "title": b.title, "priority": b.priority,
+                "claimed_by": b.claim.as_ref().filter(|c| c.is_live(&now_ts)).map(|c| &c.claimed_by),
+                "lease_until_ts": b.claim.as_ref().filter(|c| c.is_live(&now_ts)).map(|c| &c.lease_until_ts),
+            })).collect::<Vec<_>>(),
+            "claims": claims.iter().map(|b| serde_json::json!({
+                "id": b.id, "status": b.status.as_str(),
+                "claimed_by": b.claim.as_ref().map(|c| &c.claimed_by),
+                "lease_until_ts": b.claim.as_ref().map(|c| &c.lease_until_ts),
+            })).collect::<Vec<_>>(),
+            "topics": topics.iter().map(|t| {
+                let mut v = topic_json(t);
+                if let Some(obj) = v.as_object_mut() {
+                    let unread = actor.as_deref().map(|a| {
+                        state.unread_board_posts_for(a, Some(&t.topic)).len()
+                    });
+                    obj.insert("unread".into(), serde_json::json!(unread));
+                }
+                v
+            }).collect::<Vec<_>>(),
+            "recent_commits_advisory": commits.iter().map(|(sha, subject)| serde_json::json!({
+                "sha": sha, "subject": subject,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string(&v)?);
+        return Ok(0);
+    }
+
+    if let Some(actor) = &actor {
+        println!("actor: {actor}  (window: last {minutes}m)");
+    } else {
+        println!("actor: unresolved  (window: last {minutes}m)");
+    }
+
+    println!("\nSESSIONS ({}):", sessions.len());
+    for s in &sessions {
+        let pid = s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        let label = s.label.as_deref().unwrap_or("");
+        println!(
+            "  {}  {}  pid={pid}  until={}  {label}",
+            s.actor, s.session_id, s.lease_until_ts
+        );
+    }
+    if sessions.is_empty() {
+        println!(
+            "  (none — concurrent sessions are indistinguishable without `mote session start`)"
+        );
+    }
+
+    println!("\nRESERVATIONS ({}):", reservations.len());
+    for r in &reservations {
+        println!(
+            "  {}  {}  by {}  {}  until {}",
+            r.live_paths().join(", "),
+            r.reservation_id,
+            r.actor,
+            r.entity,
+            r.lease_until_ts
+        );
+    }
+
+    println!("\nDOING ({}):", doing.len());
+    for b in &doing {
+        let holder = b
+            .claim
+            .as_ref()
+            .filter(|c| c.is_live(&now_ts))
+            .map(|c| c.claimed_by.as_str())
+            .unwrap_or("unclaimed");
+        println!("  {}  p{}  by {holder}  {}", b.id, b.priority, b.title);
+    }
+
+    println!("\nACTIVE TOPICS ({}):", topics.len());
+    for t in &topics {
+        let unread = actor
+            .as_deref()
+            .map(|a| state.unread_board_posts_for(a, Some(&t.topic)).len())
+            .unwrap_or(0);
+        println!(
+            "  {}  posts={}  unread={unread}  route={}  last={}",
+            t.topic,
+            t.post_count,
+            t.route.state.as_str(),
+            t.last_activity_ts
+        );
+    }
+
+    if include_git {
+        println!(
+            "\nRECENT COMMITS ({}) [advisory: read from git, not from replayed state]:",
+            commits.len()
+        );
+        for (sha, subject) in &commits {
+            println!("  {sha}  {subject}");
+        }
+    }
+    Ok(0)
+}
+
+/// Advisory only. Returns an empty list when Git is unavailable or the store is
+/// not inside a work tree; in-flight must never fail because of Git.
+fn recent_commits(store_root: &Path, minutes: u64) -> Vec<(String, String)> {
+    let repo_dir = store_root.parent().unwrap_or(store_root);
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("log")
+        .arg(format!("--since={minutes}.minutes.ago"))
+        .arg("--pretty=format:%h %s")
+        .arg("--max-count=20")
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (sha, subject) = line.split_once(' ')?;
+            Some((sha.to_string(), subject.to_string()))
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_events(
     actor_flag: Option<&str>,
@@ -3872,6 +4958,107 @@ fn verify_accept(store: &Store, name: &ids::OpName) -> MoteResult<i32> {
     }
 }
 
+/// Actor names that read as "nobody set this", which make every coordination
+/// primitive ambiguous the moment a second agent picks the same default.
+const SENTINEL_ACTORS: &[&str] = &[
+    "agent",
+    "assistant",
+    "bot",
+    "claude",
+    "codex",
+    "default",
+    "me",
+    "mote",
+    "unknown",
+    "unset",
+    "user",
+];
+
+/// Detect the identity collapse that makes reservations, claims, and co-sign
+/// rules meaningless: several concurrent sessions publishing under one name.
+///
+/// Each mote invocation is its own process, so "this actor published from more
+/// than one pid" is true of any ordinary sequence of commands and proves
+/// nothing. These checks use evidence that actually discriminates: overlapping
+/// live reservations held by one actor (impossible for a single session doing
+/// one thing at a time), concurrent session leases, and identity that comes
+/// from the checkout-wide file rather than the process.
+fn identity_warnings(store: &Store, actor: &ActorResolution) -> MoteResult<Vec<String>> {
+    let mut warnings = Vec::new();
+
+    if SENTINEL_ACTORS.contains(&actor.actor.to_ascii_lowercase().as_str()) {
+        warnings.push(format!(
+            "actor `{}` is a generic default; give each session its own name \
+             (`mote session start --as <name>`) so reservations and claims stay attributable",
+            actor.actor
+        ));
+    }
+
+    let state = reducer::replay_store(store)?;
+    let now_ts = ids::format_rfc3339(Timestamp::now());
+
+    // Same-actor reservations never conflict by design, so an overlap here is
+    // silent: two sessions are editing the same paths believing they are alone.
+    for (rv_a, rv_b, path) in overlapping_same_actor_reservations(&state, &actor.actor, &now_ts) {
+        warnings.push(format!(
+            "reservations {rv_a} and {rv_b} both hold `{path}` under actor `{}`; \
+             same-actor reservations do not conflict, so this overlap is invisible to \
+             `mote preflight` and `mote who-has`",
+            actor.actor
+        ));
+    }
+
+    let live_sessions = state.live_sessions(&now_ts);
+    let own_sessions = state.live_sessions_for(&actor.actor, &now_ts);
+    if own_sessions.len() > 1 {
+        warnings.push(format!(
+            "{} live session leases share actor `{}`; pass distinct `--as` names so board posts \
+             and reservations carry different bylines",
+            own_sessions.len(),
+            actor.actor
+        ));
+    }
+    if actor.source == "local" && live_sessions.len() > 1 {
+        warnings.push(format!(
+            "actor resolved from `.mote/local/actor` while {} sessions are live; \
+             that file is shared by every process in this checkout — prefer MOTE_ACTOR",
+            live_sessions.len()
+        ));
+    }
+
+    Ok(warnings)
+}
+
+/// Pairs of live reservations held by one actor that cover a common path.
+fn overlapping_same_actor_reservations(
+    state: &crate::state::State,
+    actor: &str,
+    now_ts: &str,
+) -> Vec<(String, String, String)> {
+    let live: Vec<&crate::state::ReservationState> = state
+        .reservations
+        .values()
+        .filter(|r| r.actor == actor && r.is_active(now_ts))
+        .collect();
+    let mut out = Vec::new();
+    for (i, a) in live.iter().enumerate() {
+        for b in live.iter().skip(i + 1) {
+            for pa in a.live_paths() {
+                for pb in b.live_paths() {
+                    if crate::paths::overlap(pa, pb) {
+                        out.push((
+                            a.reservation_id.clone(),
+                            b.reservation_id.clone(),
+                            pa.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn cmd_doctor(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
@@ -3914,11 +5101,20 @@ fn cmd_doctor(
     let fsck_clean = fsck_report.as_ref().is_some_and(|r| r.is_clean());
     let storage_ok = layout_ok && format_ok && fsck_error.is_none() && fsck_clean;
     let actor_ok = actor.is_some();
+
+    let identity_warnings = match (&actor, storage_ok) {
+        (Some(actor), true) => identity_warnings(&store, actor)?,
+        _ => Vec::new(),
+    };
+    // Warnings describe a coordination hazard, not a broken store, so they do
+    // not change the exit code — a shared identity still works, it is just
+    // ambiguous.
     let ok = storage_ok && actor_ok;
 
     if json_mode {
         let v = serde_json::json!({
             "ok": ok,
+            "warnings": identity_warnings,
             "store_root": store.root().display().to_string(),
             "layout": {
                 "root": root_ok,
@@ -3977,6 +5173,14 @@ fn cmd_doctor(
             }
             (_, Some(error)) => println!("fsck:   not run ({error})"),
             _ => println!("fsck:   not run"),
+        }
+        if identity_warnings.is_empty() {
+            println!("warn:   none");
+        } else {
+            println!("warn:   {} identity warning(s)", identity_warnings.len());
+            for warning in &identity_warnings {
+                println!("  - {warning}");
+            }
         }
     }
 

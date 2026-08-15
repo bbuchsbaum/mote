@@ -7,13 +7,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::op::{
-    BoardPostOp, BoardReadOp, BoardStickyOp, BoardTopicOp, ClaimOp, CloseOp, CreateOp, DeleteOp,
-    DepOp, MsgAckOp, MsgResolveOp, MsgSendOp, NoteOp, Op, PatchOp, RelOp, ReleaseOp,
-    ReserveCloseOp, ReserveOpenOp, ScalarSet, Status, TagOp, VALID_REPLY_KINDS,
-    validate_idempotency_key, validate_msg_kind, validate_note_kind,
+    BoardPostOp, BoardReadOp, BoardRouteOp, BoardStickyOp, BoardTopicOp, ClaimOp, CloseOp,
+    CreateOp, DeleteOp, DepOp, MsgAckOp, MsgResolveOp, MsgSendOp, NoteOp, Op, PatchOp, RelOp,
+    ReleaseOp, ReserveCloseOp, ReserveOpenOp, ScalarSet, SessionEndOp, SessionStartOp, Status,
+    TagOp, VALID_POST_KINDS, VALID_REPLY_KINDS, VALID_ROUTE_STATES, validate_idempotency_key,
+    validate_msg_kind, validate_note_kind, validate_post_kind, validate_route_state,
 };
 use crate::repo::Store;
-use crate::state::{Bead, HistoryEntry, RequestState, State};
+use crate::state::{Bead, HistoryEntry, RequestState, RouteState, State};
 
 /// Replay a sequence of ops, in the given filename order, into a fresh State.
 pub fn replay<I>(ops: I) -> State
@@ -115,6 +116,9 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
         Op::BoardRead(o) => apply_board_read(state, op_id, kind, &actor, &ts, o),
         Op::BoardTopic(o) => apply_board_topic(state, op_id, kind, &actor, &ts, o),
         Op::BoardSticky(o) => apply_board_sticky(state, op_id, kind, &actor, &ts, o),
+        Op::BoardRoute(o) => apply_board_route(state, op_id, kind, &actor, &ts, o),
+        Op::SessionStart(o) => apply_session_start(state, op_id, kind, &actor, &ts, o),
+        Op::SessionEnd(o) => apply_session_end(state, op_id, kind, &actor, &ts, o),
         Op::ReserveOpen(o) => apply_reserve_open(state, op_id, kind, &actor, &ts, o),
         Op::ReserveClose(o) => apply_reserve_close(state, op_id, kind, &actor, &ts, o),
     }
@@ -1282,10 +1286,26 @@ fn apply_board_post(
         topic,
         body,
         reply_to,
+        post_kind,
         ..
     } = o;
     let topic = topic.trim().to_string();
+    let post_kind = post_kind.unwrap_or_else(|| "post".to_string());
 
+    if !validate_post_kind(&post_kind) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!(
+                "invalid post_kind `{post_kind}` (expected one of: {})",
+                VALID_POST_KINDS.join(" | ")
+            ),
+        );
+        return;
+    }
     if state.board_posts.contains_key(&post_id) {
         reject_orphan(
             state,
@@ -1352,6 +1372,13 @@ fn apply_board_post(
         topic_record.post_count += 1;
         topic_record.last_activity_ts = ts.to_string();
         topic_record.last_activity_op_id = op_id.to_string();
+        match post_kind.as_str() {
+            // The newest summary wins: it is a pointer to current state, not a
+            // log, so readers never have to pick between two of them.
+            "summary" => topic_record.summary_post_id = Some(post_id.clone()),
+            "decision" => topic_record.decision_count += 1,
+            _ => {}
+        }
     }
 
     state
@@ -1365,8 +1392,10 @@ fn apply_board_post(
             topic,
             body,
             reply_to,
+            post_kind,
             sticky: false,
             sticky_op_id: None,
+            route: crate::state::RouteRecord::default(),
             sent_ts: ts.to_string(),
             sent_op_id: op_id.to_string(),
         },
@@ -1433,6 +1462,9 @@ fn apply_board_topic(
                     last_activity_op_id: op_id.to_string(),
                     post_count: 0,
                     sticky_count: 0,
+                    decision_count: 0,
+                    summary_post_id: None,
+                    route: crate::state::RouteRecord::default(),
                 },
             );
         }
@@ -1573,7 +1605,329 @@ fn ensure_topic(state: &mut State, topic: &str, actor: &str, ts: &str, op_id: &s
             last_activity_op_id: op_id.to_string(),
             post_count: 0,
             sticky_count: 0,
+            decision_count: 0,
+            summary_post_id: None,
+            route: crate::state::RouteRecord::default(),
         });
+}
+
+fn apply_board_route(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: BoardRouteOp,
+) {
+    let BoardRouteOp {
+        post_id,
+        topic,
+        route_state,
+        entity,
+        ..
+    } = o;
+    let topic = topic.map(|t| t.trim().to_string());
+
+    if !validate_route_state(&route_state) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!(
+                "invalid route_state `{route_state}` (expected one of: {})",
+                VALID_ROUTE_STATES.join(" | ")
+            ),
+        );
+        return;
+    }
+    let Some(parsed_state) = RouteState::parse(&route_state) else {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("invalid route_state `{route_state}`"),
+        );
+        return;
+    };
+
+    match (post_id.as_deref(), topic.as_deref()) {
+        (Some(_), Some(_)) => {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "board_route targets either a post_id or a topic, not both".into(),
+            );
+            return;
+        }
+        (None, None) => {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "board_route requires a post_id or a topic".into(),
+            );
+            return;
+        }
+        _ => {}
+    }
+
+    // `routed` is the only state that carries a bead, and the bead must be a
+    // live tracker entity — a link to nothing would defeat the point of routing.
+    match (parsed_state, entity.as_deref()) {
+        (RouteState::Routed, None) => {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "board_route route_state=routed requires an entity".into(),
+            );
+            return;
+        }
+        (state_kind, Some(_)) if state_kind != RouteState::Routed => {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("board_route route_state={route_state} must not carry an entity"),
+            );
+            return;
+        }
+        _ => {}
+    }
+    if let Some(entity) = entity.as_deref() {
+        match state.beads.get(entity) {
+            Some(bead) if !bead.is_deleted() => {}
+            Some(_) => {
+                reject_orphan(
+                    state,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    format!("route target {entity} is deleted"),
+                );
+                return;
+            }
+            None => {
+                reject_orphan(
+                    state,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    format!("route target {entity} does not exist"),
+                );
+                return;
+            }
+        }
+    }
+
+    // Resolve the target, and remember the owning topic so topic activity
+    // reflects post-level routing too.
+    let (route, activity_topic) = if let Some(post_id) = post_id.as_deref() {
+        let Some(post) = state.board_posts.get_mut(post_id) else {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("no such board post {post_id}"),
+            );
+            return;
+        };
+        let owning_topic = post.topic.clone();
+        (&mut post.route, Some(owning_topic))
+    } else {
+        let topic_name = topic.as_deref().expect("checked above");
+        if topic_name.is_empty() {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "board_route topic must be non-empty".into(),
+            );
+            return;
+        }
+        let Some(topic_record) = state.board_topics.get_mut(topic_name) else {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("no such discussion topic {topic_name}"),
+            );
+            return;
+        };
+        (&mut topic_record.route, None)
+    };
+
+    route.state = parsed_state;
+    // Links accumulate: a discussion can spawn several beads, and re-routing
+    // to a second bead must not erase the first.
+    if let Some(entity) = entity {
+        route.issues.insert(entity);
+    }
+    route.updated_by = Some(actor.to_string());
+    route.updated_ts = Some(ts.to_string());
+    route.updated_op_id = Some(op_id.to_string());
+
+    if let Some(topic_name) = activity_topic {
+        if let Some(topic_record) = state.board_topics.get_mut(&topic_name) {
+            topic_record.last_activity_ts = ts.to_string();
+            topic_record.last_activity_op_id = op_id.to_string();
+        }
+    } else if let Some(topic_name) = topic.as_deref() {
+        if let Some(topic_record) = state.board_topics.get_mut(topic_name) {
+            topic_record.last_activity_ts = ts.to_string();
+            topic_record.last_activity_op_id = op_id.to_string();
+        }
+    }
+
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_session_start(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: SessionStartOp,
+) {
+    let SessionStartOp {
+        session_id,
+        ttl_s,
+        label,
+        pid,
+        ..
+    } = o;
+
+    if session_id.trim().is_empty() {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "session_id must be non-empty".into(),
+        );
+        return;
+    }
+    if ttl_s == 0 {
+        reject_orphan(state, op_id, kind, actor, ts, "ttl_s must be > 0".into());
+        return;
+    }
+    let lease_until_ts = match compute_lease_until(ts, ttl_s) {
+        Ok(s) => s,
+        Err(e) => {
+            reject_orphan(state, op_id, kind, actor, ts, format!("bad ttl: {e}"));
+            return;
+        }
+    };
+
+    // A repeated session_start for the same id is a renewal, so a long-running
+    // session can extend its lease without minting a new identity.
+    let existing_owner = state.sessions.get(&session_id).map(|s| s.actor.clone());
+    if let Some(owner) = existing_owner {
+        if owner != actor {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("session {session_id} belongs to {owner}, not {actor}"),
+            );
+            return;
+        }
+        let existing = state.sessions.get_mut(&session_id).expect("checked above");
+        existing.ttl_s = ttl_s;
+        existing.lease_until_ts = lease_until_ts;
+        existing.ended_ts = None;
+        existing.ended_op_id = None;
+        if label.is_some() {
+            existing.label = label;
+        }
+        if pid.is_some() {
+            existing.pid = pid;
+        }
+        state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+        return;
+    }
+
+    state.sessions.insert(
+        session_id.clone(),
+        crate::state::SessionRecord {
+            session_id,
+            actor: actor.to_string(),
+            label,
+            pid,
+            ttl_s,
+            started_ts: ts.to_string(),
+            started_op_id: op_id.to_string(),
+            lease_until_ts,
+            ended_ts: None,
+            ended_op_id: None,
+        },
+    );
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_session_end(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: SessionEndOp,
+) {
+    let SessionEndOp { session_id, .. } = o;
+
+    let Some(owner) = state.sessions.get(&session_id).map(|s| s.actor.clone()) else {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("no such session {session_id}"),
+        );
+        return;
+    };
+    if owner != actor {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("session {session_id} belongs to {owner}, not {actor}"),
+        );
+        return;
+    }
+    let session = state.sessions.get_mut(&session_id).expect("checked above");
+    if session.ended_ts.is_none() {
+        session.ended_ts = Some(ts.to_string());
+        session.ended_op_id = Some(op_id.to_string());
+    }
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
 }
 
 fn apply_reserve_open(

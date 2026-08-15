@@ -21,8 +21,14 @@ use crate::repo::Store;
 use crate::state::State;
 
 pub const EVENT_SCHEMA: &str = "mote.event.v1";
-pub const VALID_EVENT_CATEGORIES: &[&str] =
-    &["issue", "claim", "reservation", "message", "discussion"];
+pub const VALID_EVENT_CATEGORIES: &[&str] = &[
+    "issue",
+    "claim",
+    "reservation",
+    "message",
+    "discussion",
+    "session",
+];
 
 /// Stable JSONL envelope emitted by `mote events --json` and follow-mode
 /// projections such as `mote inbox --follow --json`.
@@ -377,9 +383,12 @@ fn event_category(op: &Op) -> &'static str {
     match op {
         Op::Claim(_) | Op::Release(_) => "claim",
         Op::MsgSend(_) | Op::MsgAck(_) | Op::MsgResolve(_) => "message",
-        Op::BoardPost(_) | Op::BoardRead(_) | Op::BoardTopic(_) | Op::BoardSticky(_) => {
-            "discussion"
-        }
+        Op::BoardPost(_)
+        | Op::BoardRead(_)
+        | Op::BoardTopic(_)
+        | Op::BoardSticky(_)
+        | Op::BoardRoute(_) => "discussion",
+        Op::SessionStart(_) | Op::SessionEnd(_) => "session",
         Op::ReserveOpen(_) | Op::ReserveClose(_) => "reservation",
         _ => "issue",
     }
@@ -405,11 +414,19 @@ fn event_type(op: &Op) -> &'static str {
         Op::MsgSend(_) => "message.sent",
         Op::MsgAck(_) => "message.acknowledged",
         Op::MsgResolve(_) => "message.resolved",
+        Op::BoardPost(o) if o.post_kind.as_deref() == Some("decision") => "discussion.decided",
+        Op::BoardPost(o) if o.post_kind.as_deref() == Some("summary") => "discussion.summarized",
         Op::BoardPost(_) => "discussion.posted",
         Op::BoardRead(_) => "discussion.read",
         Op::BoardTopic(_) => "discussion.topic_created",
         Op::BoardSticky(o) if o.sticky => "discussion.post_stuck",
         Op::BoardSticky(_) => "discussion.post_unstuck",
+        Op::BoardRoute(o) if o.route_state == "routed" => "discussion.routed",
+        Op::BoardRoute(o) if o.route_state == "resolved" => "discussion.resolved",
+        Op::BoardRoute(o) if o.route_state == "needs_bead" => "discussion.needs_bead",
+        Op::BoardRoute(_) => "discussion.route_cleared",
+        Op::SessionStart(_) => "session.started",
+        Op::SessionEnd(_) => "session.ended",
         Op::ReserveOpen(_) => "reservation.opened",
         Op::ReserveClose(_) => "reservation.closed",
     }
