@@ -61,6 +61,27 @@ fn post(td: &TempDir, actor: &str, topic: &str, body: &str) -> String {
     )
 }
 
+/// Pull a value out of a `session start` activation line. The value is
+/// shell-quoted, because the line is meant to be `eval`ed.
+fn export_value(stdout: &str, var: &str) -> String {
+    let prefix = format!("export {var}=");
+    let raw = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no `{prefix}` line in:\n{stdout}"));
+    assert!(
+        raw.starts_with('\'') && raw.ends_with('\''),
+        "{var} value is not shell-quoted: {raw}"
+    );
+    raw[1..raw.len() - 1].replace(r"'\''", "'")
+}
+
+fn start_session(td: &TempDir, actor: &str, extra: &[&str]) -> String {
+    let mut args = vec!["session", "start", "--as", actor];
+    args.extend_from_slice(extra);
+    export_value(&run(td, actor, &args), "MOTE_SESSION")
+}
+
 // ---------------------------------------------------------------- routing
 
 #[test]
@@ -380,15 +401,8 @@ fn session_start_prints_an_activation_line_and_leaves_a_visible_lease() {
         &["session", "start", "--as", "session-a", "--label", "triage"],
     );
     // The CLI cannot mutate its parent shell, so stdout must be evalable.
-    assert!(
-        out.contains("export MOTE_ACTOR=session-a"),
-        "stdout:\n{out}"
-    );
-    let session_id = out
-        .lines()
-        .find_map(|l| l.strip_prefix("export MOTE_SESSION="))
-        .unwrap()
-        .to_string();
+    assert_eq!(export_value(&out, "MOTE_ACTOR"), "session-a");
+    let session_id = export_value(&out, "MOTE_SESSION");
 
     let state = reducer::replay_store(&store).unwrap();
     let record = state.sessions.get(&session_id).unwrap();
@@ -413,12 +427,7 @@ fn session_start_prints_an_activation_line_and_leaves_a_visible_lease() {
 fn session_renew_extends_the_lease_without_minting_a_new_identity() {
     let td = TempDir::new().unwrap();
     let store = init_store(&td);
-    let out = run(&td, "a", &["session", "start", "--as", "a", "--ttl", "60"]);
-    let session_id = out
-        .lines()
-        .find_map(|l| l.strip_prefix("export MOTE_SESSION="))
-        .unwrap()
-        .to_string();
+    let session_id = start_session(&td, "a", &["--ttl", "60"]);
     let before = reducer::replay_store(&store)
         .unwrap()
         .sessions
@@ -441,15 +450,32 @@ fn session_renew_extends_the_lease_without_minting_a_new_identity() {
 fn a_session_cannot_be_renewed_or_ended_under_another_actor() {
     let td = TempDir::new().unwrap();
     let store = init_store(&td);
-    let out = run(&td, "a", &["session", "start", "--as", "a"]);
-    let session_id = out
-        .lines()
-        .find_map(|l| l.strip_prefix("export MOTE_SESSION="))
-        .unwrap()
-        .to_string();
+    let session_id = start_session(&td, "a", &[]);
 
-    // Publishing a session_start for someone else's id must be rejected by the
-    // reducer, not silently taken over.
+    // The commands must publish as the invoker, so the reducer's ownership
+    // check is reachable rather than bypassed by an op that claims to be `a`.
+    for args in [
+        vec!["session", "renew", "--id", session_id.as_str()],
+        vec!["session", "end", session_id.as_str()],
+    ] {
+        let out = run_full(&td, "b", &args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`mote {}` as a non-owner should be rejected: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("belongs to a, not b"), "stderr:\n{stderr}");
+    }
+
+    let state = reducer::replay_store(&store).unwrap();
+    let record = state.sessions.get(&session_id).unwrap();
+    assert_eq!(record.actor, "a");
+    assert!(record.ended_ts.is_none(), "a non-owner ended the session");
+
+    // Publishing the op directly is rejected for the same reason.
     let op = mote::op::make_session_start(
         "b".into(),
         session_id.clone(),
@@ -462,6 +488,88 @@ fn a_session_cannot_be_renewed_or_ended_under_another_actor() {
     let state = reducer::replay_store(&store).unwrap();
     assert!(!state.was_accepted(name.as_str()));
     assert_eq!(state.sessions.get(&session_id).unwrap().actor, "a");
+}
+
+#[test]
+fn ending_a_session_is_terminal() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+    let session_id = start_session(&td, "a", &[]);
+    run(&td, "a", &["session", "end", &session_id]);
+
+    // Renewing an ended session would make `session end` a suggestion, and
+    // would let a stale lease reappear after the process behind it is gone.
+    let out = run_full(&td, "a", &["session", "renew", "--id", &session_id]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("has ended"), "stderr:\n{stderr}");
+
+    let state = reducer::replay_store(&store).unwrap();
+    let record = state.sessions.get(&session_id).unwrap();
+    assert!(record.ended_ts.is_some(), "ended session was resurrected");
+    assert!(
+        state
+            .live_sessions("2000-01-01T00:00:00.000000Z")
+            .is_empty()
+    );
+}
+
+/// Apply an activation block exactly as the documented `eval "$(...)"` flow
+/// does, and report the resulting `MOTE_ACTOR`. The block is piped through
+/// stdin so this harness cannot expand it before the shell evaluates it.
+fn eval_activation(cwd: &std::path::Path, activation: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(r#"eval "$(cat)"; printf '%s' "$MOTE_ACTOR""#)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(activation.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn session_activation_lines_survive_the_shell_verbatim() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+
+    // A name with a space must not truncate on eval: the shell would then
+    // publish under a different identity than the lease records, which is the
+    // exact divergence session leases exist to prevent.
+    let spaced = "claude session 2";
+    let out = run(&td, "x", &["session", "start", "--as", spaced]);
+    assert_eq!(export_value(&out, "MOTE_ACTOR"), spaced);
+    assert_eq!(
+        eval_activation(td.path(), &out),
+        spaced,
+        "eval of the activation line changed the identity"
+    );
+
+    // Shell metacharacters in a persisted actor name must not execute. That
+    // file travels with a checkout, so it is not trusted input.
+    let hostile = "alice$(touch pwned)";
+    let out = run(&td, hostile, &["session", "start"]);
+    assert_eq!(eval_activation(td.path(), &out), hostile);
+    assert!(
+        !td.path().join("pwned").exists(),
+        "activation line executed embedded shell"
+    );
+    assert!(
+        reducer::replay_store(&store)
+            .unwrap()
+            .sessions
+            .values()
+            .any(|s| s.actor == hostile)
+    );
 }
 
 #[test]
@@ -613,6 +721,106 @@ fn in_flight_answers_the_collision_question_in_one_invocation() {
     for section in ["SESSIONS", "RESERVATIONS", "DOING", "ACTIVE TOPICS"] {
         assert!(human.contains(section), "missing {section} in:\n{human}");
     }
+}
+
+#[test]
+fn in_flight_survives_an_absurd_window() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    post(&td, "alice", "roadmap", "opening");
+
+    // Saturate rather than overflow: a huge window means "everything".
+    let json = run(
+        &td,
+        "alice",
+        &[
+            "--json",
+            "in-flight",
+            "--no-git",
+            "--minutes",
+            "200000000000000000",
+        ],
+    );
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["topics"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn summary_rejects_two_sources_of_text_like_every_other_post_command() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    post(&td, "alice", "roadmap", "opening");
+
+    let out = run_full(
+        &td,
+        "alice",
+        &[
+            "discuss",
+            "summary",
+            "--topic",
+            "roadmap",
+            "--body",
+            "FROM BODY",
+            "FROM POSITIONAL",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "one of the two texts was dropped"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not both"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn doctor_reports_one_finding_per_colliding_reservation_pair() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let bead = run(&td, "shared", &["new", "shared work"]);
+    // A multi-path reservation against a directory reservation overlaps twice,
+    // but it is one collision, not two.
+    run(
+        &td,
+        "shared",
+        &["reserve", "--issue", &bead, "src/a.rs", "src/b.rs"],
+    );
+    run(&td, "shared", &["reserve", "--issue", &bead, "src/"]);
+
+    let json = run(&td, "shared", &["--json", "doctor"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let overlaps: Vec<_> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w.as_str().unwrap().contains("both hold"))
+        .collect();
+    assert_eq!(overlaps.len(), 1, "warnings: {:?}", v["warnings"]);
+}
+
+#[test]
+fn show_reports_the_discussion_a_bead_came_from() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let post_id = post(&td, "alice", "roadmap", "split the parser");
+    let bead = run(&td, "alice", &["discuss", "promote", &post_id]);
+
+    let human = run(&td, "alice", &["show", &bead]);
+    assert!(human.contains(&post_id), "show output:\n{human}");
+    assert!(
+        human.contains("promoted from discussion post"),
+        "promote left no note in history:\n{human}"
+    );
+
+    let json = run(&td, "alice", &["--json", "show", &bead]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["discussion_sources"]["posts"][0]["post_id"], post_id);
+    assert_eq!(v["discussion_sources"]["posts"][0]["topic"], "roadmap");
+
+    // Promoting again is allowed but says what already exists.
+    let again = run_full(&td, "alice", &["discuss", "promote", &post_id]);
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(stderr.contains("already routed to"), "stderr:\n{stderr}");
 }
 
 #[test]

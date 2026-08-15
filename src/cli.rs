@@ -1886,6 +1886,18 @@ fn clock_for(bead: &Bead, field: &str) -> MoteResult<String> {
         .ok_or_else(|| MoteError::Invalid(format!("bead has no clock for `{field}`")))
 }
 
+/// Discussion posts and topics routed to this bead, so `mote show` answers
+/// "where did this work come from?" without a board lookup.
+fn discussion_sources_json(state: &crate::state::State, id: &str) -> serde_json::Value {
+    let (posts, topics) = state.discussion_sources_for(id);
+    serde_json::json!({
+        "posts": posts.iter().map(|p| serde_json::json!({
+            "post_id": p.post_id, "topic": p.topic, "from": p.from,
+        })).collect::<Vec<_>>(),
+        "topics": topics.iter().map(|t| &t.topic).collect::<Vec<_>>(),
+    })
+}
+
 fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let state = reducer::replay_store(&store)?;
@@ -1910,6 +1922,7 @@ fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResul
             "notes": bead.notes.iter().map(|n| serde_json::json!({
                 "op_id": n.op_id, "kind": n.note_kind, "actor": n.actor, "ts": n.ts, "text": n.text,
             })).collect::<Vec<_>>(),
+            "discussion_sources": discussion_sources_json(&state, &id),
             "ready": state.is_ready(bead),
             "deleted_at": bead.deleted_at_ts,
             "created_at": bead.created_at_ts,
@@ -1967,6 +1980,20 @@ fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResul
                 .iter()
                 .map(|(b, k)| format!("{} ({k})", b.id))
                 .collect();
+            println!("{}", parts.join(", "));
+        }
+        let (source_posts, source_topics) = state.discussion_sources_for(&id);
+        if !source_posts.is_empty() || !source_topics.is_empty() {
+            print!("board:    ");
+            let mut parts: Vec<String> = source_topics
+                .iter()
+                .map(|t| format!("topic {}", t.topic))
+                .collect();
+            parts.extend(
+                source_posts
+                    .iter()
+                    .map(|p| format!("{} ({})", p.post_id, p.topic)),
+            );
             println!("{}", parts.join(", "));
         }
         if !bead.notes.is_empty() {
@@ -2960,14 +2987,12 @@ fn cmd_discuss(
         }
         DiscussCmd::Summary { topic, body, text } => {
             let topic = normalize_discussion_topic(&topic)?;
-            let Some(text) = text.or(body) else {
+            if text.is_none() && body.is_none() {
                 // No text: read the pinned summary rather than write one.
                 let state = reducer::replay_store(&store)?;
                 return print_topic_summary(&state, &topic, json_mode);
-            };
-            if text.trim().is_empty() {
-                return Err(MoteError::Invalid("summary text must be non-empty".into()));
             }
+            let text = require_post_text(text, body, "summary")?;
             let actor = store.resolve_actor(actor_flag)?;
             let (code, post_id) = publish_discussion_post_id(
                 &store,
@@ -3328,6 +3353,16 @@ fn cmd_discuss_promote(
             return Err(MoteError::Invalid(format!("priority {p} out of 0..=3")));
         }
     }
+    // Promotion is deliberately not idempotent — one post can legitimately
+    // spawn several beads — but a second promote is usually a mistake, so say
+    // what already exists rather than silently adding a duplicate.
+    if !post.route.issues.is_empty() {
+        let existing: Vec<&str> = post.route.issues.iter().map(String::as_str).collect();
+        eprintln!(
+            "note: {post_id} is already routed to {}; promoting again creates another bead",
+            existing.join(", ")
+        );
+    }
 
     // The post already carries the argument; the bead only needs a handle on it
     // plus a pointer back, so the board never becomes a second task tracker.
@@ -3399,6 +3434,17 @@ fn cmd_discuss_promote(
         Timestamp::now(),
     );
     names.push(publish::publish_op(store, &route)?);
+
+    // Mirror the provenance as a note, matching `discuss route`, so the link is
+    // in the bead's history and not only in its body text.
+    let note = make_note(
+        actor.clone(),
+        bead_id.clone(),
+        "decision".into(),
+        format!("promoted from discussion post {post_id} in topic {topic}"),
+        Timestamp::now(),
+    );
+    names.push(publish::publish_op(store, &note)?);
 
     let state = reducer::replay_store(store)?;
     for n in &names {
@@ -4442,6 +4488,13 @@ fn cmd_who_has(store_flag: Option<&Path>, json_mode: bool, path: String) -> Mote
     Ok(0)
 }
 
+/// Wrap a value in single quotes for safe `eval` in a POSIX shell. The actor
+/// name can come from `.mote/local/actor`, which travels with a checkout, so
+/// this output is not trusted input even though it is normally self-authored.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
 /// Session id for this invocation, from `MOTE_SESSION`.
 fn env_session_id() -> Option<String> {
     std::env::var("MOTE_SESSION")
@@ -4468,9 +4521,8 @@ fn cmd_session(
             // to normal resolution so `session start` still works in a repo
             // that has only ever had one actor.
             let actor = match as_actor.as_deref() {
-                Some(name) if !name.trim().is_empty() => name.trim().to_string(),
-                Some(_) => return Err(MoteError::Invalid("--as must be non-empty".into())),
-                None => store.resolve_actor(actor_flag)?,
+                Some(name) => normalize_actor(name)?,
+                None => normalize_actor(&store.resolve_actor(actor_flag)?)?,
             };
             if ttl == 0 {
                 return Err(MoteError::Invalid("--ttl must be > 0".into()));
@@ -4499,6 +4551,15 @@ fn cmd_session(
                 .map(|s| s.lease_until_ts.clone())
                 .unwrap_or_default();
 
+            // This output is meant to be `eval`ed, so every interpolated value
+            // must survive the shell verbatim. An actor name containing a space
+            // would otherwise silently truncate the identity — the exact
+            // divergence this command exists to prevent.
+            let activate = format!(
+                "export MOTE_ACTOR={}; export MOTE_SESSION={}",
+                shell_quote(&actor),
+                shell_quote(&session_id)
+            );
             if json_mode {
                 let v = serde_json::json!({
                     "session_id": session_id,
@@ -4506,16 +4567,19 @@ fn cmd_session(
                     "ttl_s": ttl,
                     "label": label,
                     "lease_until_ts": lease_until,
-                    "activate": format!("export MOTE_ACTOR={actor}; export MOTE_SESSION={session_id}"),
+                    "activate": activate,
                 });
                 println!("{}", serde_json::to_string(&v)?);
             } else {
                 // stdout is shell-evalable on purpose: a CLI cannot set its
                 // parent shell's environment, so the caller must apply it.
-                println!("export MOTE_ACTOR={actor}");
-                println!("export MOTE_SESSION={session_id}");
+                println!("export MOTE_ACTOR={}", shell_quote(&actor));
+                println!("export MOTE_SESSION={}", shell_quote(&session_id));
                 eprintln!("session {session_id} for {actor} until {lease_until}");
-                eprintln!("activate with: eval \"$(mote session start --as {actor})\"");
+                eprintln!(
+                    "activate with: eval \"$(mote session start --as {})\"",
+                    shell_quote(&actor)
+                );
             }
             Ok(0)
         }
@@ -4525,13 +4589,17 @@ fn cmd_session(
                     "no session id (pass --id or set MOTE_SESSION)".into(),
                 ));
             };
+            // Publish as the invoker, never as the recorded owner: forging the
+            // op actor would misattribute the action and make the reducer's
+            // ownership check unreachable.
+            let actor = store.resolve_actor(actor_flag)?;
             let state = reducer::replay_store(&store)?;
             let Some(session) = state.sessions.get(&session_id) else {
                 return Err(MoteError::Invalid(format!("no such session {session_id}")));
             };
             let ttl = ttl.unwrap_or(session.ttl_s);
             let op = make_session_start(
-                session.actor.clone(),
+                actor,
                 session_id.clone(),
                 ttl,
                 session.label.clone(),
@@ -4591,13 +4659,14 @@ fn cmd_session(
                     "no session id (pass one or set MOTE_SESSION)".into(),
                 ));
             };
+            // As with renew: publish under the invoker so the op log records
+            // who actually ended the session. A mismatch is rejected by the
+            // reducer; pass `--actor` when the owning identity is not in scope.
+            let actor = store.resolve_actor(actor_flag)?;
             let state = reducer::replay_store(&store)?;
-            // End under the session's own actor so a session can be closed out
-            // from a shell whose MOTE_ACTOR has already been unset.
-            let actor = match state.sessions.get(&session_id) {
-                Some(session) => session.actor.clone(),
-                None => return Err(MoteError::Invalid(format!("no such session {session_id}"))),
-            };
+            if !state.sessions.contains_key(&session_id) {
+                return Err(MoteError::Invalid(format!("no such session {session_id}")));
+            }
             let op = make_session_end(actor, session_id.clone(), Timestamp::now());
             let name = publish::publish_op(&store, &op)?;
             let code = verify_accept(&store, &name)?;
@@ -4722,8 +4791,11 @@ fn cmd_in_flight(
     let state = reducer::replay_store(&store)?;
     let now = Timestamp::now();
     let now_ts = ids::format_rfc3339(now);
+    // Saturate rather than wrap: an absurd `--minutes` should mean "everything",
+    // not an arithmetic panic.
+    let window_secs = minutes.saturating_mul(60).min(i64::MAX as u64) as i64;
     let cutoff = now
-        .checked_sub(jiff::SignedDuration::from_secs(minutes as i64 * 60))
+        .checked_sub(jiff::SignedDuration::from_secs(window_secs))
         .map(ids::format_rfc3339)
         .unwrap_or_default();
 
@@ -5030,6 +5102,8 @@ fn identity_warnings(store: &Store, actor: &ActorResolution) -> MoteResult<Vec<S
 }
 
 /// Pairs of live reservations held by one actor that cover a common path.
+/// One pair yields one finding regardless of how many of their paths overlap —
+/// the reservation pair is the problem, not each path.
 fn overlapping_same_actor_reservations(
     state: &crate::state::State,
     actor: &str,
@@ -5043,16 +5117,16 @@ fn overlapping_same_actor_reservations(
     let mut out = Vec::new();
     for (i, a) in live.iter().enumerate() {
         for b in live.iter().skip(i + 1) {
-            for pa in a.live_paths() {
-                for pb in b.live_paths() {
-                    if crate::paths::overlap(pa, pb) {
-                        out.push((
-                            a.reservation_id.clone(),
-                            b.reservation_id.clone(),
-                            pa.to_string(),
-                        ));
-                    }
-                }
+            if let Some(path) = a.live_paths().into_iter().find(|pa| {
+                b.live_paths()
+                    .iter()
+                    .any(|pb| crate::paths::overlap(pa, pb))
+            }) {
+                out.push((
+                    a.reservation_id.clone(),
+                    b.reservation_id.clone(),
+                    path.to_string(),
+                ));
             }
         }
     }

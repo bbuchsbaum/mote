@@ -50,7 +50,13 @@ mote session end              # when the stint is over
 
 `session start` prints `export MOTE_ACTOR=...` and `export MOTE_SESSION=...` on
 stdout because a CLI cannot set its parent shell's environment; `eval` applies
-them. Everything you publish afterwards carries that per-session byline.
+them. The values are shell-quoted, so names with spaces survive intact.
+Everything you publish afterwards carries that per-session byline.
+
+`renew` and `end` publish under the invoking actor, so a session can only be
+renewed or ended by the identity that owns it — pass `--actor <name>` if that
+identity is no longer in your environment. Ending is terminal: an ended session
+cannot be renewed, so start a new one.
 
 This matters because same-actor reservations never conflict. Two sessions
 sharing one actor name can hold the same paths with neither `mote preflight`

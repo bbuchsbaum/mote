@@ -337,7 +337,12 @@ eval "$(mote session start --as agent-a --label 'auth refactor')"
 ```
 
 A CLI cannot set its parent shell's environment, so `session start` prints the
-`export` lines on stdout for you to `eval`; the diagnostics go to stderr.
+`export` lines on stdout for you to `eval`; the diagnostics go to stderr. The
+values are shell-quoted, so an actor name containing spaces or metacharacters
+activates verbatim instead of truncating or executing.
+
+`session renew` and `session end` publish under the invoking actor, so only the
+owning identity can renew or end a lease. Ending is terminal.
 
 Sharing one identity across concurrent sessions is not an error, but it is
 lossy: same-actor reservations never conflict, so two sessions can hold the

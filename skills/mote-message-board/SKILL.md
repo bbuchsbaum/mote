@@ -140,9 +140,10 @@ mote discuss route --topic <topic> --issue bd-...
 mote discuss resolve <post-id>                 # no tracker action needed
 ```
 
-`route` also records the link as a `decision` note on the bead, so the
-provenance is visible from `mote show` without a board lookup. Links
-accumulate: routing a post to a second bead does not erase the first.
+`route` also records the link as a `decision` note on the bead, and `mote show`
+lists the originating posts and topics on its `board:` line, so provenance
+reads from either side. Links accumulate: routing a post to a second bead does
+not erase the first.
 
 To create the bead and link it in one step:
 

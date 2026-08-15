@@ -1844,8 +1844,11 @@ fn apply_session_start(
 
     // A repeated session_start for the same id is a renewal, so a long-running
     // session can extend its lease without minting a new identity.
-    let existing_owner = state.sessions.get(&session_id).map(|s| s.actor.clone());
-    if let Some(owner) = existing_owner {
+    let existing_owner = state
+        .sessions
+        .get(&session_id)
+        .map(|s| (s.actor.clone(), s.ended_ts.is_some()));
+    if let Some((owner, ended)) = existing_owner {
         if owner != actor {
             reject_orphan(
                 state,
@@ -1857,11 +1860,23 @@ fn apply_session_start(
             );
             return;
         }
+        // Ending is terminal. Reviving an ended session would make
+        // `session end` a suggestion rather than a fact, and would let a
+        // stale lease reappear long after the process behind it is gone.
+        if ended {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("session {session_id} has ended; start a new session"),
+            );
+            return;
+        }
         let existing = state.sessions.get_mut(&session_id).expect("checked above");
         existing.ttl_s = ttl_s;
         existing.lease_until_ts = lease_until_ts;
-        existing.ended_ts = None;
-        existing.ended_op_id = None;
         if label.is_some() {
             existing.label = label;
         }

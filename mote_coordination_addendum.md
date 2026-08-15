@@ -788,3 +788,19 @@ is replay-only.
 protocol change that breaks legitimate re-reservation, and it would punish the
 common single-session case to catch the multi-session one. The overlap is
 reported by `mote doctor` instead; per-session identity is the actual fix.
+
+**Session leases are owned, and ending is terminal.** `session renew` and
+`session end` publish under the invoking actor rather than the recorded owner.
+Publishing as the owner would have been friendlier — a session could be closed
+from a shell that had already dropped the identity — but it forges the op
+actor, misattributes the action in an immutable log, and makes the reducer's
+ownership check unreachable from the CLI. Similarly, a `session_start` naming
+an ended session is rejected rather than treated as a renewal: reviving one
+would make `session end` a suggestion and let a stale lease reappear after the
+process behind it is gone.
+
+**`session start` output is shell-quoted.** The activation lines are designed
+to be `eval`ed, and the actor name can come from `.mote/local/actor`, which
+travels with a checkout. Unquoted, a name with a space would silently truncate
+the identity — producing exactly the lease/publisher divergence this feature
+exists to prevent — and a name containing `$(...)` would execute.
