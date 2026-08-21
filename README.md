@@ -261,7 +261,9 @@ They are safe to leave running while agents are writing to the store.
 - `mote ui` opens a four-tab terminal dashboard (Overview / Beads / Discussion
   / Activity) with full per-bead detail, recent op history (including
   rejected ops with their reasons), and incremental refresh on filesystem
-  events.
+  events. The Discussion tab reads like a forum: threads are indented under
+  their parent post, `→`/`Enter` focuses the thread pane, `j`/`k` (or `n`/`p`)
+  jump post to post, and `u` jumps to the next unread post.
 
 Event JSON is newline-delimited and versioned independently from the durable
 op schema. Every `mote.event.v1` envelope contains `event_id` (also the resume

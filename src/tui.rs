@@ -3,7 +3,7 @@
 //! Like `mote watch`, this only ever calls `reducer::replay_store`. There is
 //! no write path; the TUI is a passive viewer.
 
-use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
@@ -67,6 +67,13 @@ impl Tab {
     }
 }
 
+/// Which pane of the Discussion tab has the keyboard.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiscussionFocus {
+    Topics,
+    Posts,
+}
+
 struct App {
     actor: Option<String>,
     tab: Tab,
@@ -83,6 +90,13 @@ struct App {
     discussion_scroll: u16,
     discussion_scroll_max: u16,
     discussion_page_rows: u16,
+    discussion_focus: DiscussionFocus,
+    /// Index of the highlighted post within the selected topic.
+    post_cursor: usize,
+    /// Row offset of every post in the currently rendered thread, in render
+    /// order. Refreshed on each draw; key handling jumps by these offsets.
+    post_starts: Vec<u16>,
+    post_unread: Vec<bool>,
 
     // Derived caches refreshed on each replay.
     bead_ids: Vec<String>,
@@ -117,6 +131,10 @@ impl App {
             discussion_scroll: 0,
             discussion_scroll_max: 0,
             discussion_page_rows: 1,
+            discussion_focus: DiscussionFocus::Topics,
+            post_cursor: 0,
+            post_starts: Vec::new(),
+            post_unread: Vec::new(),
             bead_ids: Vec::new(),
             topic_names: Vec::new(),
             activity: Vec::new(),
@@ -200,8 +218,11 @@ impl App {
     }
 
     fn move_down(&mut self) {
-        let reset_discussion_scroll = self.tab == Tab::Discussion;
-        let old_selection = self.topics_state.selected();
+        if self.posts_focused() {
+            self.next_post();
+            return;
+        }
+        let before = self.topics_state.selected();
         let (state, len) = self.current_list_mut();
         if len == 0 {
             return;
@@ -212,23 +233,22 @@ impl App {
             None => 0,
         };
         state.select(Some(next));
-        if reset_discussion_scroll && self.topics_state.selected() != old_selection {
-            self.discussion_scroll = 0;
-        }
+        self.reset_posts_if_topic_changed(before);
     }
 
     fn move_up(&mut self) {
-        let reset_discussion_scroll = self.tab == Tab::Discussion;
-        let old_selection = self.topics_state.selected();
+        if self.posts_focused() {
+            self.prev_post();
+            return;
+        }
+        let before = self.topics_state.selected();
         let (state, _) = self.current_list_mut();
         let next = match state.selected() {
             Some(i) if i > 0 => i - 1,
             _ => 0,
         };
         state.select(Some(next));
-        if reset_discussion_scroll && self.topics_state.selected() != old_selection {
-            self.discussion_scroll = 0;
-        }
+        self.reset_posts_if_topic_changed(before);
     }
 
     fn page_down(&mut self) {
@@ -255,27 +275,110 @@ impl App {
     }
 
     fn home(&mut self) {
-        let reset_discussion_scroll = self.tab == Tab::Discussion;
-        let old_selection = self.topics_state.selected();
+        if self.posts_focused() {
+            self.select_post(0);
+            return;
+        }
+        let before = self.topics_state.selected();
         let (state, len) = self.current_list_mut();
         if len > 0 {
             state.select(Some(0));
         }
-        if reset_discussion_scroll && self.topics_state.selected() != old_selection {
-            self.discussion_scroll = 0;
-        }
+        self.reset_posts_if_topic_changed(before);
     }
 
     fn end(&mut self) {
-        let reset_discussion_scroll = self.tab == Tab::Discussion;
-        let old_selection = self.topics_state.selected();
+        if self.posts_focused() {
+            self.select_post(self.post_starts.len().saturating_sub(1));
+            return;
+        }
+        let before = self.topics_state.selected();
         let (state, len) = self.current_list_mut();
         if len > 0 {
             state.select(Some(len - 1));
         }
-        if reset_discussion_scroll && self.topics_state.selected() != old_selection {
-            self.discussion_scroll = 0;
+        self.reset_posts_if_topic_changed(before);
+    }
+
+    fn posts_focused(&self) -> bool {
+        self.tab == Tab::Discussion && self.discussion_focus == DiscussionFocus::Posts
+    }
+
+    fn focus_posts(&mut self) {
+        if self.tab == Tab::Discussion {
+            self.discussion_focus = DiscussionFocus::Posts;
         }
+    }
+
+    fn focus_topics(&mut self) {
+        if self.tab == Tab::Discussion {
+            self.discussion_focus = DiscussionFocus::Topics;
+        }
+    }
+
+    /// A new topic means a new thread: rewind to its first post.
+    fn reset_posts_if_topic_changed(&mut self, before: Option<usize>) {
+        if self.tab == Tab::Discussion && self.topics_state.selected() != before {
+            self.discussion_scroll = 0;
+            self.post_cursor = 0;
+            self.post_starts.clear();
+            self.post_unread.clear();
+        }
+    }
+
+    /// Put post `idx` at the top of the reading pane and highlight it.
+    fn select_post(&mut self, idx: usize) {
+        if self.post_starts.is_empty() {
+            self.post_cursor = 0;
+            return;
+        }
+        let idx = idx.min(self.post_starts.len() - 1);
+        self.post_cursor = idx;
+        self.discussion_scroll = self.post_starts[idx].min(self.discussion_scroll_max);
+    }
+
+    fn next_post(&mut self) {
+        if self.post_starts.is_empty() {
+            return;
+        }
+        self.select_post(self.post_cursor.saturating_add(1));
+    }
+
+    fn prev_post(&mut self) {
+        if self.post_starts.is_empty() {
+            return;
+        }
+        self.select_post(self.post_cursor.saturating_sub(1));
+    }
+
+    /// Next post the current actor has not read yet, wrapping around.
+    fn next_unread_post(&mut self) {
+        if self.post_unread.is_empty() {
+            return;
+        }
+        let n = self.post_unread.len();
+        for step in 1..=n {
+            let idx = (self.post_cursor + step) % n;
+            if self.post_unread[idx] {
+                self.select_post(idx);
+                self.focus_posts();
+                return;
+            }
+        }
+    }
+
+    /// Free scrolling moves the highlight to the topmost visible post so the
+    /// cursor never drifts away from what is on screen.
+    fn sync_cursor_to_scroll(&mut self) {
+        if self.post_starts.is_empty() {
+            return;
+        }
+        let scroll = self.discussion_scroll;
+        self.post_cursor = self
+            .post_starts
+            .iter()
+            .rposition(|start| *start <= scroll)
+            .unwrap_or(0);
     }
 
     fn scroll_discussion_down(&mut self) {
@@ -284,19 +387,13 @@ impl App {
             .discussion_scroll
             .saturating_add(step)
             .min(self.discussion_scroll_max);
+        self.sync_cursor_to_scroll();
     }
 
     fn scroll_discussion_up(&mut self) {
         let step = self.discussion_page_rows.max(1);
         self.discussion_scroll = self.discussion_scroll.saturating_sub(step);
-    }
-
-    fn scroll_discussion_top(&mut self) {
-        self.discussion_scroll = 0;
-    }
-
-    fn scroll_discussion_bottom(&mut self) {
-        self.discussion_scroll = self.discussion_scroll_max;
+        self.sync_cursor_to_scroll();
     }
 
     fn current_list_mut(&mut self) -> (&mut ListState, usize) {
@@ -375,16 +472,25 @@ fn event_loop<B: Backend>(
                         (KeyCode::Char('2'), _) => app.tab = Tab::Beads,
                         (KeyCode::Char('3'), _) => app.tab = Tab::Discussion,
                         (KeyCode::Char('4'), _) => app.tab = Tab::Activity,
+                        (KeyCode::Right, _) | (KeyCode::Enter, _) if app.tab == Tab::Discussion => {
+                            app.focus_posts()
+                        }
+                        (KeyCode::Left, _) if app.tab == Tab::Discussion => app.focus_topics(),
+                        (KeyCode::Char('n'), _) if app.tab == Tab::Discussion => {
+                            app.focus_posts();
+                            app.next_post()
+                        }
+                        (KeyCode::Char('p'), _) if app.tab == Tab::Discussion => {
+                            app.focus_posts();
+                            app.prev_post()
+                        }
+                        (KeyCode::Char('u'), _) if app.tab == Tab::Discussion => {
+                            app.next_unread_post()
+                        }
                         (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.move_down(),
                         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.move_up(),
                         (KeyCode::PageDown, _) => app.page_down(),
                         (KeyCode::PageUp, _) => app.page_up(),
-                        (KeyCode::Home, _) if app.tab == Tab::Discussion => {
-                            app.scroll_discussion_top()
-                        }
-                        (KeyCode::End, _) if app.tab == Tab::Discussion => {
-                            app.scroll_discussion_bottom()
-                        }
                         (KeyCode::Home, _) | (KeyCode::Char('g'), _) => app.home(),
                         (KeyCode::End, _) | (KeyCode::Char('G'), _) => app.end(),
                         (KeyCode::Char('r'), _) => needs_refresh = true,
@@ -462,14 +568,17 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
-    let scroll_hint = if app.tab == Tab::Discussion {
-        " · PgUp/PgDn scroll posts"
+    if app.tab == Tab::Discussion {
+        spans.push(Span::raw(
+            "  q quit · 1-4 tab · ←/→ pane · j/k or n/p post · u unread · PgUp/PgDn scroll · ? help"
+                .to_string(),
+        ));
     } else {
-        " · PgUp/PgDn page"
-    };
-    spans.push(Span::raw(format!(
-        "  q quit · Tab next · 1-4 jump · j/k move{scroll_hint} · r refresh · ? help"
-    )));
+        spans.push(Span::raw(
+            "  q quit · Tab next · 1-4 jump · j/k move · PgUp/PgDn page · r refresh · ? help"
+                .to_string(),
+        ));
+    }
     if let Some(err) = &app.error {
         spans.push(Span::raw("  |  "));
         spans.push(Span::styled(
@@ -848,31 +957,48 @@ fn bead_detail_lines(state: &State, b: &Bead) -> Vec<Line<'static>> {
 fn render_discussion(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Min(20)])
+        .constraints([Constraint::Percentage(32), Constraint::Min(24)])
         .split(area);
 
-    let mut topics: Vec<&crate::state::BoardTopicRecord> = state.board_topics.values().collect();
-    topics.sort_by(
-        |a, b| match b.last_activity_op_id.cmp(&a.last_activity_op_id) {
-            Ordering::Equal => a.topic.cmp(&b.topic),
-            other => other,
-        },
-    );
+    let topics = state.board_topics_by_activity();
+    let topics_focused = app.discussion_focus == DiscussionFocus::Topics;
+
+    // One pass over the actor's unread posts feeds both the per-topic badge and
+    // the per-post "new" dot.
+    let mut unread_ids: HashSet<String> = HashSet::new();
+    let mut unread_by_topic: HashMap<String, usize> = HashMap::new();
+    if let Some(actor) = app.actor.as_deref() {
+        for post in state.unread_board_posts_for(actor, None) {
+            unread_ids.insert(post.post_id.clone());
+            *unread_by_topic.entry(post.topic.clone()).or_insert(0) += 1;
+        }
+    }
 
     let items: Vec<ListItem> = topics
         .iter()
         .map(|t| {
             let mark = if t.explicit { "★" } else { " " };
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(mark.to_string(), Style::default().fg(Color::Yellow)),
                 Span::raw(" "),
                 Span::styled(t.topic.clone(), Style::default().fg(Color::Cyan)),
-                Span::raw("  "),
-                Span::styled(
-                    format!("posts={} sticky={}", t.post_count, t.sticky_count),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]))
+            ];
+            match unread_by_topic.get(&t.topic) {
+                Some(n) => spans.push(Span::styled(
+                    format!("  ●{n}"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                None => spans.push(Span::raw("  ")),
+            }
+            let counts = if t.sticky_count > 0 {
+                format!(" posts={} sticky={}", t.post_count, t.sticky_count)
+            } else {
+                format!(" posts={}", t.post_count)
+            };
+            spans.push(Span::styled(counts, Style::default().fg(Color::DarkGray)));
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -880,77 +1006,382 @@ fn render_discussion(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(pane_border_style(topics_focused))
                 .title(format!("Topics ({})", topics.len())),
         )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(selection_style(topics_focused))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, chunks[0], &mut app.topics_state);
 
-    let selected_topic = app
-        .topics_state
-        .selected()
-        .and_then(|i| topics.get(i))
-        .map(|t| t.topic.clone());
-
-    let posts_lines = match selected_topic {
-        Some(topic) => discussion_post_lines(state, &topic),
-        None => vec![Line::from("(no topic selected)")],
-    };
+    let selected = app.topics_state.selected().and_then(|i| topics.get(i));
+    let inner_width = chunks[1].width.saturating_sub(2) as usize;
     let visible_rows = chunks[1].height.saturating_sub(2).max(1);
+
+    let rendered = match selected {
+        Some(t) => discussion_post_lines(
+            state,
+            &t.topic,
+            inner_width,
+            app.post_cursor,
+            &unread_ids,
+            !topics_focused,
+        ),
+        None => RenderedThread {
+            lines: vec![Line::from(Span::styled(
+                "(no topic selected)",
+                Style::default().fg(Color::DarkGray),
+            ))],
+            starts: Vec::new(),
+            unread: Vec::new(),
+        },
+    };
+
     app.discussion_page_rows = visible_rows;
-    app.discussion_scroll_max = posts_lines
+    app.discussion_scroll_max = rendered
+        .lines
         .len()
         .saturating_sub(visible_rows as usize)
         .min(u16::MAX as usize) as u16;
     app.discussion_scroll = app.discussion_scroll.min(app.discussion_scroll_max);
+    app.post_starts = rendered.starts;
+    app.post_unread = rendered.unread;
+    if app.post_cursor >= app.post_starts.len() {
+        app.post_cursor = app.post_starts.len().saturating_sub(1);
+    }
 
-    let title = match app.topics_state.selected().and_then(|i| topics.get(i)) {
-        Some(t) if app.discussion_scroll_max > 0 => format!(
-            "Posts in {} — {}  scroll {}/{}",
-            t.topic, t.title, app.discussion_scroll, app.discussion_scroll_max
-        ),
-        Some(t) => format!("Posts in {} — {}", t.topic, t.title),
+    let title = match selected {
+        Some(t) => {
+            let mut title = if t.title.is_empty() || t.title == t.topic {
+                t.topic.clone()
+            } else {
+                format!("{} — {}", t.topic, t.title)
+            };
+            if !app.post_starts.is_empty() {
+                title.push_str(&format!(
+                    "  [post {}/{}]",
+                    app.post_cursor + 1,
+                    app.post_starts.len()
+                ));
+            }
+            if app.discussion_scroll_max > 0 {
+                title.push_str(&format!(
+                    "  {}%",
+                    percent_scrolled(app.discussion_scroll, app.discussion_scroll_max)
+                ));
+            }
+            title
+        }
         None => "Posts".to_string(),
     };
+
     f.render_widget(
-        Paragraph::new(posts_lines)
-            .wrap(Wrap { trim: false })
+        Paragraph::new(rendered.lines)
             .scroll((app.discussion_scroll, 0))
-            .block(Block::default().borders(Borders::ALL).title(title)),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(pane_border_style(!topics_focused))
+                    .title(title),
+            ),
         chunks[1],
     );
 }
 
-fn discussion_post_lines(state: &State, topic: &str) -> Vec<Line<'static>> {
+fn pane_border_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn selection_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+}
+
+fn percent_scrolled(scroll: u16, max: u16) -> u16 {
+    if max == 0 {
+        return 100;
+    }
+    ((scroll as u32 * 100) / max as u32) as u16
+}
+
+/// A topic's posts laid out as terminal rows, plus the row each post starts on
+/// so key handling can jump post-to-post instead of line-by-line.
+struct RenderedThread {
+    lines: Vec<Line<'static>>,
+    starts: Vec<u16>,
+    unread: Vec<bool>,
+}
+
+/// Posts of one topic in reading order: root posts newest-activity-last as the
+/// board already orders them, each followed by its reply subtree.
+fn ordered_topic_posts<'a>(
+    state: &'a State,
+    topic: &str,
+) -> Vec<(usize, &'a crate::state::BoardPostRecord)> {
     let posts = state.board_posts_for(Some(topic));
-    if posts.is_empty() {
-        return vec![Line::from(Span::styled(
-            "(no posts)",
-            Style::default().fg(Color::DarkGray),
-        ))];
-    }
-    let mut lines: Vec<Line> = Vec::new();
-    for p in posts {
-        let sticky = if p.sticky { " ★" } else { "" };
-        lines.push(Line::from(vec![
-            Span::styled(p.post_id.clone(), Style::default().fg(Color::Cyan)),
-            Span::styled(sticky.to_string(), Style::default().fg(Color::Yellow)),
-            Span::raw("  "),
-            Span::styled(p.from.clone(), Style::default().fg(Color::Yellow)),
-            Span::raw("  "),
-            Span::styled(p.sent_ts.clone(), Style::default().fg(Color::DarkGray)),
-            Span::raw(if p.reply_to.is_some() { "  ↪" } else { "" }),
-        ]));
-        for body_line in p.body.lines() {
-            lines.push(Line::from(format!("  {body_line}")));
+    let in_topic: HashSet<&str> = posts.iter().map(|p| p.post_id.as_str()).collect();
+    let mut out: Vec<(usize, &crate::state::BoardPostRecord)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for post in &posts {
+        let is_root = match post.reply_to.as_deref() {
+            None => true,
+            // A reply whose parent lives elsewhere still has to be readable.
+            Some(parent) => !in_topic.contains(parent),
+        };
+        if !is_root || seen.contains(&post.post_id) {
+            continue;
         }
-        lines.push(Line::from(""));
+        for (depth, threaded) in state.thread_posts(&post.post_id) {
+            if threaded.topic != topic || !seen.insert(threaded.post_id.clone()) {
+                continue;
+            }
+            out.push((depth, threaded));
+        }
     }
-    lines
+    // Anything a cycle or a cross-topic parent kept out of the walk.
+    for post in posts {
+        if seen.insert(post.post_id.clone()) {
+            out.push((0, post));
+        }
+    }
+    out
+}
+
+fn discussion_post_lines(
+    state: &State,
+    topic: &str,
+    width: usize,
+    cursor: usize,
+    unread_ids: &HashSet<String>,
+    posts_focused: bool,
+) -> RenderedThread {
+    let ordered = ordered_topic_posts(state, topic);
+    if ordered.is_empty() {
+        return RenderedThread {
+            lines: vec![Line::from(Span::styled(
+                "(no posts)",
+                Style::default().fg(Color::DarkGray),
+            ))],
+            starts: Vec::new(),
+            unread: Vec::new(),
+        };
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut starts: Vec<u16> = Vec::new();
+    let mut unread: Vec<bool> = Vec::new();
+
+    for (idx, (depth, post)) in ordered.iter().enumerate() {
+        let selected = idx == cursor;
+        let is_unread = unread_ids.contains(&post.post_id);
+        starts.push(lines.len().min(u16::MAX as usize) as u16);
+        unread.push(is_unread);
+
+        let indent = "  ".repeat((*depth).min(6));
+        let gutter = if selected {
+            Span::styled(
+                "▌",
+                if posts_focused {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            )
+        } else {
+            Span::raw(" ")
+        };
+
+        lines.push(Line::from(post_header_spans(
+            gutter.clone(),
+            &indent,
+            idx,
+            post,
+            *depth,
+            selected,
+            is_unread,
+            width,
+        )));
+
+        let body_indent = format!("{indent}  ");
+        let body_width = width.saturating_sub(1 + display_width(&body_indent));
+        for source_line in post.body.lines() {
+            for wrapped in wrap_line(source_line, body_width) {
+                lines.push(Line::from(vec![
+                    gutter.clone(),
+                    Span::raw(format!("{body_indent}{wrapped}")),
+                ]));
+            }
+        }
+        lines.push(Line::from(gutter));
+    }
+
+    RenderedThread {
+        lines,
+        starts,
+        unread,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_header_spans(
+    gutter: Span<'static>,
+    indent: &str,
+    idx: usize,
+    post: &crate::state::BoardPostRecord,
+    depth: usize,
+    selected: bool,
+    is_unread: bool,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![gutter, Span::raw(indent.to_string())];
+    spans.push(Span::styled(
+        format!("{}.", idx + 1),
+        Style::default().fg(if selected {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }),
+    ));
+    spans.push(Span::styled(
+        if is_unread { " ● " } else { "   " }.to_string(),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if post.sticky {
+        spans.push(Span::styled("★ ", Style::default().fg(Color::Yellow)));
+    }
+    let mut author = Style::default().fg(Color::Yellow);
+    if selected {
+        author = author.add_modifier(Modifier::BOLD);
+    }
+    spans.push(Span::styled(format!("@{}", post.from), author));
+    spans.push(Span::styled(
+        format!("  {}", short_ts(&post.sent_ts)),
+        Style::default().fg(Color::DarkGray),
+    ));
+    if post.post_kind != "post" {
+        spans.push(Span::styled(
+            format!("  {}", post.post_kind),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    // Indentation already says "reply"; only call it out when the parent is
+    // somewhere else and there is no visible nesting.
+    if depth == 0 && post.reply_to.is_some() {
+        spans.push(Span::styled("  ↪", Style::default().fg(Color::DarkGray)));
+    }
+
+    // The post id is what an agent needs to reply, so keep it whenever the pane
+    // is wide enough rather than letting it clip mid-id.
+    let used: usize = spans.iter().map(|s| s.width()).sum();
+    let room = width.saturating_sub(used);
+    if room >= post.post_id.len() + 2 {
+        spans.push(Span::styled(
+            format!("  {}", post.post_id),
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else if room >= 12 {
+        spans.push(Span::styled(
+            format!("  {}", truncate(&post.post_id, room - 2)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans
+}
+
+/// `2026-05-14T09:31:07Z` -> `05-14 09:31`; anything unexpected passes through.
+fn short_ts(ts: &str) -> String {
+    if ts.len() >= 16 && ts.is_char_boundary(5) && ts.is_char_boundary(16) {
+        format!("{} {}", &ts[5..10], &ts[11..16])
+    } else {
+        ts.to_string()
+    }
+}
+
+fn display_width(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
+/// Word-wrap one source line to `width` columns, keeping its leading
+/// indentation on continuation rows so quoted code and lists stay readable.
+fn wrap_line(text: &str, width: usize) -> Vec<String> {
+    let text = text.replace('\t', "    ");
+    if width == 0 || display_width(&text) <= width {
+        return vec![text];
+    }
+    let indent: String = text.chars().take_while(|c| *c == ' ').collect();
+    let cont_indent = if display_width(&indent) + 8 <= width {
+        indent
+    } else {
+        String::new()
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = cont_indent.clone();
+    let mut cur_w = display_width(&cur);
+    let mut has_word = false;
+
+    for word in text.split_whitespace() {
+        let word_w = display_width(word);
+        if has_word && cur_w + 1 + word_w > width {
+            out.push(std::mem::replace(&mut cur, cont_indent.clone()));
+            cur_w = display_width(&cur);
+            has_word = false;
+        }
+        if has_word {
+            cur.push(' ');
+            cur_w += 1;
+        }
+        if word_w > width.saturating_sub(cur_w) {
+            // A single word longer than the pane: break it across rows.
+            let mut rest = word;
+            while !rest.is_empty() {
+                let room = width.saturating_sub(cur_w).max(1);
+                let (chunk, tail) = split_at_width(rest, room);
+                cur.push_str(chunk);
+                cur_w += display_width(chunk);
+                rest = tail;
+                if !rest.is_empty() {
+                    out.push(std::mem::replace(&mut cur, cont_indent.clone()));
+                    cur_w = display_width(&cur);
+                }
+            }
+        } else {
+            cur.push_str(word);
+            cur_w += word_w;
+        }
+        has_word = true;
+    }
+    out.push(cur);
+    out
+}
+
+/// Split `s` at the last char boundary that fits in `width` columns, always
+/// consuming at least one char so callers cannot loop forever.
+fn split_at_width(s: &str, width: usize) -> (&str, &str) {
+    let mut used = 0usize;
+    let mut end = 0usize;
+    for (offset, ch) in s.char_indices() {
+        let w = display_width(ch.encode_utf8(&mut [0u8; 4]));
+        if end > 0 && used + w > width {
+            break;
+        }
+        used += w;
+        end = offset + ch.len_utf8();
+    }
+    s.split_at(end)
 }
 
 fn render_activity(f: &mut Frame, app: &mut App, _state: &State, area: Rect) {
@@ -1068,7 +1499,7 @@ fn activity_detail_lines(e: &ActivityEntry) -> Vec<Line<'static>> {
 
 fn render_help(f: &mut Frame, area: Rect) {
     let w = area.width.saturating_sub(20).min(60);
-    let h = 14u16.min(area.height.saturating_sub(4));
+    let h = 20u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width - w) / 2;
     let y = area.y + (area.height - h) / 2;
     let popup = Rect {
@@ -1088,11 +1519,20 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from("Tab / S-Tab   next / prev tab"),
         Line::from("1 2 3 4       jump to tab"),
         Line::from("j/k or ↑/↓    move selection"),
-        Line::from("g / G         top / bottom of selected list"),
+        Line::from("g / G         first / last item"),
         Line::from("PgUp / PgDn   page list; in Discussion, scroll posts"),
-        Line::from("Home / End    in Discussion, top / bottom of posts"),
         Line::from("r             force refresh now"),
         Line::from("? / h         show / hide help"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Discussion",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("→ / Enter     read the selected topic"),
+        Line::from("←             back to the topic list"),
+        Line::from("j/k, n/p      next / previous post"),
+        Line::from("g / G         first / last post"),
+        Line::from("u             next unread post"),
         Line::from(""),
         Line::from(Span::styled(
             "press any key to dismiss",
@@ -1137,6 +1577,10 @@ mod tests {
             discussion_scroll: 0,
             discussion_scroll_max: 0,
             discussion_page_rows: 1,
+            discussion_focus: DiscussionFocus::Topics,
+            post_cursor: 0,
+            post_starts: Vec::new(),
+            post_unread: Vec::new(),
             bead_ids: Vec::new(),
             topic_names: Vec::new(),
             activity: Vec::new(),
@@ -1168,24 +1612,152 @@ mod tests {
 
         app.page_up();
         assert_eq!(app.discussion_scroll, 7);
-
-        app.scroll_discussion_top();
-        assert_eq!(app.discussion_scroll, 0);
-        app.scroll_discussion_bottom();
-        assert_eq!(app.discussion_scroll, 12);
     }
 
     #[test]
-    fn changing_discussion_topic_resets_post_scroll() {
+    fn changing_discussion_topic_resets_post_cursor_and_scroll() {
         let mut app = test_app();
         app.topic_names = vec!["alpha".into(), "beta".into()];
         app.topics_state.select(Some(0));
         app.discussion_scroll = 8;
         app.discussion_scroll_max = 20;
+        app.post_cursor = 3;
+        app.post_starts = vec![0, 4, 9, 14];
 
         app.move_down();
         assert_eq!(app.topics_state.selected(), Some(1));
         assert_eq!(app.discussion_scroll, 0);
+        assert_eq!(app.post_cursor, 0);
+        assert!(app.post_starts.is_empty());
+    }
+
+    #[test]
+    fn focused_posts_pane_jumps_post_to_post() {
+        let mut app = test_app();
+        app.topic_names = vec!["alpha".into()];
+        app.topics_state.select(Some(0));
+        app.post_starts = vec![0, 6, 21, 40];
+        app.discussion_scroll_max = 30;
+        app.focus_posts();
+
+        app.move_down();
+        assert_eq!(app.post_cursor, 1);
+        assert_eq!(app.discussion_scroll, 6);
+
+        app.move_down();
+        assert_eq!(app.post_cursor, 2);
+        assert_eq!(app.discussion_scroll, 21);
+
+        // The last post starts past the end of the scrollable range.
+        app.move_down();
+        assert_eq!(app.post_cursor, 3);
+        assert_eq!(app.discussion_scroll, 30);
+
+        app.move_down();
+        assert_eq!(app.post_cursor, 3, "cursor stops at the last post");
+
+        app.move_up();
+        assert_eq!(app.post_cursor, 2);
+        assert_eq!(app.discussion_scroll, 21);
+
+        // Topic selection is untouched while the posts pane has focus.
+        assert_eq!(app.topics_state.selected(), Some(0));
+
+        app.home();
+        assert_eq!(app.post_cursor, 0);
+        assert_eq!(app.discussion_scroll, 0);
+        app.end();
+        assert_eq!(app.post_cursor, 3);
+    }
+
+    #[test]
+    fn unfocused_posts_pane_still_moves_topics() {
+        let mut app = test_app();
+        app.topic_names = vec!["alpha".into(), "beta".into()];
+        app.topics_state.select(Some(0));
+        app.post_starts = vec![0, 6];
+
+        app.move_down();
+        assert_eq!(app.topics_state.selected(), Some(1));
+        assert_eq!(app.post_cursor, 0);
+    }
+
+    #[test]
+    fn page_scroll_keeps_cursor_on_the_topmost_visible_post() {
+        let mut app = test_app();
+        app.topic_names = vec!["alpha".into()];
+        app.topics_state.select(Some(0));
+        app.post_starts = vec![0, 6, 21, 40];
+        app.post_unread = vec![false; 4];
+        app.discussion_page_rows = 10;
+        app.discussion_scroll_max = 60;
+
+        app.page_down();
+        assert_eq!(app.discussion_scroll, 10);
+        assert_eq!(app.post_cursor, 1);
+
+        app.page_down();
+        assert_eq!(app.discussion_scroll, 20);
+        assert_eq!(app.post_cursor, 1);
+
+        app.page_down();
+        assert_eq!(app.discussion_scroll, 30);
+        assert_eq!(app.post_cursor, 2);
+
+        app.page_up();
+        assert_eq!(app.post_cursor, 1);
+    }
+
+    #[test]
+    fn next_unread_post_wraps_around() {
+        let mut app = test_app();
+        app.topic_names = vec!["alpha".into()];
+        app.topics_state.select(Some(0));
+        app.post_starts = vec![0, 6, 21, 40];
+        app.post_unread = vec![true, false, false, true];
+        app.discussion_scroll_max = 60;
+
+        app.next_unread_post();
+        assert_eq!(app.post_cursor, 3);
+        assert!(
+            app.posts_focused(),
+            "reading an unread post focuses the pane"
+        );
+
+        app.next_unread_post();
+        assert_eq!(app.post_cursor, 0, "wraps back to the first unread post");
+        assert_eq!(app.discussion_scroll, 0);
+    }
+
+    #[test]
+    fn post_navigation_is_inert_without_posts() {
+        let mut app = test_app();
+        app.focus_posts();
+        app.move_down();
+        app.move_up();
+        app.next_unread_post();
+        assert_eq!(app.post_cursor, 0);
+        assert_eq!(app.discussion_scroll, 0);
+    }
+
+    fn post(id: &str, from: &str, body: &str, reply_to: Option<&str>) -> BoardPostRecord {
+        BoardPostRecord {
+            post_id: id.into(),
+            from: from.into(),
+            topic: "planning".into(),
+            body: body.into(),
+            reply_to: reply_to.map(String::from),
+            post_kind: "post".into(),
+            sticky: false,
+            sticky_op_id: None,
+            route: Default::default(),
+            sent_ts: "2026-05-14T09:31:07Z".into(),
+            sent_op_id: format!("op-{id}"),
+        }
+    }
+
+    fn rendered(state: &State, cursor: usize) -> RenderedThread {
+        discussion_post_lines(state, "planning", 60, cursor, &HashSet::new(), true)
     }
 
     #[test]
@@ -1201,30 +1773,234 @@ mod tests {
                 format!("body {i}")
             };
             let post_id = format!("post-{i:03}");
-            state.board_posts.insert(
-                post_id.clone(),
-                BoardPostRecord {
-                    post_id,
-                    from: "alice".into(),
-                    topic: "planning".into(),
-                    body,
-                    reply_to: None,
-                    post_kind: "post".into(),
-                    sticky: false,
-                    sticky_op_id: None,
-                    route: Default::default(),
-                    sent_ts: format!("2026-05-14T00:00:{i:02}Z"),
-                    sent_op_id: format!("op-{i:03}"),
-                },
-            );
+            let mut record = post(&post_id, "alice", &body, None);
+            record.sent_ts = format!("2026-05-14T00:00:{i:02}Z");
+            record.sent_op_id = format!("op-{i:03}");
+            state.board_posts.insert(post_id, record);
         }
 
-        let lines = discussion_post_lines(&state, "planning");
-        let text = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        let out = rendered(&state, 0);
+        let text = out
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("line 6"), "body text was truncated:\n{text}");
         assert!(
             text.contains("post-060"),
             "post list was truncated:\n{text}"
         );
+        assert_eq!(out.starts.len(), 61, "one start offset per post");
+        assert_eq!(out.unread.len(), 61);
+    }
+
+    #[test]
+    fn post_start_offsets_point_at_each_header_row() {
+        let mut state = State::default();
+        for (id, body) in [
+            ("post-a", "one\ntwo"),
+            ("post-b", "solo"),
+            ("post-c", "x\ny\nz"),
+        ] {
+            state
+                .board_posts
+                .insert(id.into(), post(id, "alice", body, None));
+        }
+
+        let out = rendered(&state, 0);
+        assert_eq!(out.starts.len(), 3);
+        for (idx, start) in out.starts.iter().enumerate() {
+            let header = line_text(&out.lines[*start as usize]);
+            assert!(
+                header.contains(&format!("{}.", idx + 1)),
+                "row {start} is not the header of post {}: {header}",
+                idx + 1
+            );
+            assert!(header.contains('@'), "header lacks an author: {header}");
+        }
+        // header + 2 body + blank
+        assert_eq!(out.starts[1], 4);
+    }
+
+    #[test]
+    fn replies_are_indented_under_their_parent() {
+        let mut state = State::default();
+        state
+            .board_posts
+            .insert("post-a".into(), post("post-a", "alice", "root", None));
+        state
+            .board_posts
+            .insert("post-c".into(), post("post-c", "carol", "later root", None));
+        state.board_posts.insert(
+            "post-b".into(),
+            post("post-b", "bob", "reply", Some("post-a")),
+        );
+
+        let ordered = ordered_topic_posts(&state, "planning");
+        let ids: Vec<(usize, &str)> = ordered
+            .iter()
+            .map(|(d, p)| (*d, p.post_id.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![(0, "post-a"), (1, "post-b"), (0, "post-c")],
+            "replies must follow their parent"
+        );
+    }
+
+    #[test]
+    fn orphan_replies_still_appear_once() {
+        let mut state = State::default();
+        state.board_posts.insert(
+            "post-b".into(),
+            post("post-b", "bob", "reply to another topic", Some("post-zz")),
+        );
+        let ordered = ordered_topic_posts(&state, "planning");
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].0, 0, "orphan replies render at the root");
+
+        let out = rendered(&state, 0);
+        let text = out
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("↪"), "orphan reply is marked:\n{text}");
+    }
+
+    #[test]
+    fn wrap_line_fits_the_pane_and_keeps_indentation() {
+        let wrapped = wrap_line("    let x = compute(alpha, beta, gamma, delta);", 20);
+        assert!(wrapped.len() > 1);
+        for row in &wrapped {
+            assert!(display_width(row) <= 20, "row too wide: {row:?}");
+        }
+        assert!(wrapped[0].starts_with("    "));
+        assert!(wrapped[1].starts_with("    "), "continuation keeps indent");
+        assert_eq!(
+            wrapped.join(" ").split_whitespace().collect::<Vec<_>>(),
+            "let x = compute(alpha, beta, gamma, delta);"
+                .split_whitespace()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wrap_line_breaks_words_longer_than_the_pane() {
+        let wrapped = wrap_line(&"z".repeat(45), 10);
+        assert_eq!(wrapped.len(), 5);
+        for row in &wrapped {
+            assert!(display_width(row) <= 10);
+        }
+        assert_eq!(wrapped.concat(), "z".repeat(45));
+    }
+
+    #[test]
+    fn wrap_line_handles_empty_and_zero_width() {
+        assert_eq!(wrap_line("", 10), vec![String::new()]);
+        assert_eq!(wrap_line("abc", 0), vec!["abc".to_string()]);
+    }
+
+    #[test]
+    fn wrapped_body_rows_never_exceed_the_pane_width() {
+        let mut state = State::default();
+        state.board_posts.insert(
+            "post-a".into(),
+            post(
+                "post-a",
+                "alice",
+                "the quick brown fox jumps over the lazy dog again and again and again",
+                None,
+            ),
+        );
+        let width = 32;
+        let out = discussion_post_lines(&state, "planning", width, 0, &HashSet::new(), true);
+        for line in &out.lines {
+            assert!(
+                line.width() <= width,
+                "line overflows the pane: {:?}",
+                line_text(line)
+            );
+        }
+    }
+
+    fn topic_record(topic: &str, posts: usize) -> crate::state::BoardTopicRecord {
+        crate::state::BoardTopicRecord {
+            topic: topic.into(),
+            title: "Planning".into(),
+            body: String::new(),
+            created_by: "alice".into(),
+            created_ts: "2026-05-14T09:00:00Z".into(),
+            created_op_id: "op-000".into(),
+            explicit: true,
+            last_activity_ts: "2026-05-14T09:31:07Z".into(),
+            last_activity_op_id: "op-999".into(),
+            post_count: posts,
+            sticky_count: 0,
+            decision_count: 0,
+            summary_post_id: None,
+            route: Default::default(),
+        }
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect::<String>()
+    }
+
+    /// The whole point of the pane: one keystroke moves a whole post, and the
+    /// post you land on is at the top of the reading area, not somewhere below
+    /// the fold.
+    #[test]
+    fn jumping_posts_puts_the_target_header_at_the_top_of_the_pane() {
+        let mut state = State::default();
+        state
+            .board_topics
+            .insert("planning".into(), topic_record("planning", 8));
+        for i in 0..8 {
+            let id = format!("post-{i:03}");
+            let mut record = post(
+                &id,
+                &format!("agent{i}"),
+                "a body long enough to wrap at least once in a narrow pane, plus\na second source line",
+                None,
+            );
+            record.sent_op_id = format!("op-{i:03}");
+            state.board_posts.insert(id, record);
+        }
+
+        let mut app = test_app();
+        app.state = Some(state);
+        app.topic_names = vec!["planning".into()];
+        app.topics_state.select(Some(0));
+        app.focus_posts();
+
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+        assert_eq!(app.post_starts.len(), 8, "every post gets a row offset");
+
+        // Header rows are 3 tall and the pane has a border, so the first
+        // readable row of the posts pane is y = 4.
+        let top_row = 4;
+        app.next_post();
+        app.next_post();
+        term.draw(|f| render(f, &mut app)).unwrap();
+
+        assert_eq!(app.post_cursor, 2);
+        let row = row_text(term.backend().buffer(), top_row);
+        assert!(
+            row.contains("3. ") && row.contains("@agent2"),
+            "post 3 should sit at the top of the pane, got: {row}"
+        );
+        assert!(row.contains('▌'), "selected post is marked: {row}");
+    }
+
+    #[test]
+    fn short_ts_compacts_rfc3339() {
+        assert_eq!(short_ts("2026-05-14T09:31:07Z"), "05-14 09:31");
+        assert_eq!(short_ts("bogus"), "bogus");
     }
 }

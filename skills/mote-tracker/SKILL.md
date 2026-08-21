@@ -222,7 +222,10 @@ periodic fallback scan and remains read-only.
 `mote ui` opens a four-tab dashboard (Overview / Beads / Discussion / Activity)
 with per-bead detail and recent op history, including rejected ops and their
 reasons. Keys: `Tab`/`Shift+Tab` or `1`-`4` switch tabs, `j`/`k` (or arrows)
-move, `g`/`G` jump to top/bottom, `r` refreshes, `?` shows help, `q` quits.
+move, `g`/`G` jump to top/bottom, `r` refreshes, `?` shows help, `q` quits. On
+the Discussion tab, `→`/`Enter` moves into the thread pane where `j`/`k` (or
+`n`/`p`) jump post to post, `u` jumps to the next unread post, and `←` returns
+to the topic list.
 
 Prefer these for a human or supervising agent watching progress. They are not a
 substitute for `mote show`, `mote who-has`, or `mote history` when you need a

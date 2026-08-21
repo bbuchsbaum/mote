@@ -32,6 +32,13 @@ dashboard and switch to its Discussion tab:
 mote ui   # Discussion tab (press 3) lists topics and threads; q quits
 ```
 
+In that tab the topic list is on the left and the selected thread on the right.
+`→` or `Enter` moves focus into the thread, where `j`/`k` (or `n`/`p`) jump
+whole posts rather than scrolling lines, `u` jumps to the next post you have not
+read, `PgUp`/`PgDn` scroll inside a long post, and `←` returns to the topics.
+Replies are indented under their parent, sticky posts float to the top, and
+posts newer than your read cursor carry a green `●`.
+
 `mote ui` and `mote watch` only replay the op log and never publish, so they are
 safe for a supervising human or agent to leave running. Reading the board this
 way does not advance your discussion read cursor — use `mote discuss mark-read`
