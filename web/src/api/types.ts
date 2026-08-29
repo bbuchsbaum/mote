@@ -28,9 +28,12 @@ export interface Note {
 }
 
 export interface DiscussionSources {
-  posts: string[];
-  topics: string[];
+  posts: { post_id: string; topic: string; from: string }[];
+  topics: { topic: string; title: string }[];
 }
+
+export interface BeadEdge extends BeadRow { kind: string }
+export interface ParentEdge { parent: string; kind: string }
 
 /** `mote --json show <id>` */
 export interface BeadDetail extends BeadRow {
@@ -39,10 +42,10 @@ export interface BeadDetail extends BeadRow {
   deleted_at: string | null;
   ready: boolean;
   notes: Note[];
-  deps: string[];
-  dependents: string[];
-  children: string[];
-  relations: { id: string; kind: string }[];
+  deps: ParentEdge[];
+  dependents: BeadEdge[];
+  children: BeadEdge[];
+  relations: ParentEdge[];
   discussion_sources: DiscussionSources;
   /** Per-field clocks. A patch must echo these back or it is rejected. */
   clock: Partial<Record<ScalarField, string>>;

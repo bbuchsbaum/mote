@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Immutable op-maildir issue + coordination tracker"
 license = "MIT OR Apache-2.0"
+exclude = [".claude/scheduled_tasks.lock"]
 
 [dependencies]
 anyhow = "1"

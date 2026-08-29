@@ -78,9 +78,13 @@ export class FixtureClient implements MoteClient {
     const help = seedBead("Add flat leaf-command discovery with mote help --all", "open", 1,
       ["cli", "discoverability", "help", "mote-dx"], 620);
 
-    answering.deps = [cursor.id];
+    answering.deps = [{ parent: cursor.id, kind: "blocks" }];
     answering.ready = false;
-    cursor.dependents = [answering.id];
+    cursor.dependents = [{
+      id: answering.id, title: answering.title, status: answering.status,
+      priority: answering.priority, tags: answering.tags, assignee: answering.assignee,
+      kind: "blocks",
+    }];
 
     this.allBeads = [parser, cursor, answering, aliases, rfc, identity, help];
     for (const b of this.allBeads) {
@@ -105,7 +109,9 @@ export class FixtureClient implements MoteClient {
       "Proposal: split parser and test work. Expiry is invisible until it bites — we should emit a derived warning event before a reservation lapses.", null);
     root.route_state = "routed";
     root.issues = [parser.id];
-    parser.discussion_sources = { posts: [root.post_id], topics: [] };
+    parser.discussion_sources = {
+      posts: [{ post_id: root.post_id, topic: root.topic, from: root.from }], topics: [],
+    };
 
     const decision = this.mkPost("planning", "alice", 170,
       "Decision: split parser work from test work. Parser lands first; tests follow behind the same reservation.", null);
@@ -126,7 +132,7 @@ export class FixtureClient implements MoteClient {
       "We never decided whether an expired reservation can be adopted. It cannot today, and that asymmetry needs a bead.", null);
     leaseNeeds.route_state = "needs_bead";
 
-    void decision; void reply2; void orphan;
+    void decision; void orphan;
 
     this.messages = [
       this.mkMsg("codex-b", "alice", "request", "Please take the parser work — I'm blocked on the lexer refactor and won't get to it today.", 60, {
@@ -137,7 +143,7 @@ export class FixtureClient implements MoteClient {
       this.mkMsg("parser-session", "alice", "blocked", "Cannot reserve src/watch.rs — reviewer holds it until 15:10.", 8, {}),
     ];
 
-    this.readCursor.set("alice", this.allPosts[this.allPosts.length - 3]?.post_id ?? "");
+    this.readCursor.set("alice", reply2.post_id);
   }
 
   private mkTopic(topic: string, title: string, body: string, by: string, minutesAgo: number): Topic {
@@ -186,10 +192,12 @@ export class FixtureClient implements MoteClient {
     for (const fn of this.subscribers) fn(event);
   }
 
-  subscribe(onEvent: (e: MoteEvent) => void): () => void {
+  subscribe(onEvent: (e: MoteEvent) => void, onConnection?: (connected: boolean) => void): () => void {
     this.subscribers.add(onEvent);
+    onConnection?.(true);
     if (!this.timer) this.timer = setInterval(() => this.simulateExternalPatch(), 45_000);
     return () => {
+      onConnection?.(false);
       this.subscribers.delete(onEvent);
       if (this.subscribers.size === 0 && this.timer) {
         clearInterval(this.timer);
@@ -281,6 +289,10 @@ export class FixtureClient implements MoteClient {
     return this.allPosts.filter((p) => p.topic === topic).sort((a, b) => a.sent_ts.localeCompare(b.sent_ts));
   }
 
+  async unread(): Promise<Post[]> {
+    return structuredClone(this.unreadPosts(this.getActor()));
+  }
+
   async thread(postId: string): Promise<Post[]> {
     const out: Post[] = [];
     const walk = (id: string, depth: number) => {
@@ -342,7 +354,9 @@ export class FixtureClient implements MoteClient {
   async createBead(input: NewBeadInput): Promise<{ id: string }> {
     if (!input.title.trim()) throw new ValidationError("title is required");
     const b = seedBead(input.title, "open", input.priority ?? 2, input.tags ?? [], 0, {
-      body: input.body ?? "", deps: input.deps ?? [], ready: !(input.deps ?? []).length,
+      body: input.body ?? "",
+      deps: (input.deps ?? []).map((parent) => ({ parent, kind: "blocks" })),
+      ready: !(input.deps ?? []).length,
     });
     this.allBeads.unshift(b);
     this.allHistory.set(b.id, [{ accepted: true, actor: this.getActor(), kind: "create", op_id: opId(), reason: null, ts: now() }]);
@@ -439,7 +453,9 @@ export class FixtureClient implements MoteClient {
     p.route_state = "routed";
     p.issues = [...p.issues, id];
     const b = this.allBeads.find((x) => x.id === id)!;
-    b.discussion_sources = { posts: [postId], topics: [] };
+    b.discussion_sources = {
+      posts: [{ post_id: p.post_id, topic: p.topic, from: p.from }], topics: [],
+    };
     this.emit("discussion", "discussion.routed", { post_id: postId, issue: id });
     return { id };
   }
@@ -451,8 +467,11 @@ export class FixtureClient implements MoteClient {
     p.route_state = "routed";
     if (!p.issues.includes(issue)) p.issues = [...p.issues, issue];
     const b = this.allBeads.find((x) => x.id === issue)!;
-    if (!b.discussion_sources.posts.includes(postId)) {
-      b.discussion_sources = { ...b.discussion_sources, posts: [...b.discussion_sources.posts, postId] };
+    if (!b.discussion_sources.posts.some((source) => source.post_id === postId)) {
+      b.discussion_sources = {
+        ...b.discussion_sources,
+        posts: [...b.discussion_sources.posts, { post_id: p.post_id, topic: p.topic, from: p.from }],
+      };
     }
     this.emit("discussion", "discussion.routed", { post_id: postId, issue });
   }

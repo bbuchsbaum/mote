@@ -27,7 +27,11 @@ export function DiscussionView({
   const { data: beads } = useResource("beads", "picker", () => client.beads());
 
   const focusRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { if (focusPost) focusRef.current?.scrollIntoView({ block: "center" }); }, [focusPost, posts]);
+  useEffect(() => {
+    if (!focusPost) return;
+    focusRef.current?.focus();
+    focusRef.current?.scrollIntoView?.({ block: "center" });
+  }, [focusPost, posts]);
 
   // Indent on the reply graph, exactly as `discuss thread` reports depth.
   const ordered = useMemo(() => nest(posts ?? []), [posts]);
@@ -49,7 +53,7 @@ export function DiscussionView({
         </div>
         <div className="scroll">
           {(topics ?? []).map((t) => (
-            <button key={t.topic} className={`topic ${active === t.topic ? "on" : ""}`}
+            <button key={t.topic} data-nav-item className={`topic ${active === t.topic ? "on" : ""}`}
               onClick={() => onSelectTopic(t.topic)}>
               <span className="topic-t">
                 {(t.unread ?? 0) > 0 && <span className="unread-dot" aria-label="unread" />}
@@ -87,6 +91,8 @@ export function DiscussionView({
                 <div
                   key={post.post_id}
                   ref={post.post_id === focusPost ? focusRef : undefined}
+                  data-nav-item
+                  tabIndex={-1}
                   className={`post ${post.sticky ? "sticky" : ""} ${post.post_id === focusPost ? "unread" : ""}`}
                   style={{ marginLeft: Math.min(depth, 3) * 26 }}
                 >

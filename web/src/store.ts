@@ -23,21 +23,28 @@ const INVALIDATES: Record<EventCategory, Slice[]> = {
 
 class Revisions {
   private revs = new Map<Slice, number>();
-  private listeners = new Set<() => void>();
+  private listeners = new Map<Slice, Set<() => void>>();
 
   get(slice: Slice): number {
     return this.revs.get(slice) ?? 0;
   }
   bump(slices: Slice[]) {
-    for (const s of slices) this.revs.set(s, this.get(s) + 1);
-    for (const fn of this.listeners) fn();
+    for (const slice of new Set(slices)) {
+      this.revs.set(slice, this.get(slice) + 1);
+      for (const fn of this.listeners.get(slice) ?? []) fn();
+    }
   }
   onEvent(event: MoteEvent) {
     this.bump(INVALIDATES[event.category] ?? []);
   }
-  subscribe(fn: () => void): () => void {
-    this.listeners.add(fn);
-    return () => this.listeners.delete(fn);
+  subscribe(slice: Slice, fn: () => void): () => void {
+    const listeners = this.listeners.get(slice) ?? new Set<() => void>();
+    listeners.add(fn);
+    this.listeners.set(slice, listeners);
+    return () => {
+      listeners.delete(fn);
+      if (listeners.size === 0) this.listeners.delete(slice);
+    };
   }
 }
 
@@ -56,7 +63,7 @@ export function useResource<T>(
   const loaderRef = useRef(loader);
   loaderRef.current = loader;
 
-  useEffect(() => revisions.subscribe(() => setTick((t) => t + 1)), []);
+  useEffect(() => revisions.subscribe(slice, () => setTick((t) => t + 1)), [slice]);
 
   const rev = revisions.get(slice);
   useEffect(() => {
@@ -75,11 +82,10 @@ export function useResource<T>(
 
 /** Connects the event stream to the cache for the life of the app. */
 export function useEventStream(client: MoteClient) {
-  const [connected, setConnected] = useState(true);
+  const [connected, setConnected] = useState(false);
   useEffect(() => {
     try {
-      const stop = client.subscribe((event) => revisions.onEvent(event));
-      setConnected(true);
+      const stop = client.subscribe((event) => revisions.onEvent(event), setConnected);
       return stop;
     } catch {
       setConnected(false);

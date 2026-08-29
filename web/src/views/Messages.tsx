@@ -45,7 +45,7 @@ export function MessagesView({
         <div className="scroll">
           {(actors ?? []).length === 0 && <Empty title="No other actors" />}
           {(actors ?? []).map((a) => (
-            <button key={a.actor} className={`peer ${active === a.actor ? "on" : ""}`} onClick={() => onSelectPeer(a.actor)}>
+            <button key={a.actor} data-nav-item className={`peer ${active === a.actor ? "on" : ""}`} onClick={() => onSelectPeer(a.actor)}>
               <Avatar actor={a.actor} muted={a.active_claims === 0} />
               <span className="peer-txt">
                 <span className="peer-n">

@@ -40,7 +40,7 @@ export function TriageView({
         ) : (
           <div className="thread">
             {posts.map((p) => (
-              <div key={p.post_id} className="post" style={{ borderLeftColor: "var(--warn)" }}>
+              <div key={p.post_id} data-nav-item tabIndex={-1} className="post" style={{ borderLeftColor: "var(--warn)" }}>
                 <div className="post-head">
                   <span className="post-who">{p.from}</span>
                   <span className="post-when">{relativeTime(p.sent_ts)}</span>
@@ -60,7 +60,7 @@ export function TriageView({
               </div>
             ))}
             {topics.map((t) => (
-              <div key={t.topic} className="post" style={{ borderLeftColor: "var(--warn)" }}>
+              <div key={t.topic} data-nav-item tabIndex={-1} className="post" style={{ borderLeftColor: "var(--warn)" }}>
                 <div className="post-head">
                   <span className="post-who">{t.title || t.topic}</span>
                   <span className="post-when">whole topic · {t.post_count} posts</span>

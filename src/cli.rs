@@ -428,8 +428,9 @@ pub enum Command {
 
     /// Serve the local web-console HTTP API on loopback
     Serve {
-        #[arg(long, default_value = "127.0.0.1:7717")]
-        bind: String,
+        /// TCP port on 127.0.0.1; use 0 to select an available ephemeral port
+        #[arg(long, default_value_t = 7717)]
+        port: u16,
     },
 
     /// Check store layout, actor identity, and op-log health
@@ -1364,9 +1365,9 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             interval,
         ),
         Command::Ui => cmd_ui(cli.actor.as_deref(), cli.store.as_deref()),
-        Command::Serve { bind } => {
+        Command::Serve { port } => {
             let store = open_store(cli.store.as_deref())?;
-            crate::server::serve(store, &bind)?;
+            crate::server::serve(store, port)?;
             Ok(0)
         }
         Command::Doctor => cmd_doctor(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
@@ -1444,7 +1445,7 @@ fn known_candidates(state: &crate::state::State) -> Vec<crate::candidate::KnownC
         .collect()
 }
 
-fn candidate_json(
+pub(crate) fn candidate_json(
     state: &crate::state::State,
     candidate: &crate::state::CandidateRecord,
 ) -> serde_json::Value {
@@ -2260,7 +2261,7 @@ fn cmd_actor(
     }
 }
 
-fn normalize_actor(actor: &str) -> MoteResult<String> {
+pub(crate) fn normalize_actor(actor: &str) -> MoteResult<String> {
     let actor = actor.trim();
     if actor.is_empty() {
         return Err(MoteError::Invalid("actor must be non-empty".into()));
@@ -2285,7 +2286,7 @@ struct ActorActivity {
 }
 
 #[derive(Debug, Serialize)]
-struct ActorSummary {
+pub(crate) struct ActorSummary {
     actor: String,
     current: bool,
     last_activity_ts: Option<String>,
@@ -2299,7 +2300,7 @@ struct ActorSummary {
     status: crate::actor_status::ActorStatus,
 }
 
-fn actor_summaries(
+pub(crate) fn actor_summaries(
     state: &crate::state::State,
     current: Option<&str>,
     as_of: Timestamp,
@@ -3251,7 +3252,7 @@ fn clock_for(bead: &Bead, field: &str) -> MoteResult<String> {
 
 /// Discussion posts and topics routed to this bead, so `mote show` answers
 /// "where did this work come from?" without a board lookup.
-fn discussion_sources_json(state: &crate::state::State, id: &str) -> serde_json::Value {
+pub(crate) fn discussion_sources_json(state: &crate::state::State, id: &str) -> serde_json::Value {
     let (posts, topics) = state.discussion_sources_for(id);
     serde_json::json!({
         "posts": posts.iter().map(|p| serde_json::json!({
@@ -3375,7 +3376,7 @@ fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResul
     Ok(0)
 }
 
-fn bead_edge_json(bead: &Bead, kind: &str) -> serde_json::Value {
+pub(crate) fn bead_edge_json(bead: &Bead, kind: &str) -> serde_json::Value {
     serde_json::json!({
         "id": bead.id,
         "title": bead.title,
@@ -4229,7 +4230,7 @@ fn cmd_msg(
 
 /// Full JSON projection of a message record, shared by `msg requests`
 /// and `msg thread`.
-fn message_json(request: &MsgRecord) -> serde_json::Value {
+pub(crate) fn message_json(request: &MsgRecord) -> serde_json::Value {
     serde_json::json!({
         "msg_id": request.msg_id,
         "from": request.from,
@@ -4255,7 +4256,7 @@ fn message_json(request: &MsgRecord) -> serde_json::Value {
 }
 
 /// `message_json` plus the direction the viewing actor saw it from.
-fn thread_message_json(m: &MsgRecord, viewer: &str) -> serde_json::Value {
+pub(crate) fn thread_message_json(m: &MsgRecord, viewer: &str) -> serde_json::Value {
     let mut value = message_json(m);
     let direction = if m.from == viewer { "out" } else { "in" };
     if let Some(obj) = value.as_object_mut() {
@@ -5442,7 +5443,7 @@ fn print_discussion_topics(
     Ok(0)
 }
 
-fn topic_json(t: &crate::state::BoardTopicRecord) -> serde_json::Value {
+pub(crate) fn topic_json(t: &crate::state::BoardTopicRecord) -> serde_json::Value {
     serde_json::json!({
         "topic": t.topic,
         "title": t.title,
@@ -5668,7 +5669,7 @@ fn revision_marker(post: &crate::state::BoardPostRecord) -> String {
     }
 }
 
-fn limit_board_posts_preserving_stickies(
+pub(crate) fn limit_board_posts_preserving_stickies(
     posts: Vec<&crate::state::BoardPostRecord>,
     limit: usize,
 ) -> Vec<&crate::state::BoardPostRecord> {
@@ -5738,7 +5739,7 @@ fn print_thread_posts(
     Ok(0)
 }
 
-fn board_post_json(p: &crate::state::BoardPostRecord) -> serde_json::Value {
+pub(crate) fn board_post_json(p: &crate::state::BoardPostRecord) -> serde_json::Value {
     serde_json::json!({
         "post_id": p.post_id,
         "from": p.from,
@@ -5767,7 +5768,7 @@ fn board_post_json(p: &crate::state::BoardPostRecord) -> serde_json::Value {
     })
 }
 
-fn normalize_discussion_topic(topic: &str) -> MoteResult<String> {
+pub(crate) fn normalize_discussion_topic(topic: &str) -> MoteResult<String> {
     let topic = topic.trim();
     if topic.is_empty() {
         return Err(MoteError::Invalid(
@@ -7155,7 +7156,7 @@ fn cmd_session(
     }
 }
 
-fn session_json(s: &crate::state::SessionRecord, now_ts: &str) -> serde_json::Value {
+pub(crate) fn session_json(s: &crate::state::SessionRecord, now_ts: &str) -> serde_json::Value {
     let live = s.is_live(now_ts);
     let intent = if live { s.intent.as_ref() } else { None };
     serde_json::json!({

@@ -35,6 +35,7 @@ export interface MoteClient {
   history(id: string): Promise<HistoryEntry[]>;
   topics(): Promise<Topic[]>;
   posts(topic: string): Promise<Post[]>;
+  unread(): Promise<Post[]>;
   thread(postId: string): Promise<Post[]>;
   unrouted(): Promise<Unrouted>;
   actors(): Promise<Actor[]>;
@@ -69,21 +70,15 @@ export interface MoteClient {
   resolveRequest(msgId: string): Promise<void>;
 
   /** Returns an unsubscribe function. */
-  subscribe(onEvent: (event: MoteEvent) => void): () => void;
+  subscribe(
+    onEvent: (event: MoteEvent) => void,
+    onConnection?: (connected: boolean) => void,
+  ): () => void;
 }
 
 /* ------------------------------------------------------------------ */
 /* HTTP implementation — talks to `mote serve`.                        */
 /* ------------------------------------------------------------------ */
-
-function launchToken(): string {
-  const fromUrl = new URLSearchParams(window.location.search).get("t");
-  if (fromUrl) {
-    sessionStorage.setItem("mote.token", fromUrl);
-    return fromUrl;
-  }
-  return sessionStorage.getItem("mote.token") ?? "";
-}
 
 export class HttpClient implements MoteClient {
   constructor(private getActor: () => string, private base = "/api") {}
@@ -91,14 +86,14 @@ export class HttpClient implements MoteClient {
   private async req<T>(method: string, path: string, body?: unknown): Promise<T> {
     const headers: Record<string, string> = {
       "X-Mote-Actor": this.getActor(),
-      "X-Mote-Token": launchToken(),
     };
-    if (body !== undefined) headers["Content-Type"] = "application/json";
+    const isWrite = method !== "GET";
+    if (isWrite) headers["Content-Type"] = "application/json";
 
     const res = await fetch(this.base + path, {
       method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: isWrite ? JSON.stringify(body ?? {}) : undefined,
     });
 
     if (res.status === 409) {
@@ -130,6 +125,7 @@ export class HttpClient implements MoteClient {
   history(id: string) { return this.req<HistoryEntry[]>("GET", `/beads/${encodeURIComponent(id)}/history?include_rejected=1`); }
   topics() { return this.req<Topic[]>("GET", "/topics"); }
   posts(topic: string) { return this.req<Post[]>("GET", `/topics/${encodeURIComponent(topic)}/posts`); }
+  unread() { return this.req<Post[]>("GET", "/unread"); }
   thread(postId: string) { return this.req<Post[]>("GET", `/posts/${encodeURIComponent(postId)}/thread`); }
   unrouted() { return this.req<Unrouted>("GET", "/unrouted"); }
   actors() { return this.req<Actor[]>("GET", "/actors"); }
@@ -179,10 +175,15 @@ export class HttpClient implements MoteClient {
   }
   resolveRequest(msgId: string) { return this.req<void>("POST", `/messages/${encodeURIComponent(msgId)}/resolve`); }
 
-  subscribe(onEvent: (event: MoteEvent) => void): () => void {
+  subscribe(
+    onEvent: (event: MoteEvent) => void,
+    onConnection?: (connected: boolean) => void,
+  ): () => void {
     // EventSource resends Last-Event-ID on reconnect, and every envelope's
     // event_id is the resume cursor, so reconnection resyncs for free.
-    const src = new EventSource(`${this.base}/events?t=${encodeURIComponent(launchToken())}`);
+    const src = new EventSource(`${this.base}/events`);
+    src.onopen = () => onConnection?.(true);
+    src.onerror = () => onConnection?.(false);
     src.onmessage = (e) => {
       try {
         onEvent(JSON.parse(e.data) as MoteEvent);

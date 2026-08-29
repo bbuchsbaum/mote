@@ -53,7 +53,7 @@ export function IssuesView({
           <button className={`chip ${readyOnly ? "on" : ""}`} onClick={() => setReadyOnly(!readyOnly)}>ready only</button>
           <button className={`chip ${mine ? "on" : ""}`} onClick={() => setMine(!mine)}>mine</button>
           <input className="search" value={q} onChange={(e) => setQ(e.target.value)}
-            placeholder="filter title, tag, id…" aria-label="Filter beads" />
+            placeholder="filter title, tag, id…" aria-label="Filter beads" data-console-search />
         </div>
 
         {error && <div className="err">{error.message}</div>}
@@ -67,7 +67,7 @@ export function IssuesView({
                 const claim = claimOf(b.id);
                 const lease = claim ? leaseRemaining(claim.lease_until_ts) : null;
                 return (
-                  <button key={b.id} className={`row ${selected === b.id ? "sel" : ""}`}
+                  <button key={b.id} data-nav-item className={`row ${selected === b.id ? "sel" : ""}`}
                     onClick={() => onSelect(b.id === selected ? null : b.id)}>
                     <span className={`pri p${b.priority}`} />
                     <span className="row-body">
@@ -207,8 +207,8 @@ function BeadDetailPane({
             <h5>From discussion</h5>
             <div className="card" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {bead.discussion_sources.posts.map((p) => (
-                <button key={p} className="src" style={{ textAlign: "left" }} onClick={() => onOpenPost(p)}>
-                  {shortId(p)} →
+                <button key={p.post_id} className="src" style={{ textAlign: "left" }} onClick={() => onOpenPost(p.post_id)}>
+                  {shortId(p.post_id)} →
                 </button>
               ))}
             </div>

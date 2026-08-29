@@ -260,7 +260,8 @@ mote --json watch         # newline-delimited JSON for piping into other tools
 mote --json events --kind message,reservation,candidate
 mote --json events --kind message --for-actor bob --follow
 mote ui                   # interactive TUI dashboard (q to quit, ? for help)
-mote serve                # blocking loopback HTTP core for the local console
+mote serve                # local console on 127.0.0.1:7717
+mote serve --port 0       # same loopback-only server on an available port
 ```
 
 Most agent-facing commands accept `--json` for machine-readable output.
