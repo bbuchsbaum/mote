@@ -193,7 +193,24 @@ fn json_inbox_schema() {
         assert_obj_has_str(m, k);
     }
     assert_obj_has_array(m, "answers");
-    assert!(m.get("response_post_id").is_some());
+    for key in [
+        "response_post_id",
+        "ack_ts",
+        "resolved_op_id",
+        "resolved_ts",
+    ] {
+        assert!(
+            m.get(key).is_some(),
+            "shared message projection lacks {key}: {m}"
+        );
+    }
+    assert!(m["ack_ts"].is_null());
+    assert!(m["resolved_op_id"].is_null());
+    assert!(m["resolved_ts"].is_null());
+    assert!(
+        m.get("direction").is_none(),
+        "direction is thread-view context only"
+    );
     assert_eq!(m["from"], Value::String("alice".into()));
     assert_eq!(m["to"], Value::String("bob".into()));
 }

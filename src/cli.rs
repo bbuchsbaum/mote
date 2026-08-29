@@ -4228,8 +4228,7 @@ fn cmd_msg(
     }
 }
 
-/// Full JSON projection of a message record, shared by `msg requests`
-/// and `msg thread`.
+/// Full JSON projection shared by `inbox`, `msg requests`, and `msg thread`.
 pub(crate) fn message_json(request: &MsgRecord) -> serde_json::Value {
     serde_json::json!({
         "msg_id": request.msg_id,
@@ -5864,30 +5863,7 @@ fn write_inbox_messages(
     actor: Option<&ActorResolution>,
 ) -> MoteResult<()> {
     if json_mode {
-        let arr: Vec<_> = messages
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "msg_id": m.msg_id,
-                    "from": m.from,
-                    "to": m.to,
-                    "entity": m.entity,
-                    "reservation": m.reservation,
-                    "msg_kind": m.msg_kind,
-                    "body": m.body,
-                    "reply_to": m.reply_to,
-                    "correlation_id": m.correlation_id,
-                    "idempotency_key": m.idempotency_key,
-                    "answers": m.answers,
-                    "require_live": m.require_live,
-                    "recipient_presence": m.recipient_presence,
-                    "request_state": m.request_state.map(RequestState::as_str),
-                    "response_msg_id": m.response_msg_id,
-                    "response_post_id": m.response_post_id,
-                    "sent_ts": m.sent_ts,
-                })
-            })
-            .collect();
+        let arr: Vec<_> = messages.iter().map(|m| message_json(m)).collect();
         println!("{}", serde_json::to_string(&arr)?);
     } else if messages.is_empty() {
         let actor = actor.expect("empty finite inbox output carries resolved identity");
