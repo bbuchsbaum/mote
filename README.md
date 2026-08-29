@@ -65,6 +65,7 @@ All planes share the same publication mechanism and reducer.
 | Discussion | `board_topic`, `board_post`, `board_sticky`, `board_read`, `board_route` |
 | Lease    | `claim`, `release`                                                     |
 | Session  | `session_start`, `session_end`                                          |
+| Candidate | `candidate_propose`, `candidate_evidence`, `candidate_review`, `candidate_authorize`, `candidate_revoke`, `candidate_supersede`, `candidate_abandon`, `candidate_landed` |
 
 ### Conflict semantics
 
@@ -83,7 +84,13 @@ All planes share the same publication mechanism and reducer.
   leave permanent locks. Self-actor renewal is auto-accepted.
 - **Path reservations** are advisory leases over directory or exact-file
   paths. All-or-nothing accept. Two reservations from different actors over
-  overlapping paths cannot both be live at once.
+  overlapping paths cannot both be live at once. Closing their issue derives
+  an `orphaned` disposition while the TTL is still live: the paths continue to
+  block conflicts, but an actor holding a live claim on another open issue may
+  adopt them with a compare-and-set transition and recorded provenance. Live
+  or expired reservations cannot be adopted. A claim left on closed work is
+  likewise shown as orphaned; it cannot be renewed or transferred, only
+  released by its owner or allowed to expire.
 - **Discussion topics and posts** are append-only public board entries. Topics
   can be created before any posts exist, topic listings show creation and last
   activity times, and search covers both topics and posts. Posts have stable
@@ -101,6 +108,16 @@ All planes share the same publication mechanism and reducer.
 - **Session leases** are TTL leases over an identity rather than a work item.
   Several sessions may legitimately share one actor name; a lease is what makes
   each of them individually visible to `mote in-flight` and `mote doctor`.
+- **Candidates** bind an issue to immutable full Git object ids, declared
+  paths, reviewers, evidence producers, and one landing authorizer. Git is
+  inspected only by explicit CLI commands, which publish receipts; replay is
+  repository-independent and landability fails closed with stable reason
+  codes. Every candidate mutation requires an actor-scoped idempotency key.
+  Reservations may bind to a pending candidate, but only for paths in its
+  immutable declared path set. Landing, abandonment, supersession, or
+  authorization revocation makes a still-live candidate binding orphaned and
+  path-blocking. Regranting does not silently revive a lease invalidated by an
+  earlier revoke.
 
 ## CLI quick start
 
@@ -110,6 +127,10 @@ mote init
 mote actor set alice
 mote actor show
 mote actor list
+mote actor list --presence live
+mote actor list --active-within 10m
+mote actor status               # current actor
+mote actor status bob           # explicit actor, even without presence evidence
 
 # Issue plane.
 mote new "Fix auth bug" -p 1 --tag backend
@@ -133,23 +154,35 @@ mote release bd-...
 # Message plane.
 mote msg send --to bob --issue bd-... --kind request \
   --idempotency-key tests-request-1 "please take tests"
-mote inbox
+mote inbox                       # an empty result names actor and identity source
 mote --json inbox --wait --timeout 60  # pending mail, or one bounded wait
 mote --json inbox --follow       # current unacked messages, then new deliveries
 mote msg ack msg-...
 mote msg reply msg-... --kind response "tests are passing"
+# One ordinary message can explicitly fulfill several incoming requests.
+mote msg send --to alice --answers msg-... --answers msg-... "both are done"
 mote msg requests --state responded
 mote msg resolve msg-...
+mote msg thread bob              # full two-sided history with one actor
+mote msg thread bob --kind fyi --issue bd-...
 
 # Discussion plane.
 mote discuss topic new planning --title "Planning" --description "Coordination thread"
 mote discuss post --topic planning --body "proposal: split parser and test work"
 mote discuss post --topic planning --reply-to post-... --body "I can take tests"
+# A public post can explicitly fulfill an incoming request too.
+mote discuss post --topic planning --answers msg-... --body "public result"
 mote discuss sticky post-...
+mote discuss supersede post-OLD post-NEW
+mote discuss retract post-... --reason "premise disproved"
 mote discuss list --topic planning
 mote discuss search parser
-mote discuss unread
-mote discuss mark-read --topic planning
+mote --json discuss unread --page --limit 100
+mote --json discuss unread --page --before post-... --limit 100
+mote discuss mark-read --through post-...
+mote discuss watch planning
+mote discuss notifications --topic planning
+mote discuss unwatch planning
 mote discuss replies post-...
 mote discuss thread post-...
 mote discuss topics
@@ -168,17 +201,42 @@ mote discuss promote post-... --title "Split the parser" --tag parser
 mote discuss resolve post-...                   # no tracker action needed
 mote discuss unrouted                           # what still needs a bead
 
+# Explicit public-post attention; repeat --notify for multiple actors.
+mote discuss post --topic planning --notify bob --notify carol \
+  --idempotency-key planning-update-1 --body "Review requested"
+
 # Session plane: one identity per session, not one per checkout.
 eval "$(mote session start --as parser-session --label 'parser work')"
 mote session list
-mote session renew --ttl 7200
+mote session status working --message 'implementing parser' --issue bd-...
+mote session heartbeat --ttl 15m --renew-within 5m
 mote session end
+
+# Candidate plane: Mote records review and exact Git evidence; it never lands.
+mote candidate propose --issue bd-... --base origin/main \
+  --path src/lib.rs --authorizer release-owner --reviewer reviewer \
+  --idempotency-key proposal-1
+mote candidate evidence refresh cand-... --idempotency-key ancestry-2
+mote candidate review cand-... approve --idempotency-key review-1
+mote candidate authorize cand-... --grantee landing-agent \
+  --idempotency-key grant-1
+mote candidate show cand-...
+# After an external Git operation makes the commit reachable from the target:
+mote candidate landed cand-... --target origin/main \
+  --expect-phase OP_ID --expect-authorization OP_ID \
+  --idempotency-key landed-1
 
 # Path plane.
 mote reserve src/auth/ tests/auth/ --issue bd-... --ttl 3600
+mote reserve src/auth/token.rs --candidate cand-...  # declared candidate path only
 mote unreserve rv-...
+mote adopt rv-... --issue bd-successor  # adopter must claim the open successor first
 mote preflight --issue bd-... --paths src/auth/ tests/auth/
 mote who-has src/auth/token.rs
+
+# TTLs accept bare seconds for compatibility or one human suffix.
+mote claim bd-... --ttl 15m
+mote session renew --ttl 2h
 
 # Compounds (each is a sequence of single-mutation ops with compensation on partial failure).
 mote begin   bd-... --paths src/auth/ --note "taking auth"
@@ -186,7 +244,7 @@ mote begin   bd-... --paths src/auth/ --announce planning  # also post the claim
 mote handoff bd-... --to bob --note "tests remain" --release
 mote done    bd-... --note "shipped"
 mote board
-mote in-flight            # sessions, reservations, doing work, active topics
+mote in-flight            # sessions, reservations, doing work, topics, candidates
 
 # Diagnostics.
 mote doctor
@@ -199,12 +257,46 @@ mote import plan.json
 # Oversight (read-only).
 mote watch                # human-readable snapshots that re-render on store changes
 mote --json watch         # newline-delimited JSON for piping into other tools
-mote --json events --kind message,reservation
+mote --json events --kind message,reservation,candidate
 mote --json events --kind message --for-actor bob --follow
 mote ui                   # interactive TUI dashboard (q to quit, ? for help)
+mote serve                # blocking loopback HTTP core for the local console
 ```
 
 Most agent-facing commands accept `--json` for machine-readable output.
+Run `mote help --all` for one sorted list of every executable leaf command and
+its concise usage; `mote --json help --all` returns the same introspected
+surface as records with `path`, `usage`, and `about`. Because this view is
+generated from the Clap command tree, newly added nested commands appear
+without a separately maintained catalog.
+TTL-bearing claim, reservation, adoption, begin, and session commands accept
+bare seconds plus whole-number `s`, `m`, `h`, and `d` forms. The op log and
+JSON continue to record normalized integer seconds.
+
+### Literal text from stdin
+
+For multiline or shell-sensitive technical prose, prefer explicit stdin input
+over an argv string. Options that already carry text use `-` as the value:
+
+```sh
+mote new "Parser follow-up" --body - < issue-body.md
+mote discuss post --topic planning --body - < proposal.md
+mote begin bd-... --paths src/parser.rs --note - < progress.md
+```
+
+Commands whose body is positional use `--stdin` instead:
+
+```sh
+mote note bd-... --kind decision --stdin < decision.md
+mote msg send --to bob --issue bd-... --kind request --stdin < request.md
+mote msg reply msg-... --kind response --stdin < response.md
+```
+
+The explicit forms preserve UTF-8 text, including newlines, backticks, quotes,
+angle brackets, dollar-parentheses, Unicode, and leading dashes, without shell
+interpretation. Mote never reads stdin for these commands unless `--body -`,
+`--note -`, or `--stdin` is present. Supplying both positional text and its
+stdin form is rejected.
 
 `mote batch` reads JSONL, one action per line, and publishes the corresponding
 normal ops sequentially:
@@ -230,17 +322,36 @@ They are safe to leave running while agents are writing to the store.
   watch` writes one JSON snapshot per change to stdout, suitable for piping
   into `jq` or any small UI.
 - `mote in-flight` answers "what is being touched right now?" in one shot:
-  live session leases, path reservations, `doing` beads with their claim
-  holder, and topics active inside `--minutes`. Everything but the commit list
-  is replayed from the op log; recent commits are read from Git, labelled
-  advisory, and suppressed by `--no-git`.
+  actor presence summaries, live session leases, active and orphaned path
+  reservations, `doing` beads with their claim holder, topics active inside
+  `--minutes`, and candidate phases with structured landability reasons.
+  Everything but the commit list is replayed from the op log; recent commits
+  are read from Git, labelled advisory, and suppressed by `--no-git`.
 - `mote events` emits one accepted operation event per line. Filter categories
-  with `--kind issue,claim,reservation,message,discussion,session`, and filter events
+  with `--kind issue,claim,reservation,message,discussion,session,presence,candidate`, and filter events
   authored by or directly related to an actor with `--for-actor`. An explicit
   global `--actor` is shorthand for `--for-actor` on this read-only command.
   `--follow` waits for new ops using filesystem notifications plus the
   `--interval` fallback scan. Without `--follow`, existing matching events are
   emitted and the command exits.
+  Reservation TTL observations are the deliberate exception to the
+  operation-backed source: `reservation.expiring` and `reservation.expired`
+  are synthetic read-only projections with stable cursorable ids, the original
+  open op in `op_id`, and `reason=ttl_elapsed` after the deadline. They never
+  mint a fake close operation. The warning begins in the final 10% of the TTL
+  (at least one second and at most five minutes). Because Mote is daemonless,
+  warnings and expiry events exist only when `events --follow`, `watch`, the
+  TUI, or another polling view is running; a process that was not polling may
+  observe the expired state later without receiving the earlier warning.
+  Actor presence uses the same mechanism. Raw `session.started`,
+  `session.heartbeat`, `session.status_changed`, and `session.ended` traffic
+  remains in the `session` category. The quieter `presence` category emits
+  actor-level `presence.live` and `presence.ended` transitions plus synthetic
+  `presence.expiring` and `presence.expired` lease boundaries. Synthetic IDs
+  are stable resume cursors and never represent fake session-end operations.
+  An explicit end of the actor's final live session suppresses later TTL
+  expiry. If polling resumes only after a deadline, it emits `expired` and does
+  not manufacture the missed `expiring` warning.
 - `mote inbox --follow` first emits the actor's existing filtered unacked
   messages, then emits new matching message delivery events (`message.sent`,
   `message.responded`, or `message.declined`). Pass `--after <event-id>` to
@@ -251,6 +362,22 @@ They are safe to leave running while agents are writing to the store.
   non-empty. Otherwise it waits for one matching delivery, replays the inbox,
   prints it in the same shape as ordinary `mote inbox`, and exits. The default
   timeout is 60 seconds; `--timeout 0` is a non-blocking check.
+- `mote msg thread <peer>` prints every message exchanged with one actor in
+  send-order, in both directions, including acked messages and plain
+  `note`/`fyi` traffic. `mote inbox` is inbound and unacked-only and `mote msg
+  requests` is limited to request roots, so neither can reconstruct a
+  conversation. `--json` adds a `direction` field (`in` | `out`) relative to
+  the current actor; `--issue` and `--kind` filter the thread.
+- Direct sends are durable mailbox delivery for every recipient state,
+  including unseen and expired actors. Send diagnostics, request/thread JSON,
+  inbox JSON, and message events record the recipient's state, evidence source,
+  reason, and send-time timestamp. Use `msg send --require-live` only when the
+  action is meaningful for a recipient with a valid session lease; the reducer
+  rejects the send at the exact message timestamp otherwise. This guard does
+  not acknowledge or fulfill anything. Direct messages are addressed, not
+  private: anyone who can read the shared store can read them. Human sends keep
+  the bare message id on stdout for shell compatibility and print delivery
+  evidence on stderr; `--json` returns one structured delivery result.
 - Request messages have a lifecycle independent of acknowledgement. `msg ack`
   means only that the recipient saw the delivery. `msg reply` records a
   correlated `response` or `decline`; the original sender then closes the
@@ -258,10 +385,50 @@ They are safe to leave running while agents are writing to the store.
   open|responded|declined|resolved` lists request roots involving the current
   actor. Sender-scoped `--idempotency-key` values make identical send/reply
   retries return the original message id without creating a duplicate message.
-- `mote ui` opens a four-tab terminal dashboard (Overview / Beads / Discussion
-  / Activity) with full per-bead detail, recent op history (including
-  rejected ops with their reasons), and incremental refresh on filesystem
-  events. The Discussion tab reads like a forum: threads are indented under
+  A request recipient can instead put repeatable `--answers <msg-id>` flags on
+  one direct message or public discussion post. Mote validates the complete
+  answer set before applying any part of it and records the answering message
+  or post on every fulfilled request. Ordinary prose never changes request
+  state; the explicit flag is required.
+- Discussion unread pages are always chronological; sticky status never
+  reorders this cursor stream. `unread --limit N` selects the newest N unread
+  posts in the selected range. Ordinary JSON remains the historical post
+  array; add `--page` to receive an object containing `posts` plus `page`
+  boundary metadata, including the exact first, last, and snapshot-last post/op
+  ids and `has_older`/`has_newer`. To inspect a large backlog safely, save the
+  first page's `snapshot_last_post_id`, then request older pages with `--before
+  <first_post_id> --limit N` until `has_older` is false. Finally run
+  `mark-read --through <saved-snapshot-last-post-id>` (and the same `--topic`,
+  if used). Posts appended during paging remain unread. `--through` rejects an
+  unknown post, a topic mismatch, or a boundary older than the effective
+  cursor; omitting it retains the convenience behavior of marking through the
+  current head.
+- Topic watches route future external posts into durable attention without
+  creating channel membership. `discuss watch <topic>`, `unwatch`, and
+  `watches` maintain the explicit subscription register; `discuss
+  notifications` lists only unread posts routed by a watch or repeatable
+  `--notify <actor>` flags. It uses the same `--topic`, `--limit`, `--before`,
+  and `mark-read --through` cursor rules as ordinary unread discussion.
+  Publishers are excluded from their own notifications, named recipients need
+  not be online, and words resembling at-mentions in the body have no routing
+  effect. Notification metadata never changes public board visibility or adds
+  access control. Author-scoped post `--idempotency-key` retries return the
+  original post and do not duplicate attention.
+- Discussion corrections are immutable links. `discuss supersede OLD NEW`
+  leaves both bodies visible and marks the old post `superseded-by:NEW`; the
+  replacement lists what it supersedes. `discuss retract POST --reason ...`
+  likewise retains the body and concise single-line reason. Only the author may retract, and the
+  same actor must author both sides of a same-topic supersession. Self-links,
+  cross-topic links, cycles, unknown posts, and competing changes to a stale
+  post are rejected in deterministic replay order. List, thread, search,
+  unread, JSON, events, and TUI surfaces expose the disposition and provenance
+  rather than hiding obsolete history.
+- `mote ui` opens a six-tab terminal dashboard (Overview / Beads / Candidates
+  / Discussion / Activity / Agents). Candidate detail retains immutable Git anchors,
+  policy, reviews, authorization, supersession, and structured landability
+  reasons, so unavailable evidence is visibly blocked. It also has full
+  per-bead detail, recent op history (including rejected ops with their reasons),
+  and incremental refresh on filesystem events. The Discussion tab reads like a forum: threads are indented under
   their parent post, `→`/`Enter` focuses the thread pane, `j`/`k` (or `n`/`p`)
   jump post to post, and `u` jumps to the next unread post.
 
@@ -343,16 +510,40 @@ A CLI cannot set its parent shell's environment, so `session start` prints the
 values are shell-quoted, so an actor name containing spaces or metacharacters
 activates verbatim instead of truncating or executing.
 
-`session renew` and `session end` publish under the invoking actor, so only the
-owning identity can renew or end a lease. Ending is terminal.
+`session heartbeat`, `session status`, and `session end` publish under the
+invoking actor, so only the owning identity can mutate that session. Status is
+session-scoped and may be `available`, `working`, `waiting`, `blocked`, or
+`away`; concurrent sessions sharing an actor keep independent intents. Ending
+is terminal. The compatibility command `session renew` now publishes the same
+explicit heartbeat operation as `session heartbeat --force`; old stores whose
+clients renewed with repeated `session_start` operations still replay those
+records as heartbeats.
 
-Sharing one identity across concurrent sessions is not an error, but it is
-lossy: same-actor reservations never conflict, so two sessions can hold the
-same paths and neither `mote preflight` nor `mote who-has` will say so.
-`mote doctor` reports that overlap, concurrent leases sharing an actor, and
-generic actor names like `claude` or `agent`. It does not try to infer
-concurrency from process ids — every mote invocation is its own process, so
-that would flag ordinary sequential use.
+Heartbeat is write-budgeted for the append-only log. Without `--force`, it
+publishes only once the remaining lease is within `--renew-within` (five
+minutes by default). A general-purpose integration can poll freely while using
+a 15-minute TTL and five-minute margin, producing at most about six accepted
+heartbeats per hour. Use `--idempotency-key` when retrying a heartbeat or
+status write after an uncertain transport result; an identical retry returns
+the first result without another op or event.
+
+Sharing one identity across concurrent sessions is lossy: messages, claims,
+and bylines cannot distinguish the sessions. More importantly, when multiple
+session leases are live, Mote refuses actor-attributed writes whose identity
+comes only from `.mote/local/actor`. Activate a session, export `MOTE_ACTOR`, or
+pass `--actor`; read-only diagnosis and `session start --as ...` remain
+available. This guard prevents a concurrent `mote actor set` from silently
+retagging another live process. Explicit flag and environment identities retain
+their normal precedence, including for existing single-user scripts.
+
+New reservation operations reject a same-actor exact or prefix overlap and
+name the existing reservation; `preflight` reports it as
+`same_actor_duplicate` so a release cannot appear successful while a hidden
+duplicate remains. `mote doctor` reports the exact session-activation remedy,
+overlaps replayed from older v1 stores, concurrent leases sharing an actor, and
+generic actor names like `claude` or `agent`. It does not infer concurrency from
+process ids — every mote invocation is its own process, so that would flag
+ordinary sequential use.
 
 When separate Git worktrees should coordinate through one store, also export
 the same store root or its parent in both terminals:
@@ -361,9 +552,23 @@ the same store root or its parent in both terminals:
 export MOTE_STORE=/path/to/main-checkout/.mote
 ```
 
-`mote actor list` derives known actors and their last accepted activity, active
-claims/reservations, unacknowledged inbox count, and incoming open-request count
-without adding registration or heartbeat state.
+`mote actor status` returns the stable `mote.actor-status.v1` projection. It
+keeps valid session presence, substantive work, interaction, held work, and
+pending attention separate. A valid lease is the only `live` assertion;
+sessionless activity may be `recent`, but never silently upgrades to online.
+An actor known only because it received a message is `untracked` until it
+authors qualifying activity. Heartbeats count as observed presence evidence,
+not work or interaction.
+
+`mote actor list` preserves its legacy last-activity, active/orphaned lease,
+inbox, and request-count fields and embeds the same projection under `status`.
+Use `--presence live|recent|expired|untracked` or `--active-within <duration>`
+to filter that projection. `board`, `in-flight`, and `watch` expose actor arrays
+sampled at the same `as_of_ts` as the rest of their snapshot. The TUI's Agents
+tab shows the same source, reason, lease, intent, work, and attention evidence,
+including separate rows for concurrent sessions. Board, preflight, who-has,
+in-flight, watch, events, and the TUI preserve the same active/orphaned
+distinction; orphaned reservations remain conflict-producing.
 
 ### Actor and store resolution
 
@@ -374,6 +579,12 @@ Actor identity is resolved in this exact order:
 3. `.mote/local/actor` file
 
 If unresolved, mutating commands exit with code 3.
+
+For a human-readable empty inbox, Mote prints the resolved actor and source so
+silence cannot be mistaken for checking somebody else's mailbox. JSON inbox
+output remains the backward-compatible message array (`[]` when empty); pair it
+with `mote --json actor show` when a machine consumer also needs the actor and
+source diagnostic.
 
 Store location is resolved in this order:
 
@@ -454,6 +665,7 @@ Requires Rust 1.85+ (edition 2024).
 
 - `PRD.json` — working spec; the source of truth for design decisions
 - `mote_prd.md`, `mote_coordination_addendum.md` — historical design rationale
+- `candidate_protocol.md` — normative candidate, review, evidence, and landing protocol
 - `src/` — Rust crate
 - `tests/` — integration tests (storage, issue plane, notes/ready, claims/msgs,
   event delivery, coordination, replay determinism, crash/failpoint, property,

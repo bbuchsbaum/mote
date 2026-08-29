@@ -1,4 +1,6 @@
 use std::process::{Command, Output};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use jiff::Timestamp;
 use serde_json::Value;
@@ -255,10 +257,291 @@ fn legacy_request_op_without_metadata_replays_as_open_request() {
     assert!(json.get("reply_to").is_none());
     assert!(json.get("correlation_id").is_none());
     assert!(json.get("idempotency_key").is_none());
+    assert!(json.get("answers").is_none());
 
     publish::publish_op(&store, &op).unwrap();
     let state = reducer::replay_store(&store).unwrap();
     let request = &state.messages[&msg_id];
     assert_eq!(request.request_state, Some(RequestState::Open));
     assert_eq!(request.correlation_id.as_deref(), Some(msg_id.as_str()));
+}
+
+#[test]
+fn one_message_atomically_answers_multiple_requests_with_provenance() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let issue = new_issue(&td);
+    let request_one = run_ok(
+        &td,
+        &[
+            "msg", "send", "--to", "bob", "--issue", &issue, "--kind", "request", "one", "--actor",
+            "alice",
+        ],
+    );
+    let request_two = run_ok(
+        &td,
+        &[
+            "msg", "send", "--to", "bob", "--issue", &issue, "--kind", "request", "two", "--actor",
+            "alice",
+        ],
+    );
+    let answer_args = [
+        "msg",
+        "send",
+        "--to",
+        "alice",
+        "--answers",
+        &request_one,
+        "--answers",
+        &request_two,
+        "--idempotency-key",
+        "answer-both",
+        "both done",
+        "--actor",
+        "bob",
+    ];
+    let answer_id = run_ok(&td, &answer_args);
+    assert_eq!(run_ok(&td, &answer_args), answer_id);
+    let store = Store::open(&td.path().join(".mote")).unwrap();
+    let state = reducer::replay_store(&store).unwrap();
+    for request_id in [&request_one, &request_two] {
+        let request = &state.messages[request_id];
+        assert_eq!(request.request_state, Some(RequestState::Responded));
+        assert_eq!(request.response_msg_id.as_deref(), Some(answer_id.as_str()));
+        assert!(request.response_post_id.is_none());
+    }
+    let mut expected_answers = vec![request_one.clone(), request_two.clone()];
+    expected_answers.sort();
+    assert_eq!(state.messages[&answer_id].answers, expected_answers);
+
+    let rows: Value = serde_json::from_str(&run_ok(
+        &td,
+        &[
+            "--json",
+            "--actor",
+            "bob",
+            "msg",
+            "requests",
+            "--state",
+            "responded",
+        ],
+    ))
+    .unwrap();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["response_msg_id"] == answer_id)
+    );
+    let events: Vec<Value> = run_ok(&td, &["--json", "events", "--kind", "message"])
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let answer_event = events
+        .iter()
+        .find(|event| event["data"]["msg_id"] == answer_id)
+        .unwrap();
+    assert_eq!(answer_event["type"], "message.responded");
+    assert_eq!(answer_event["data"]["request_state"], "responded");
+
+    let ordinary = run_ok(
+        &td,
+        &[
+            "msg", "send", "--to", "bob", "--kind", "request", "three", "--actor", "alice",
+        ],
+    );
+    run_ok(
+        &td,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "alice",
+            "plain prose",
+            "--actor",
+            "bob",
+        ],
+    );
+    assert_eq!(
+        reducer::replay_store(&store).unwrap().messages[&ordinary].request_state,
+        Some(RequestState::Open)
+    );
+    let unauthorized = run(
+        &td,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "alice",
+            "--answers",
+            &ordinary,
+            "not mine",
+            "--actor",
+            "charlie",
+        ],
+    );
+    assert_eq!(unauthorized.status.code(), Some(2));
+}
+
+#[test]
+fn answer_targets_are_validated_as_one_atomic_set() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let valid = run_ok(
+        &td,
+        &[
+            "msg", "send", "--to", "bob", "--kind", "request", "valid", "--actor", "alice",
+        ],
+    );
+    let not_bobs = run_ok(
+        &td,
+        &[
+            "msg", "send", "--to", "charlie", "--kind", "request", "invalid", "--actor", "alice",
+        ],
+    );
+
+    let failed = run(
+        &td,
+        &[
+            "msg",
+            "send",
+            "--to",
+            "alice",
+            "--answers",
+            &valid,
+            "--answers",
+            &not_bobs,
+            "must not partly apply",
+            "--actor",
+            "bob",
+        ],
+    );
+    assert_eq!(failed.status.code(), Some(2));
+
+    let store = Store::open(&td.path().join(".mote")).unwrap();
+    let state = reducer::replay_store(&store).unwrap();
+    assert_eq!(
+        state.messages.len(),
+        2,
+        "rejected answer must not create a message"
+    );
+    assert_eq!(
+        state.messages[&valid].request_state,
+        Some(RequestState::Open)
+    );
+    assert_eq!(
+        state.messages[&not_bobs].request_state,
+        Some(RequestState::Open)
+    );
+}
+
+#[test]
+fn discussion_post_answers_request_and_two_process_answer_races_choose_one() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let request = run_ok(
+        &td,
+        &[
+            "msg", "send", "--to", "bob", "--kind", "request", "report", "--actor", "alice",
+        ],
+    );
+    let posted: Value = serde_json::from_str(&run_ok(
+        &td,
+        &[
+            "--json",
+            "discuss",
+            "post",
+            "--topic",
+            "status",
+            "--answers",
+            &request,
+            "public answer",
+            "--actor",
+            "bob",
+        ],
+    ))
+    .unwrap();
+    let post_id = posted["post_id"].as_str().unwrap();
+    let store = Store::open(&td.path().join(".mote")).unwrap();
+    let state = reducer::replay_store(&store).unwrap();
+    assert_eq!(
+        state.messages[&request].response_post_id.as_deref(),
+        Some(post_id)
+    );
+    assert_eq!(state.board_posts[post_id].answers, vec![request.clone()]);
+    let thread: Value =
+        serde_json::from_str(&run_ok(&td, &["--json", "discuss", "thread", post_id])).unwrap();
+    assert_eq!(thread[0]["answers"][0], request);
+
+    for iteration in 0..12 {
+        let raced = run_ok(
+            &td,
+            &[
+                "msg",
+                "send",
+                "--to",
+                "bob",
+                "--kind",
+                "request",
+                &format!("race {iteration}"),
+                "--actor",
+                "alice",
+            ],
+        );
+        let barrier = Arc::new(Barrier::new(3));
+        let answer_dir = td.path().to_path_buf();
+        let answer_request = raced.clone();
+        let answer_barrier = Arc::clone(&barrier);
+        let answer = thread::spawn(move || {
+            answer_barrier.wait();
+            Command::new(mote_bin())
+                .args([
+                    "msg",
+                    "send",
+                    "--to",
+                    "alice",
+                    "--answers",
+                    &answer_request,
+                    "answer",
+                    "--actor",
+                    "bob",
+                ])
+                .current_dir(answer_dir)
+                .output()
+                .unwrap()
+        });
+        let reply_dir = td.path().to_path_buf();
+        let reply_request = raced.clone();
+        let reply_barrier = Arc::clone(&barrier);
+        let reply = thread::spawn(move || {
+            reply_barrier.wait();
+            Command::new(mote_bin())
+                .args(["msg", "reply", &reply_request, "reply", "--actor", "bob"])
+                .current_dir(reply_dir)
+                .output()
+                .unwrap()
+        });
+        barrier.wait();
+        let answer = answer.join().unwrap();
+        let reply = reply.join().unwrap();
+        assert!(
+            answer.status.success() || reply.status.success(),
+            "at least the replay winner must report success"
+        );
+
+        let state = reducer::replay_store(&store).unwrap();
+        let request = &state.messages[&raced];
+        assert_eq!(request.request_state, Some(RequestState::Responded));
+        let winner = request.response_msg_id.as_deref().unwrap();
+        let accepted_answers: Vec<_> = state
+            .messages
+            .values()
+            .filter(|message| {
+                message.reply_to.as_deref() == Some(raced.as_str())
+                    || message.answers.iter().any(|answer| answer == &raced)
+            })
+            .collect();
+        assert_eq!(accepted_answers.len(), 1);
+        assert_eq!(accepted_answers[0].msg_id, winner);
+    }
 }

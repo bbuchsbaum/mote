@@ -4,10 +4,13 @@
 
 use std::process::Command;
 
+use jiff::Timestamp;
 use tempfile::TempDir;
 
+use mote::ids;
+use mote::op::{Op, make_reserve_open};
 use mote::state::RouteState;
-use mote::{reducer, repo::Store};
+use mote::{publish, reducer, repo::Store};
 
 fn mote_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mote")
@@ -53,12 +56,37 @@ fn run_full(td: &TempDir, actor: &str, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+fn legacy_reserve(store: &Store, actor: &str, bead: &str, paths: &[&str]) {
+    let mut op = make_reserve_open(
+        actor.into(),
+        ids::new_reservation_id(),
+        bead.into(),
+        paths.iter().map(|path| (*path).into()).collect(),
+        3600,
+        Timestamp::now(),
+    );
+    let Op::ReserveOpen(reserve) = &mut op else {
+        unreachable!()
+    };
+    reserve.v = 1;
+    publish::publish_op(store, &op).unwrap();
+}
+
 fn post(td: &TempDir, actor: &str, topic: &str, body: &str) -> String {
     run(
         td,
         actor,
         &["discuss", "post", "--topic", topic, "--body", body],
     )
+}
+
+#[test]
+fn session_human_ttl_is_reported_as_seconds_in_json() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let out = run(&td, "alice", &["--json", "session", "start", "--ttl", "1m"]);
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["ttl_s"], 60);
 }
 
 /// Pull a value out of a `session start` activation line. The value is
@@ -575,7 +603,7 @@ fn session_activation_lines_survive_the_shell_verbatim() {
 #[test]
 fn doctor_flags_the_shared_identity_failures_that_actually_hide_collisions() {
     let td = TempDir::new().unwrap();
-    init_store(&td);
+    let store = init_store(&td);
 
     // A distinct per-session name with nothing overlapping is clean, even
     // though every mote invocation ran as a separate process.
@@ -600,11 +628,11 @@ fn doctor_flags_the_shared_identity_failures_that_actually_hide_collisions() {
         v["warnings"]
     );
 
-    // Same-actor reservations never conflict, so an overlap between two of them
-    // is exactly the collision `preflight` and `who-has` cannot see.
+    // Historical v1 stores may contain same-actor overlaps. New v2 opens reject
+    // them, but doctor must keep the old state actionable.
     let bead = run(&td, "shared", &["new", "shared work"]);
-    run(&td, "shared", &["reserve", "--issue", &bead, "src/lib.rs"]);
-    run(&td, "shared", &["reserve", "--issue", &bead, "src/lib.rs"]);
+    legacy_reserve(&store, "shared", &bead, &["src/lib.rs"]);
+    legacy_reserve(&store, "shared", &bead, &["src/lib.rs"]);
     let overlapped = run(&td, "shared", &["--json", "doctor"]);
     let v: serde_json::Value = serde_json::from_str(&overlapped).unwrap();
     let warnings = v["warnings"].as_array().unwrap();
@@ -711,6 +739,10 @@ fn in_flight_answers_the_collision_question_in_one_invocation() {
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(v["reservations"].as_array().unwrap().len(), 1);
+    assert!(v["orphaned_claims"].is_array());
+    assert!(v["orphaned_reservations"].is_array());
+    assert!(v["expiring_reservations"].is_array());
+    assert!(v["expired_reservations"].is_array());
     assert_eq!(v["doing"][0]["id"], bead.as_str());
     assert_eq!(v["doing"][0]["claimed_by"], "session-a");
     assert_eq!(v["topics"][0]["topic"], "roadmap");
@@ -718,7 +750,15 @@ fn in_flight_answers_the_collision_question_in_one_invocation() {
     assert_eq!(v["recent_commits_advisory"].as_array().unwrap().len(), 0);
 
     let human = run(&td, "session-a", &["in-flight", "--no-git"]);
-    for section in ["SESSIONS", "RESERVATIONS", "DOING", "ACTIVE TOPICS"] {
+    for section in [
+        "SESSIONS",
+        "RESERVATIONS",
+        "ORPHANED LEASES",
+        "EXPIRY WARNINGS",
+        "EXPIRED RESERVATIONS",
+        "DOING",
+        "ACTIVE TOPICS",
+    ] {
         assert!(human.contains(section), "missing {section} in:\n{human}");
     }
 }
@@ -776,16 +816,12 @@ fn summary_rejects_two_sources_of_text_like_every_other_post_command() {
 #[test]
 fn doctor_reports_one_finding_per_colliding_reservation_pair() {
     let td = TempDir::new().unwrap();
-    init_store(&td);
+    let store = init_store(&td);
     let bead = run(&td, "shared", &["new", "shared work"]);
     // A multi-path reservation against a directory reservation overlaps twice,
     // but it is one collision, not two.
-    run(
-        &td,
-        "shared",
-        &["reserve", "--issue", &bead, "src/a.rs", "src/b.rs"],
-    );
-    run(&td, "shared", &["reserve", "--issue", &bead, "src/"]);
+    legacy_reserve(&store, "shared", &bead, &["src/a.rs", "src/b.rs"]);
+    legacy_reserve(&store, "shared", &bead, &["src/"]);
 
     let json = run(&td, "shared", &["--json", "doctor"]);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();

@@ -4,9 +4,12 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use jiff::Timestamp;
+use serde_json::Value;
 use tempfile::TempDir;
 
-use mote::{reducer, repo::Store};
+use mote::op::{Op, make_board_retract, make_board_supersede};
+use mote::{publish, reducer, repo::Store};
 
 fn mote_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mote")
@@ -38,6 +41,38 @@ fn new_bead(td: &TempDir, title: &str, actor: &str) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn claim_accepts_human_ttl_and_retains_seconds_on_wire() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+    let id = new_bead(&td, "human ttl", "alice");
+    let out = Command::new(mote_bin())
+        .args(["claim", &id, "--ttl", "15m", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    let claim_op_id = state.history[&id]
+        .iter()
+        .find(|entry| entry.kind == "claim" && entry.accepted)
+        .unwrap()
+        .op_id
+        .clone();
+    let op: Op = serde_json::from_slice(
+        &std::fs::read(store.ops_dir().join(format!("{claim_op_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    let Op::Claim(claim) = op else {
+        panic!("expected claim op")
+    };
+    assert_eq!(claim.ttl_s, 900);
 }
 
 #[test]
@@ -571,6 +606,330 @@ fn discussion_board_unread_cursor_tracks_new_external_posts() {
     assert!(
         unread4_s.contains(&second_id),
         "new reply should be unread and addressable by post id:\n{unread4_s}"
+    );
+}
+
+#[test]
+fn discussion_unread_pages_are_chronological_stable_and_markable_through() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let run_ok = |args: &[&str]| {
+        let out = Command::new(mote_bin())
+            .args(args)
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "command {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let mut post_ids = Vec::new();
+    for body in ["one", "two", "three", "four", "five"] {
+        post_ids.push(run_ok(&[
+            "discuss", "post", "--topic", "general", body, "--actor", "alice",
+        ]));
+    }
+    run_ok(&["discuss", "sticky", &post_ids[0], "--actor", "alice"]);
+
+    let newest: Value = serde_json::from_str(&run_ok(&[
+        "--json", "discuss", "unread", "--page", "--limit", "2", "--actor", "bob",
+    ]))
+    .unwrap();
+    let newest_ids: Vec<_> = newest["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|post| post["post_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(newest_ids, vec![post_ids[3].as_str(), post_ids[4].as_str()]);
+    assert_eq!(newest["page"]["order"], "chronological");
+    assert_eq!(newest["page"]["window"], "newest");
+    assert_eq!(newest["page"]["has_older"], true);
+    assert_eq!(newest["page"]["snapshot_last_post_id"], post_ids[4]);
+
+    // A concurrent append is newer than the captured first-page boundary and
+    // therefore cannot create a duplicate or gap while paging backward.
+    let appended = run_ok(&[
+        "discuss", "post", "--topic", "general", "six", "--actor", "alice",
+    ]);
+    let middle: Value = serde_json::from_str(&run_ok(&[
+        "--json",
+        "discuss",
+        "unread",
+        "--page",
+        "--before",
+        &post_ids[3],
+        "--limit",
+        "2",
+        "--actor",
+        "bob",
+    ]))
+    .unwrap();
+    let oldest: Value = serde_json::from_str(&run_ok(&[
+        "--json",
+        "discuss",
+        "unread",
+        "--page",
+        "--before",
+        &post_ids[1],
+        "--limit",
+        "2",
+        "--actor",
+        "bob",
+    ]))
+    .unwrap();
+    let paged: Vec<_> = oldest["posts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(middle["posts"].as_array().unwrap())
+        .chain(newest["posts"].as_array().unwrap())
+        .map(|post| post["post_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paged,
+        post_ids[..5].iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert!(!paged.contains(&appended.as_str()));
+
+    run_ok(&[
+        "discuss",
+        "mark-read",
+        "--through",
+        &post_ids[4],
+        "--actor",
+        "bob",
+    ]);
+    let remaining: Value = serde_json::from_str(&run_ok(&[
+        "--json", "discuss", "unread", "--page", "--actor", "bob",
+    ]))
+    .unwrap();
+    assert_eq!(remaining["posts"].as_array().unwrap().len(), 1);
+    assert_eq!(remaining["posts"][0]["post_id"], appended);
+
+    let older = Command::new(mote_bin())
+        .args([
+            "discuss",
+            "mark-read",
+            "--through",
+            &post_ids[2],
+            "--actor",
+            "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(older.status.code(), Some(2));
+    for args in [
+        vec![
+            "discuss",
+            "mark-read",
+            "--through",
+            "post-missing",
+            "--actor",
+            "bob",
+        ],
+        vec![
+            "discuss",
+            "mark-read",
+            "--topic",
+            "other",
+            "--through",
+            &appended,
+            "--actor",
+            "bob",
+        ],
+    ] {
+        let out = Command::new(mote_bin())
+            .args(args)
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3));
+    }
+}
+
+#[test]
+fn discussion_supersession_and_retraction_are_author_owned_and_deterministic() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+    let post = |topic: &str, body: &str, actor: &str| {
+        let out = Command::new(mote_bin())
+            .args(["discuss", "post", "--topic", topic, body, "--actor", actor])
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let old = post("design", "old instruction", "alice");
+    let replacement = post("design", "replacement instruction", "alice");
+    let supersede = Command::new(mote_bin())
+        .args([
+            "discuss",
+            "supersede",
+            &old,
+            &replacement,
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(supersede.status.success());
+
+    let state = reducer::replay_store(&store).unwrap();
+    assert_eq!(state.board_posts[&old].disposition(), "superseded");
+    assert_eq!(
+        state.board_posts[&old].superseded_by.as_deref(),
+        Some(replacement.as_str())
+    );
+    assert_eq!(
+        state.board_posts[&replacement].supersedes,
+        vec![old.clone()]
+    );
+    let listed = Command::new(mote_bin())
+        .args(["discuss", "list", "--topic", "design"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains(&format!("status=superseded-by:{replacement}")));
+    assert!(listed.contains(&format!("status=active supersedes={old}")));
+
+    // Reversing the link would form a cycle, and an already-obsolete post
+    // cannot win a second competing disposition.
+    for args in [
+        vec![
+            "discuss",
+            "supersede",
+            &replacement,
+            &old,
+            "--actor",
+            "alice",
+        ],
+        vec![
+            "discuss",
+            "supersede",
+            &replacement,
+            &replacement,
+            "--actor",
+            "alice",
+        ],
+    ] {
+        let out = Command::new(mote_bin())
+            .args(args)
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+    }
+    let cross_topic = post("other", "other topic", "alice");
+    let unauthorized = post("design", "bob's post", "bob");
+    for (new, actor) in [(&cross_topic, "alice"), (&unauthorized, "alice")] {
+        let active = post("design", "fresh old", "alice");
+        let out = Command::new(mote_bin())
+            .args(["discuss", "supersede", &active, new, "--actor", actor])
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+    }
+
+    let withdrawn = post("design", "withdraw me", "alice");
+    let multiline = Command::new(mote_bin())
+        .args([
+            "discuss",
+            "retract",
+            &withdrawn,
+            "--reason",
+            "first line\nsecond line",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(multiline.status.code(), Some(3));
+    let denied = Command::new(mote_bin())
+        .args([
+            "discuss", "retract", &withdrawn, "--reason", "wrong", "--actor", "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(denied.status.code(), Some(2));
+    let retracted = Command::new(mote_bin())
+        .args([
+            "discuss",
+            "retract",
+            &withdrawn,
+            "--reason",
+            "premise disproved",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(retracted.status.success());
+    let state = reducer::replay_store(&store).unwrap();
+    assert_eq!(state.board_posts[&withdrawn].disposition(), "retracted");
+    assert_eq!(
+        state.board_posts[&withdrawn].retraction_reason.as_deref(),
+        Some("premise disproved")
+    );
+
+    let reducer_guard = post("design", "reducer guard", "alice");
+    let invalid_op = make_board_retract(
+        "alice".into(),
+        reducer_guard.clone(),
+        "line one\nline two".into(),
+        Timestamp::now(),
+    );
+    let invalid_name = publish::publish_op(&store, &invalid_op).unwrap();
+    let guarded = reducer::replay_store(&store).unwrap();
+    assert!(!guarded.was_accepted(invalid_name.as_str()));
+    assert_eq!(guarded.board_posts[&reducer_guard].disposition(), "active");
+
+    // Two concurrently publishable supersessions reduce to one winner in
+    // immutable op-name order, regardless of directory iteration order.
+    let raced_old = post("race", "old", "alice");
+    let candidate_a = post("race", "candidate a", "alice");
+    let candidate_b = post("race", "candidate b", "alice");
+    let timestamp = Timestamp::now();
+    let op_a = make_board_supersede(
+        "alice".into(),
+        raced_old.clone(),
+        candidate_a.clone(),
+        timestamp,
+    );
+    let op_b = make_board_supersede(
+        "alice".into(),
+        raced_old.clone(),
+        candidate_b.clone(),
+        timestamp,
+    );
+    let name_a = publish::publish_op(&store, &op_a).unwrap();
+    let name_b = publish::publish_op(&store, &op_b).unwrap();
+    let state = reducer::replay_store(&store).unwrap();
+    assert_ne!(
+        state.was_accepted(name_a.as_str()),
+        state.was_accepted(name_b.as_str())
+    );
+    let winner = state.board_posts[&raced_old]
+        .superseded_by
+        .as_deref()
+        .unwrap();
+    assert!(winner == candidate_a || winner == candidate_b);
+    assert_eq!(
+        reducer::replay_store(&store).unwrap().board_posts[&raced_old]
+            .superseded_by
+            .as_deref(),
+        Some(winner)
     );
 }
 
@@ -1488,4 +1847,180 @@ fn ready_excludes_foreign_claimed() {
         .map(|b| b.id.as_str())
         .collect();
     assert!(alice_ready.contains(&id.as_str()));
+}
+
+/// The gap the console exposed: `inbox` is inbound-and-unacked-only and
+/// `msg requests` covers request roots, so a plain `note`/`fyi` the actor sent
+/// was listable nowhere. `msg thread` folds both directions.
+#[test]
+fn msg_thread_shows_both_directions_including_sent_and_acked() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let issue = new_bead(&td, "parser panic", "alice");
+    let bin = mote_bin();
+
+    let send = |from: &str, to: &str, kind: &str, body: &str, issue: Option<&str>| -> String {
+        let mut args = vec![
+            "msg", "send", "--to", to, "--kind", kind, body, "--actor", from,
+        ];
+        if let Some(i) = issue {
+            args.extend_from_slice(&["--issue", i]);
+        }
+        let out = Command::new(bin)
+            .args(&args)
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "send failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+
+    let request = send(
+        "bob",
+        "alice",
+        "request",
+        "please take the parser work",
+        Some(&issue),
+    );
+    let sent_fyi = send(
+        "alice",
+        "bob",
+        "fyi",
+        "taking it, reserving src/parser.rs",
+        None,
+    );
+    let reply = send("bob", "alice", "note", "thanks, tests behind you", None);
+    let unrelated = send("alice", "carol", "note", "unrelated third party", None);
+
+    // alice acks the request, which removes it from her inbox entirely.
+    let ack = Command::new(bin)
+        .args(["msg", "ack", &request, "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(ack.status.success());
+
+    // Neither existing surface can see the message alice sent.
+    let inbox = Command::new(bin)
+        .args(["inbox", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    let inbox_s = String::from_utf8(inbox.stdout).unwrap();
+    assert!(
+        !inbox_s.contains(&sent_fyi),
+        "inbox must not list a message alice sent: {inbox_s}"
+    );
+    assert!(
+        !inbox_s.contains(&request),
+        "inbox must not list an acked message: {inbox_s}"
+    );
+
+    let requests = Command::new(bin)
+        .args(["msg", "requests", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    let requests_s = String::from_utf8(requests.stdout).unwrap();
+    assert!(
+        !requests_s.contains(&sent_fyi),
+        "msg requests must not list a non-request message: {requests_s}"
+    );
+
+    // `msg thread` sees all three, in send-order, and excludes the third party.
+    let thread = Command::new(bin)
+        .args(["--json", "msg", "thread", "bob", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        thread.status.success(),
+        "msg thread failed: {}",
+        String::from_utf8_lossy(&thread.stderr)
+    );
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&thread.stdout).expect("thread must emit a JSON array");
+    let ids: Vec<&str> = rows.iter().map(|r| r["msg_id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        vec![request.as_str(), sent_fyi.as_str(), reply.as_str()],
+        "thread must be both directions in send-order"
+    );
+    assert!(
+        !ids.contains(&unrelated.as_str()),
+        "thread must exclude messages with other actors"
+    );
+
+    let dirs: Vec<&str> = rows
+        .iter()
+        .map(|r| r["direction"].as_str().unwrap())
+        .collect();
+    assert_eq!(dirs, vec!["in", "out", "in"]);
+    assert!(
+        rows[0]["ack_ts"].is_string(),
+        "acked request must retain its ack in the thread view"
+    );
+    assert_eq!(rows[0]["request_state"].as_str(), Some("open"));
+
+    // The same fold is available to library consumers.
+    let store = Store::open(&td.path().join(".mote")).unwrap();
+    let state = reducer::replay_store(&store).unwrap();
+    let convo = state.conversation_between("alice", "bob");
+    assert_eq!(convo.len(), 3);
+    assert_eq!(
+        state.conversation_between("bob", "alice").len(),
+        3,
+        "conversation_between must be symmetric in its arguments"
+    );
+    assert_eq!(state.conversation_between("alice", "dave").len(), 0);
+}
+
+#[test]
+fn msg_thread_filters_by_issue_and_kind() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let issue = new_bead(&td, "auth bug", "alice");
+    let bin = mote_bin();
+
+    for (kind, body, with_issue) in [
+        ("fyi", "on the auth bug now", true),
+        ("note", "unrelated chatter", false),
+    ] {
+        let mut args = vec![
+            "msg", "send", "--to", "bob", "--kind", kind, body, "--actor", "alice",
+        ];
+        if with_issue {
+            args.extend_from_slice(&["--issue", &issue]);
+        }
+        let out = Command::new(bin)
+            .args(&args)
+            .current_dir(td.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    let by_issue = Command::new(bin)
+        .args([
+            "msg", "thread", "bob", "--issue", &issue, "--actor", "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    let s = String::from_utf8(by_issue.stdout).unwrap();
+    assert!(s.contains("on the auth bug now"), "{s}");
+    assert!(!s.contains("unrelated chatter"), "{s}");
+
+    let by_kind = Command::new(bin)
+        .args(["msg", "thread", "bob", "--kind", "note", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    let s = String::from_utf8(by_kind.stdout).unwrap();
+    assert!(s.contains("unrelated chatter"), "{s}");
+    assert!(!s.contains("on the auth bug now"), "{s}");
 }

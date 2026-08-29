@@ -192,6 +192,8 @@ fn json_inbox_schema() {
     for k in &["msg_id", "from", "to", "msg_kind", "body", "sent_ts"] {
         assert_obj_has_str(m, k);
     }
+    assert_obj_has_array(m, "answers");
+    assert!(m.get("response_post_id").is_some());
     assert_eq!(m["from"], Value::String("alice".into()));
     assert_eq!(m["to"], Value::String("bob".into()));
 }
@@ -220,6 +222,8 @@ fn json_actor_list_includes_authors_and_message_recipients() {
         for key in [
             "active_claims",
             "active_reservations",
+            "orphaned_claims",
+            "orphaned_reservations",
             "inbox_unacked",
             "incoming_open_requests",
         ] {
@@ -295,7 +299,14 @@ fn json_preflight_schema_clear_and_conflict() {
     let conflicts = v["conflicts"].as_array().unwrap();
     assert_eq!(conflicts.len(), 1);
     let c = &conflicts[0];
-    for k in &["new_path", "held_path", "actor", "reservation_id"] {
+    for k in &[
+        "new_path",
+        "held_path",
+        "actor",
+        "reservation_id",
+        "disposition",
+        "conflict_kind",
+    ] {
         assert_obj_has_str(c, k);
     }
 }
@@ -321,6 +332,7 @@ fn json_who_has_schema() {
         "reservation_id",
         "entity",
         "lease_until_ts",
+        "disposition",
     ] {
         assert_obj_has_str(&arr[0], k);
     }
@@ -337,6 +349,10 @@ fn json_board_schema() {
     assert!(o.contains_key("status_counts"));
     assert_obj_has_array(&v, "active_claims");
     assert_obj_has_array(&v, "active_reservations");
+    assert_obj_has_array(&v, "orphaned_claims");
+    assert_obj_has_array(&v, "orphaned_reservations");
+    assert_obj_has_array(&v, "expiring_reservations");
+    assert_obj_has_array(&v, "expired_reservations");
     assert_obj_has_int(&v, "inbox_unacked");
 }
 
@@ -435,6 +451,17 @@ fn json_discussion_forum_surfaces_schema() {
     assert!(post["sticky"].is_boolean());
     assert!(post.get("reply_to").is_some());
     assert!(post.get("sticky_op_id").is_some());
+    assert_obj_has_str(post, "disposition");
+    assert_obj_has_array(post, "supersedes");
+    assert!(post["retracted"].is_boolean());
+    for key in [
+        "superseded_by",
+        "superseded_op_id",
+        "retraction_reason",
+        "retracted_op_id",
+    ] {
+        assert!(post.get(key).is_some());
+    }
 
     let thread = run_json(&td, &["discuss", "thread", &root_id]);
     let thread_arr = thread.as_array().expect("thread JSON must be an array");
@@ -456,9 +483,30 @@ fn json_discussion_forum_surfaces_schema() {
             .any(|p| p["post_id"] == root_id)
     );
 
-    let unread = run_json(&td, &["--actor", "carol", "discuss", "unread"]);
-    let unread_arr = unread.as_array().expect("unread JSON must be an array");
-    assert_eq!(unread_arr.len(), 2);
+    let legacy_unread = run_json(&td, &["--actor", "carol", "discuss", "unread"]);
+    assert_eq!(legacy_unread.as_array().unwrap().len(), 2);
+    let unread = run_json(&td, &["--actor", "carol", "discuss", "unread", "--page"]);
+    let unread_obj = unread.as_object().expect("unread JSON must be an object");
+    assert_eq!(unread_obj["posts"].as_array().unwrap().len(), 2);
+    let page = unread_obj["page"].as_object().unwrap();
+    for key in [
+        "order",
+        "window",
+        "count",
+        "has_older",
+        "has_newer",
+        "first_post_id",
+        "first_op_id",
+        "last_post_id",
+        "last_op_id",
+        "snapshot_last_post_id",
+        "snapshot_last_op_id",
+        "effective_cursor_op_id",
+    ] {
+        assert!(page.contains_key(key), "missing page key {key}");
+    }
+    assert_eq!(page["order"], "chronological");
+    assert_eq!(page["window"], "newest");
 }
 
 #[test]

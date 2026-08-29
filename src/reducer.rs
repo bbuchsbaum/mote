@@ -7,11 +7,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::op::{
-    BoardPostOp, BoardReadOp, BoardRouteOp, BoardStickyOp, BoardTopicOp, ClaimOp, CloseOp,
-    CreateOp, DeleteOp, DepOp, MsgAckOp, MsgResolveOp, MsgSendOp, NoteOp, Op, PatchOp, RelOp,
-    ReleaseOp, ReserveCloseOp, ReserveOpenOp, ScalarSet, SessionEndOp, SessionStartOp, Status,
-    TagOp, VALID_POST_KINDS, VALID_REPLY_KINDS, VALID_ROUTE_STATES, validate_idempotency_key,
-    validate_msg_kind, validate_note_kind, validate_post_kind, validate_route_state,
+    BoardPostOp, BoardReadOp, BoardRetractOp, BoardRouteOp, BoardStickyOp, BoardSupersedeOp,
+    BoardTopicOp, BoardWatchOp, CandidateAbandonOp, CandidateAuthorizeOp, CandidateEvidenceOp,
+    CandidateLandedOp, CandidateProposeOp, CandidateReviewOp, CandidateRevokeOp,
+    CandidateSupersedeOp, ClaimOp, CloseOp, CreateOp, DeleteOp, DepOp, MsgAckOp, MsgResolveOp,
+    MsgSendOp, NoteOp, Op, PatchOp, RelOp, ReleaseOp, ReserveAdoptOp, ReserveCloseOp,
+    ReserveOpenOp, ScalarSet, SessionEndOp, SessionHeartbeatOp, SessionStartOp, SessionStatusOp,
+    Status, TagOp, VALID_POST_KINDS, VALID_REPLY_KINDS, VALID_ROUTE_STATES,
+    validate_idempotency_key, validate_msg_kind, validate_note_kind, validate_post_kind,
+    validate_route_state, validate_session_intent,
 };
 use crate::repo::Store;
 use crate::state::{Bead, HistoryEntry, RequestState, RouteState, State};
@@ -94,6 +98,100 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
     let kind = op.kind_name();
     let actor = op.actor().to_string();
     let ts = op.ts().to_string();
+    let candidate_retry = op.candidate_idempotency().map(|(candidate_id, key)| {
+        (
+            candidate_id.to_string(),
+            key.to_string(),
+            crate::candidate::action_digest(&op),
+        )
+    });
+    let session_retry = match &op {
+        Op::SessionHeartbeat(o) => o.idempotency_key.as_deref(),
+        Op::SessionStatus(o) => o.idempotency_key.as_deref(),
+        _ => None,
+    }
+    .map(|key| {
+        (
+            key.to_string(),
+            crate::op::session_action_digest(&op).expect("session retry op has a digest"),
+        )
+    });
+    if let Some((key, digest)) = &session_retry {
+        if !validate_idempotency_key(key) {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                &actor,
+                &ts,
+                "idempotency_key must be 1..=128 trimmed printable characters".into(),
+            );
+            return;
+        }
+        if let Some(previous) = state.session_idempotency.get(&(actor.clone(), key.clone())) {
+            let reason = if previous.digest == *digest && previous.kind == kind {
+                format!("idempotent retry already accepted as op {}", previous.op_id)
+            } else {
+                format!(
+                    "idempotency key `{key}` already used by op {} for a different session action",
+                    previous.op_id
+                )
+            };
+            reject_orphan(state, op_id, kind, &actor, &ts, reason);
+            return;
+        }
+    }
+    if let Some((candidate_id, key, digest)) = &candidate_retry {
+        if !validate_idempotency_key(key) {
+            reject(
+                state,
+                candidate_id,
+                op_id,
+                kind,
+                &actor,
+                &ts,
+                "invalid idempotency key".into(),
+            );
+            return;
+        }
+        let digest = match digest {
+            Ok(digest) => digest,
+            Err(error) => {
+                reject(
+                    state,
+                    candidate_id,
+                    op_id,
+                    kind,
+                    &actor,
+                    &ts,
+                    format!("cannot digest candidate action: {error}"),
+                );
+                return;
+            }
+        };
+        if let Some(previous) = state
+            .candidate_idempotency
+            .get(&(actor.clone(), key.clone()))
+        {
+            if previous.candidate_id == *candidate_id && previous.digest == *digest {
+                accept(state, candidate_id, op_id, kind, &actor, &ts);
+            } else {
+                reject(
+                    state,
+                    candidate_id,
+                    op_id,
+                    kind,
+                    &actor,
+                    &ts,
+                    format!(
+                        "idempotency key already used by op {} for a different action",
+                        previous.op_id
+                    ),
+                );
+            }
+            return;
+        }
+    }
 
     match op {
         Op::Create(o) => apply_create(state, op_id, kind, &actor, &ts, o),
@@ -114,13 +212,52 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
         Op::MsgResolve(o) => apply_msg_resolve(state, op_id, kind, &actor, &ts, o),
         Op::BoardPost(o) => apply_board_post(state, op_id, kind, &actor, &ts, o),
         Op::BoardRead(o) => apply_board_read(state, op_id, kind, &actor, &ts, o),
+        Op::BoardWatch(o) => apply_board_watch(state, op_id, kind, &actor, &ts, o),
         Op::BoardTopic(o) => apply_board_topic(state, op_id, kind, &actor, &ts, o),
         Op::BoardSticky(o) => apply_board_sticky(state, op_id, kind, &actor, &ts, o),
+        Op::BoardSupersede(o) => apply_board_supersede(state, op_id, kind, &actor, &ts, o),
+        Op::BoardRetract(o) => apply_board_retract(state, op_id, kind, &actor, &ts, o),
         Op::BoardRoute(o) => apply_board_route(state, op_id, kind, &actor, &ts, o),
         Op::SessionStart(o) => apply_session_start(state, op_id, kind, &actor, &ts, o),
+        Op::SessionHeartbeat(o) => apply_session_heartbeat(state, op_id, kind, &actor, &ts, o),
+        Op::SessionStatus(o) => apply_session_status(state, op_id, kind, &actor, &ts, o),
         Op::SessionEnd(o) => apply_session_end(state, op_id, kind, &actor, &ts, o),
         Op::ReserveOpen(o) => apply_reserve_open(state, op_id, kind, &actor, &ts, o),
         Op::ReserveClose(o) => apply_reserve_close(state, op_id, kind, &actor, &ts, o),
+        Op::ReserveAdopt(o) => apply_reserve_adopt(state, op_id, kind, &actor, &ts, o),
+        Op::CandidatePropose(o) => apply_candidate_propose(state, op_id, kind, &actor, &ts, o),
+        Op::CandidateEvidence(o) => apply_candidate_evidence(state, op_id, kind, &actor, &ts, o),
+        Op::CandidateReview(o) => apply_candidate_review(state, op_id, kind, &actor, &ts, o),
+        Op::CandidateAuthorize(o) => apply_candidate_authorize(state, op_id, kind, &actor, &ts, o),
+        Op::CandidateRevoke(o) => apply_candidate_revoke(state, op_id, kind, &actor, &ts, o),
+        Op::CandidateSupersede(o) => apply_candidate_supersede(state, op_id, kind, &actor, &ts, o),
+        Op::CandidateAbandon(o) => apply_candidate_abandon(state, op_id, kind, &actor, &ts, o),
+        Op::CandidateLanded(o) => apply_candidate_landed(state, op_id, kind, &actor, &ts, o),
+    }
+
+    if let Some((candidate_id, key, Ok(digest))) = candidate_retry {
+        if state.was_accepted(op_id) {
+            state.candidate_idempotency.insert(
+                (actor.clone(), key),
+                crate::state::CandidateIdempotencyRecord {
+                    candidate_id,
+                    digest,
+                    op_id: op_id.to_string(),
+                },
+            );
+        }
+    }
+    if let Some((key, digest)) = session_retry {
+        if state.was_accepted(op_id) {
+            state.session_idempotency.insert(
+                (actor, key),
+                crate::state::SessionIdempotencyRecord {
+                    op_id: op_id.to_string(),
+                    kind: kind.to_string(),
+                    digest,
+                },
+            );
+        }
     }
 }
 
@@ -671,11 +808,13 @@ fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
     enum Decision {
         Accept,
         EntityDeleted,
+        EntityClosed,
         EntityMissing,
         Held(String),
     }
     let decision = match state.beads.get(&entity) {
         Some(b) if b.is_deleted() => Decision::EntityDeleted,
+        Some(b) if b.status == Status::Closed => Decision::EntityClosed,
         Some(b) => match (&b.claim, expect_claim.as_deref()) {
             (None, _) => Decision::Accept,
             (Some(c), Some(ec)) if ec == c.claim_clock => Decision::Accept,
@@ -707,6 +846,18 @@ fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
                 actor,
                 ts,
                 format!("entity {entity} does not exist"),
+            );
+            return;
+        }
+        Decision::EntityClosed => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "cannot claim or renew closed work".into(),
             );
             return;
         }
@@ -757,19 +908,7 @@ fn apply_release(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
         ..
     } = o;
     let bead = match state.beads.get_mut(&entity) {
-        Some(b) if !b.is_deleted() => b,
-        Some(_) => {
-            reject(
-                state,
-                &entity,
-                op_id,
-                kind,
-                actor,
-                ts,
-                "entity is deleted".into(),
-            );
-            return;
-        }
+        Some(b) => b,
         None => {
             reject(
                 state,
@@ -855,6 +994,8 @@ fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &
         reply_to,
         mut correlation_id,
         idempotency_key,
+        answers,
+        require_live,
         ..
     } = o;
 
@@ -925,6 +1066,39 @@ fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &
             );
             return;
         }
+    }
+
+    let recipient_status = crate::actor_status::actor_status(
+        state,
+        &to,
+        None,
+        ts.parse()
+            .expect("message timestamp passed envelope validation"),
+        crate::actor_status::DEFAULT_RECENT_WINDOW_S,
+    );
+    let recipient_presence = crate::state::MsgPresenceEvidence {
+        state: recipient_status.presence.state.clone(),
+        source: recipient_status.presence.source.clone(),
+        reason: recipient_status.presence.reason.clone(),
+        as_of_ts: recipient_status.as_of_ts,
+    };
+    if require_live && recipient_presence.state != "live" {
+        reject_message(
+            state,
+            entity.as_deref(),
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!(
+                "recipient {to} is not live at {}: state={} source={} reason={}",
+                recipient_presence.as_of_ts,
+                recipient_presence.state,
+                recipient_presence.source,
+                recipient_presence.reason,
+            ),
+        );
+        return;
     }
 
     let mut request_state = None;
@@ -1078,6 +1252,13 @@ fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &
 
     let bind_entity = entity.clone();
     let response_msg_id = msg_id.clone();
+    let answers = match validate_answer_requests(state, actor, &answers, Some(&to)) {
+        Ok(answers) => answers,
+        Err(reason) => {
+            reject_message(state, entity.as_deref(), op_id, kind, actor, ts, reason);
+            return;
+        }
+    };
 
     state.messages.insert(
         msg_id.clone(),
@@ -1092,8 +1273,12 @@ fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &
             reply_to,
             correlation_id,
             idempotency_key,
+            answers: answers.clone(),
+            require_live,
+            recipient_presence,
             request_state,
             response_msg_id: None,
+            response_post_id: None,
             resolved_op_id: None,
             resolved_ts: None,
             sent_ts: ts.to_string(),
@@ -1109,7 +1294,15 @@ fn apply_msg_send(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &
             .get_mut(&parent_id)
             .expect("validated request disappeared during reducer step");
         parent.request_state = Some(next);
-        parent.response_msg_id = Some(response_msg_id);
+        parent.response_msg_id = Some(response_msg_id.clone());
+    }
+    for request_id in answers {
+        let request = state
+            .messages
+            .get_mut(&request_id)
+            .expect("validated answer request disappeared");
+        request.request_state = Some(RequestState::Responded);
+        request.response_msg_id = Some(response_msg_id.clone());
     }
 
     state.push_history(
@@ -1287,6 +1480,9 @@ fn apply_board_post(
         body,
         reply_to,
         post_kind,
+        answers,
+        notify,
+        idempotency_key,
         ..
     } = o;
     let topic = topic.trim().to_string();
@@ -1316,6 +1512,33 @@ fn apply_board_post(
             format!("duplicate post_id {post_id}"),
         );
         return;
+    }
+    if let Some(key) = idempotency_key.as_deref() {
+        if !validate_idempotency_key(key) {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "idempotency_key must be 1..=128 trimmed printable characters".into(),
+            );
+            return;
+        }
+        if let Some(existing) = state.board_post_by_idempotency(actor, key) {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!(
+                    "idempotency_key `{key}` already used by {}",
+                    existing.post_id
+                ),
+            );
+            return;
+        }
     }
     if topic.trim().is_empty() {
         reject_orphan(
@@ -1367,6 +1590,40 @@ fn apply_board_post(
         }
     }
 
+    let answers = match validate_answer_requests(state, actor, &answers, None) {
+        Ok(answers) => answers,
+        Err(reason) => {
+            reject_orphan(state, op_id, kind, actor, ts, reason);
+            return;
+        }
+    };
+    let mut explicit_notify = BTreeSet::new();
+    for recipient in notify {
+        let recipient = recipient.trim();
+        if recipient.is_empty()
+            || recipient
+                .chars()
+                .any(|character| matches!(character, '\0' | '\n' | '\r'))
+        {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "notification recipients must be non-empty single-line actor names".into(),
+            );
+            return;
+        }
+        if recipient != actor {
+            explicit_notify.insert(recipient.to_string());
+        }
+    }
+    let mut notification_recipients: BTreeSet<String> =
+        state.topic_watchers(&topic).into_iter().collect();
+    notification_recipients.extend(explicit_notify.iter().cloned());
+    notification_recipients.remove(actor);
+
     ensure_topic(state, &topic, actor, ts, op_id);
     if let Some(topic_record) = state.board_topics.get_mut(&topic) {
         topic_record.post_count += 1;
@@ -1381,6 +1638,7 @@ fn apply_board_post(
         }
     }
 
+    let answer_post_id = post_id.clone();
     state
         .board_post_op_index
         .insert(op_id.to_string(), post_id.clone());
@@ -1393,14 +1651,98 @@ fn apply_board_post(
             body,
             reply_to,
             post_kind,
+            answers: answers.clone(),
+            explicit_notify: explicit_notify.into_iter().collect(),
+            notification_recipients: notification_recipients.into_iter().collect(),
+            idempotency_key,
             sticky: false,
             sticky_op_id: None,
+            superseded_by: None,
+            superseded_op_id: None,
+            supersedes: Vec::new(),
+            retracted: false,
+            retraction_reason: None,
+            retracted_op_id: None,
             route: crate::state::RouteRecord::default(),
             sent_ts: ts.to_string(),
             sent_op_id: op_id.to_string(),
         },
     );
+    for request_id in answers {
+        let request = state
+            .messages
+            .get_mut(&request_id)
+            .expect("validated answer request disappeared");
+        request.request_state = Some(RequestState::Responded);
+        request.response_post_id = Some(answer_post_id.clone());
+    }
     state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_board_watch(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: BoardWatchOp,
+) {
+    let topic = o.topic.trim();
+    if topic.is_empty() || !state.board_topics.contains_key(topic) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("discussion topic {topic} does not exist"),
+        );
+        return;
+    }
+    state.board_topic_watches.insert(
+        (actor.to_string(), topic.to_string()),
+        crate::state::BoardTopicWatchRecord {
+            actor: actor.to_string(),
+            topic: topic.to_string(),
+            watching: o.watching,
+            updated_ts: ts.to_string(),
+            updated_op_id: op_id.to_string(),
+        },
+    );
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn validate_answer_requests(
+    state: &State,
+    actor: &str,
+    answers: &[String],
+    direct_to: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let unique: std::collections::BTreeSet<String> = answers.iter().cloned().collect();
+    for request_id in &unique {
+        let Some(request) = state.messages.get(request_id) else {
+            return Err(format!("no such answered request {request_id}"));
+        };
+        if request.reply_to.is_some() || request.msg_kind != "request" {
+            return Err(format!("msg {request_id} is not a root request"));
+        }
+        if request.to != actor {
+            return Err(format!(
+                "request {request_id} addressed to {}, not {actor}",
+                request.to
+            ));
+        }
+        if request.request_state != Some(RequestState::Open) {
+            return Err(format!("request {request_id} is not open"));
+        }
+        if direct_to.is_some_and(|recipient| recipient != request.from) {
+            return Err(format!(
+                "message answering {request_id} must be addressed to {}",
+                request.from
+            ));
+        }
+    }
+    Ok(unique.into_iter().collect())
 }
 
 fn apply_board_topic(
@@ -1481,7 +1823,10 @@ fn apply_board_read(
     o: BoardReadOp,
 ) {
     let BoardReadOp {
-        upto_op_id, topic, ..
+        upto_op_id,
+        topic,
+        strict,
+        ..
     } = o;
     let topic = topic.map(|t| t.trim().to_string());
     if topic.as_deref().is_some_and(str::is_empty) {
@@ -1526,6 +1871,24 @@ fn apply_board_read(
             );
             return;
         }
+    }
+
+    if strict
+        && state
+            .discussion_cursor_for(actor, topic.as_deref())
+            .is_some_and(|cursor| cursor.as_str() > upto_op_id.as_str())
+    {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!(
+                "board_read boundary {upto_op_id} is older than the effective discussion cursor"
+            ),
+        );
+        return;
     }
 
     let cursor = if let Some(topic) = topic {
@@ -1586,6 +1949,144 @@ fn apply_board_sticky(
             topic_record.last_activity_op_id = op_id.to_string();
         }
     }
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_board_supersede(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: BoardSupersedeOp,
+) {
+    let BoardSupersedeOp {
+        old_post_id,
+        new_post_id,
+        ..
+    } = o;
+    if old_post_id == new_post_id {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "a discussion post cannot supersede itself".into(),
+        );
+        return;
+    }
+    let Some(old) = state.board_posts.get(&old_post_id).cloned() else {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("no such old discussion post {old_post_id}"),
+        );
+        return;
+    };
+    let Some(new) = state.board_posts.get(&new_post_id).cloned() else {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("no such replacement discussion post {new_post_id}"),
+        );
+        return;
+    };
+    let reason = if old.from != actor || new.from != actor {
+        Some("only the author of both posts may supersede a discussion post".to_string())
+    } else if old.topic != new.topic {
+        Some(format!(
+            "cannot supersede across topics {} and {}",
+            old.topic, new.topic
+        ))
+    } else if old.disposition() != "active" {
+        Some(format!(
+            "post {old_post_id} is already {}",
+            old.disposition()
+        ))
+    } else if new.disposition() != "active" {
+        Some(format!(
+            "replacement post {new_post_id} is {}",
+            new.disposition()
+        ))
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        reject_orphan(state, op_id, kind, actor, ts, reason);
+        return;
+    }
+
+    let old = state
+        .board_posts
+        .get_mut(&old_post_id)
+        .expect("validated old post disappeared");
+    old.superseded_by = Some(new_post_id.clone());
+    old.superseded_op_id = Some(op_id.to_string());
+    let new = state
+        .board_posts
+        .get_mut(&new_post_id)
+        .expect("validated replacement post disappeared");
+    if !new.supersedes.contains(&old_post_id) {
+        new.supersedes.push(old_post_id);
+        new.supersedes.sort();
+    }
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_board_retract(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: BoardRetractOp,
+) {
+    let BoardRetractOp {
+        post_id, reason, ..
+    } = o;
+    let reason = reason.trim().to_string();
+    let Some(post) = state.board_posts.get(&post_id) else {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("no such discussion post {post_id}"),
+        );
+        return;
+    };
+    let invalid = if reason.is_empty()
+        || reason
+            .chars()
+            .any(|character| matches!(character, '\0' | '\n' | '\r'))
+    {
+        Some("discussion retraction reason must be non-empty and single-line".to_string())
+    } else if post.from != actor {
+        Some(format!("only {} may retract post {post_id}", post.from))
+    } else if post.disposition() != "active" {
+        Some(format!("post {post_id} is already {}", post.disposition()))
+    } else {
+        None
+    };
+    if let Some(reason) = invalid {
+        reject_orphan(state, op_id, kind, actor, ts, reason);
+        return;
+    }
+    let post = state
+        .board_posts
+        .get_mut(&post_id)
+        .expect("validated post disappeared");
+    post.retracted = true;
+    post.retraction_reason = Some(reason);
+    post.retracted_op_id = Some(op_id.to_string());
     state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
 }
 
@@ -1876,13 +2377,25 @@ fn apply_session_start(
         }
         let existing = state.sessions.get_mut(&session_id).expect("checked above");
         existing.ttl_s = ttl_s;
-        existing.lease_until_ts = lease_until_ts;
+        existing.lease_until_ts = lease_until_ts.clone();
+        existing.last_heartbeat_ts = ts.to_string();
+        existing.last_heartbeat_op_id = op_id.to_string();
         if label.is_some() {
             existing.label = label;
         }
         if pid.is_some() {
             existing.pid = pid;
         }
+        existing
+            .heartbeats
+            .push(crate::state::SessionHeartbeatRecord {
+                ts: ts.to_string(),
+                op_id: op_id.to_string(),
+                ttl_s,
+                lease_until_ts,
+                label: existing.label.clone(),
+                pid: existing.pid,
+            });
         state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
         return;
     }
@@ -1892,16 +2405,220 @@ fn apply_session_start(
         crate::state::SessionRecord {
             session_id,
             actor: actor.to_string(),
-            label,
+            label: label.clone(),
             pid,
+            started_label: label,
+            started_pid: pid,
             ttl_s,
+            started_ttl_s: ttl_s,
             started_ts: ts.to_string(),
             started_op_id: op_id.to_string(),
+            started_lease_until_ts: lease_until_ts.clone(),
+            last_heartbeat_ts: ts.to_string(),
+            last_heartbeat_op_id: op_id.to_string(),
             lease_until_ts,
+            heartbeats: Vec::new(),
+            intent: None,
+            intents: Vec::new(),
             ended_ts: None,
             ended_op_id: None,
         },
     );
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_session_heartbeat(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: SessionHeartbeatOp,
+) {
+    let SessionHeartbeatOp {
+        session_id, ttl_s, ..
+    } = o;
+    if ttl_s == 0 {
+        reject_orphan(state, op_id, kind, actor, ts, "ttl_s must be > 0".into());
+        return;
+    }
+    let Some((owner, ended)) = state
+        .sessions
+        .get(&session_id)
+        .map(|session| (session.actor.clone(), session.ended_ts.is_some()))
+    else {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("no such session {session_id}"),
+        );
+        return;
+    };
+    if owner != actor {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("session {session_id} belongs to {owner}, not {actor}"),
+        );
+        return;
+    }
+    if ended {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("session {session_id} has ended; start a new session"),
+        );
+        return;
+    }
+    let lease_until_ts = match compute_lease_until(ts, ttl_s) {
+        Ok(value) => value,
+        Err(error) => {
+            reject_orphan(state, op_id, kind, actor, ts, format!("bad ttl: {error}"));
+            return;
+        }
+    };
+    let session = state.sessions.get_mut(&session_id).expect("checked above");
+    session.ttl_s = ttl_s;
+    session.last_heartbeat_ts = ts.to_string();
+    session.last_heartbeat_op_id = op_id.to_string();
+    session.lease_until_ts = lease_until_ts.clone();
+    session
+        .heartbeats
+        .push(crate::state::SessionHeartbeatRecord {
+            ts: ts.to_string(),
+            op_id: op_id.to_string(),
+            ttl_s,
+            lease_until_ts,
+            label: session.label.clone(),
+            pid: session.pid,
+        });
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_session_status(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: SessionStatusOp,
+) {
+    let SessionStatusOp {
+        session_id,
+        status,
+        message,
+        issue,
+        ..
+    } = o;
+    if !validate_session_intent(&status) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("invalid session status: {status}"),
+        );
+        return;
+    }
+    if message.as_deref().is_some_and(|message| {
+        message.is_empty()
+            || message.trim() != message
+            || message.chars().any(|c| c == '\0' || c == '\n' || c == '\r')
+    }) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "session status message must be non-empty, trimmed, and single-line".into(),
+        );
+        return;
+    }
+    let Some(session) = state.sessions.get(&session_id) else {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("no such session {session_id}"),
+        );
+        return;
+    };
+    if session.actor != actor {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!(
+                "session {session_id} belongs to {}, not {actor}",
+                session.actor
+            ),
+        );
+        return;
+    }
+    if session.ended_ts.is_some() {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("session {session_id} has ended; start a new session"),
+        );
+        return;
+    }
+    if !session.is_live(ts) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("session {session_id} is expired; heartbeat it before setting status"),
+        );
+        return;
+    }
+    if let Some(issue) = issue.as_deref() {
+        let exists = state
+            .beads
+            .get(issue)
+            .is_some_and(|bead| !bead.is_deleted());
+        if !exists {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("no such live issue {issue}"),
+            );
+            return;
+        }
+    }
+    let session = state.sessions.get_mut(&session_id).expect("checked above");
+    let intent = crate::state::SessionIntentRecord {
+        state: status,
+        message,
+        issue,
+        set_ts: ts.to_string(),
+        set_op_id: op_id.to_string(),
+    };
+    session.intent = Some(intent.clone());
+    session.intents.push(intent);
     state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
 }
 
@@ -1954,6 +2671,7 @@ fn apply_reserve_open(
     o: ReserveOpenOp,
 ) {
     let ReserveOpenOp {
+        v,
         reservation_id,
         entity,
         paths,
@@ -1986,7 +2704,9 @@ fn apply_reserve_open(
         );
         return;
     }
-    if state.beads.get(&entity).is_none_or(|b| b.is_deleted()) {
+    let bead_binding = state.beads.get(&entity).filter(|bead| !bead.is_deleted());
+    let candidate_binding = state.candidates.get(&entity);
+    if bead_binding.is_none() && candidate_binding.is_none() {
         reject(
             state,
             &entity,
@@ -1997,6 +2717,20 @@ fn apply_reserve_open(
             format!("entity {entity} does not exist"),
         );
         return;
+    }
+    if let Some(candidate) = candidate_binding {
+        if candidate.phase != crate::candidate::CandidatePhase::Pending {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "candidate-bound reservations require a pending candidate".into(),
+            );
+            return;
+        }
     }
     if paths.is_empty() {
         reject(
@@ -2030,7 +2764,25 @@ fn apply_reserve_open(
         }
     }
 
-    if let Some(reason) = first_overlap_reason(state, actor, ts, &normalized) {
+    if let Some(candidate) = candidate_binding {
+        if let Some(path) = normalized
+            .iter()
+            .find(|path| !candidate.paths.contains(path))
+        {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("candidate reservation path `{path}` is not declared by the candidate"),
+            );
+            return;
+        }
+    }
+
+    if let Some(reason) = first_overlap_reason(state, actor, ts, &normalized, v >= 2) {
         reject(state, &entity, op_id, kind, actor, ts, reason);
         return;
     }
@@ -2060,9 +2812,11 @@ fn apply_reserve_open(
             paths: normalized,
             ttl_s,
             opened_op_id: op_id.to_string(),
+            clock: op_id.to_string(),
             opened_ts: ts.to_string(),
             lease_until_ts,
             closed_paths: std::collections::BTreeSet::new(),
+            adoptions: Vec::new(),
         },
     );
     accept(state, &entity, op_id, kind, actor, ts);
@@ -2073,9 +2827,10 @@ fn first_overlap_reason(
     actor: &str,
     ts: &str,
     new_paths: &[String],
+    reject_same_actor: bool,
 ) -> Option<String> {
     for r in state.reservations.values() {
-        if r.actor == actor || !r.is_live(ts) {
+        if !r.is_live(ts) || r.actor == actor && !reject_same_actor {
             continue;
         }
         for p_new in new_paths {
@@ -2085,6 +2840,12 @@ fn first_overlap_reason(
                 .filter(|p| !r.closed_paths.contains(p.as_str()))
             {
                 if crate::paths::overlap(p_new, p_held) {
+                    if r.actor == actor {
+                        return Some(format!(
+                            "duplicate reservation: `{p_new}` overlaps `{p_held}` already held by this actor under {} (release or reuse that reservation)",
+                            r.reservation_id
+                        ));
+                    }
                     return Some(format!(
                         "path conflict: `{p_new}` overlaps `{p_held}` held by {} (rv {})",
                         r.actor, r.reservation_id
@@ -2184,7 +2945,905 @@ fn apply_reserve_close(
     for p in &to_close {
         r.closed_paths.insert(p.clone());
     }
+    r.clock = op_id.to_string();
     accept(state, &entity, op_id, kind, actor, ts);
+}
+
+fn apply_reserve_adopt(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: ReserveAdoptOp,
+) {
+    let ReserveAdoptOp {
+        reservation_id,
+        entity,
+        expect_reservation,
+        ttl_s,
+        ..
+    } = o;
+    let Some(reservation) = state.reservations.get(&reservation_id) else {
+        state.push_history(
+            None,
+            HistoryEntry::rejected(
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("no such reservation `{reservation_id}`"),
+            ),
+        );
+        return;
+    };
+    let old_entity = reservation.entity.clone();
+    let old_actor = reservation.actor.clone();
+    if reservation.clock != expect_reservation {
+        reject(
+            state,
+            &entity,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("stale reservation CAS: current is {}", reservation.clock),
+        );
+        return;
+    }
+    if state.reservation_disposition(reservation, ts) != crate::state::LeaseDisposition::Orphaned {
+        reject(
+            state,
+            &entity,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "only a still-live orphaned reservation may be adopted".into(),
+        );
+        return;
+    }
+    let target_claimed = state.beads.get(&entity).is_some_and(|bead| {
+        !bead.is_deleted()
+            && bead.status != Status::Closed
+            && bead
+                .claim
+                .as_ref()
+                .is_some_and(|claim| claim.claimed_by == actor && claim.is_live(ts))
+    });
+    if !target_claimed {
+        reject(
+            state,
+            &entity,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "adopter must hold a live claim on the open target issue".into(),
+        );
+        return;
+    }
+    let lease_until_ts = match compute_lease_until(ts, ttl_s) {
+        Ok(value) => value,
+        Err(error) => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("bad ttl: {error}"),
+            );
+            return;
+        }
+    };
+    let reservation = state
+        .reservations
+        .get_mut(&reservation_id)
+        .expect("reservation checked above");
+    reservation
+        .adoptions
+        .push(crate::state::ReservationAdoption {
+            op_id: op_id.to_string(),
+            ts: ts.to_string(),
+            from_actor: old_actor,
+            from_entity: old_entity,
+            to_actor: actor.to_string(),
+            to_entity: entity.clone(),
+        });
+    reservation.actor = actor.to_string();
+    reservation.entity = entity.clone();
+    reservation.ttl_s = ttl_s;
+    reservation.lease_until_ts = lease_until_ts;
+    reservation.clock = op_id.to_string();
+    accept(state, &entity, op_id, kind, actor, ts);
+}
+
+fn sorted_unique_nonempty(values: &[String]) -> bool {
+    !values.is_empty()
+        && values.iter().all(|value| !value.trim().is_empty())
+        && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn full_oid(value: &str, object_format: &str) -> bool {
+    let expected = if object_format == "sha256" { 64 } else { 40 };
+    value.len() == expected
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn apply_candidate_propose(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateProposeOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let fail = |state: &mut State, reason: String| {
+        reject(state, &candidate_id, op_id, kind, actor, ts, reason)
+    };
+    if !candidate_id.starts_with("cand-") || candidate_id[5..].parse::<ulid::Ulid>().is_err() {
+        fail(state, "candidate id must use the cand-ULID form".into());
+        return;
+    }
+    if state.candidates.contains_key(&candidate_id) {
+        fail(state, format!("candidate {candidate_id} already exists"));
+        return;
+    }
+    if state
+        .beads
+        .get(&o.entity)
+        .is_none_or(crate::state::Bead::is_deleted)
+    {
+        fail(
+            state,
+            format!("issue {} does not exist or is deleted", o.entity),
+        );
+        return;
+    }
+    if o.store_id.trim().is_empty()
+        || o.repository_id.trim().is_empty()
+        || !matches!(o.object_format.as_str(), "sha1" | "sha256")
+    {
+        fail(state, "proposal repository identity is incomplete".into());
+        return;
+    }
+    if !full_oid(&o.commit_oid, &o.object_format)
+        || !full_oid(&o.base_oid, &o.object_format)
+        || !o
+            .parent_oids
+            .iter()
+            .all(|parent| full_oid(parent, &o.object_format))
+    {
+        fail(
+            state,
+            "proposal requires full lowercase Git object ids".into(),
+        );
+        return;
+    }
+    if actor == o.authorizer || o.reviewers.iter().any(|reviewer| reviewer == actor) {
+        fail(
+            state,
+            "proposer must be distinct from the authorizer and all reviewers".into(),
+        );
+        return;
+    }
+    if o.authorizer.trim().is_empty()
+        || !sorted_unique_nonempty(&o.reviewers)
+        || !sorted_unique_nonempty(&o.paths)
+    {
+        fail(
+            state,
+            "authorizer, sorted unique reviewers, and sorted unique paths are required".into(),
+        );
+        return;
+    }
+    if o.reviewers.iter().any(|reviewer| reviewer == &o.authorizer) {
+        fail(state, "authorizer must be distinct from reviewers".into());
+        return;
+    }
+    if o.evidence_requirements.iter().any(|requirement| {
+        requirement.name.trim().is_empty()
+            || requirement.kind.trim().is_empty()
+            || !sorted_unique_nonempty(&requirement.producers)
+    }) {
+        fail(
+            state,
+            "evidence requirements need names, kinds, and sorted unique producers".into(),
+        );
+        return;
+    }
+    if !o.evidence_requirements.windows(2).all(|pair| {
+        pair[0]
+            .name
+            .cmp(&pair[1].name)
+            .then_with(|| pair[0].kind.cmp(&pair[1].kind))
+            .is_lt()
+    }) {
+        fail(
+            state,
+            "evidence requirements must be sorted and unique".into(),
+        );
+        return;
+    }
+    let ancestry_requirements: Vec<_> = o
+        .evidence_requirements
+        .iter()
+        .filter(|requirement| requirement.name == crate::candidate::GIT_ANCESTRY_EVIDENCE)
+        .collect();
+    if ancestry_requirements.len() != 1
+        || !ancestry_requirements[0]
+            .producers
+            .iter()
+            .any(|producer| producer == actor)
+    {
+        fail(
+            state,
+            "exactly one git-ancestry requirement produced by the proposer is mandatory".into(),
+        );
+        return;
+    }
+
+    state.candidates.insert(
+        candidate_id.clone(),
+        crate::state::CandidateRecord {
+            candidate_id: candidate_id.clone(),
+            entity: o.entity,
+            proposer: actor.to_string(),
+            proposal_op_id: op_id.to_string(),
+            store_id: o.store_id,
+            repository_id: o.repository_id,
+            object_format: o.object_format,
+            commit_oid: o.commit_oid,
+            base_oid: o.base_oid,
+            parent_oids: o.parent_oids,
+            paths: o.paths,
+            authorizer: o.authorizer,
+            reviewers: o.reviewers,
+            evidence_requirements: o.evidence_requirements,
+            evidence_refs: o.evidence_refs,
+            phase: crate::candidate::CandidatePhase::Pending,
+            phase_op_id: op_id.to_string(),
+            successor_id: None,
+            reviews: BTreeMap::new(),
+            evidence: BTreeMap::new(),
+            authorization: None,
+            landed: None,
+        },
+    );
+    accept(state, &candidate_id, op_id, kind, actor, ts);
+}
+
+fn apply_candidate_evidence(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateEvidenceOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let Some(candidate) = state.candidates.get(&candidate_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("candidate {candidate_id} does not exist"),
+        );
+        return;
+    };
+    if candidate.phase != crate::candidate::CandidatePhase::Pending {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "evidence can only update a pending candidate".into(),
+        );
+        return;
+    }
+    let computed = match crate::candidate::evidence_id(&o.payload) {
+        Ok(id) => id,
+        Err(error) => {
+            reject(
+                state,
+                &candidate_id,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("cannot digest evidence: {error}"),
+            );
+            return;
+        }
+    };
+    if computed != o.evidence_id {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("evidence id mismatch: expected {computed}"),
+        );
+        return;
+    }
+    if o.candidate_oid != candidate.commit_oid {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "evidence candidate object id does not match the immutable proposal".into(),
+        );
+        return;
+    }
+    if o.producer_tool.trim().is_empty() {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "evidence producer tool description is required".into(),
+        );
+        return;
+    }
+    let required_producer = candidate.evidence_requirements.iter().any(|requirement| {
+        requirement.name == o.name
+            && requirement.kind == o.evidence_kind
+            && requirement.producers.iter().any(|p| p == actor)
+    }) || o.name == crate::candidate::GIT_LANDING_EVIDENCE
+        && o.evidence_kind == "git"
+        && candidate
+            .authorization
+            .as_ref()
+            .is_some_and(|authorization| {
+                authorization
+                    .grantees
+                    .iter()
+                    .any(|grantee| grantee == actor)
+            });
+    if !required_producer {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("{actor} is not a named producer for evidence `{}`", o.name),
+        );
+        return;
+    }
+    if o.name == crate::candidate::GIT_ANCESTRY_EVIDENCE {
+        match &o.payload {
+            crate::candidate::CandidateEvidencePayload::GitAncestry(git)
+                if git.repository_id == candidate.repository_id
+                    && git.object_format == candidate.object_format
+                    && git.commit_oid == candidate.commit_oid
+                    && git.base_oid == candidate.base_oid
+                    && git.parent_oids == candidate.parent_oids => {}
+            _ => {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "git-ancestry receipt does not match proposal anchors".into(),
+                );
+                return;
+            }
+        }
+    }
+    let candidate = state
+        .candidates
+        .get_mut(&candidate_id)
+        .expect("candidate checked above");
+    candidate.evidence.insert(
+        (o.name.clone(), actor.to_string()),
+        crate::state::CandidateEvidenceRecord {
+            producer: actor.to_string(),
+            producer_tool: o.producer_tool,
+            evidence_id: o.evidence_id,
+            name: o.name,
+            evidence_kind: o.evidence_kind,
+            candidate_oid: o.candidate_oid,
+            outcome: o.outcome,
+            payload: o.payload,
+            refs: o.refs,
+            op_id: op_id.to_string(),
+            ts: ts.to_string(),
+        },
+    );
+    accept(state, &candidate_id, op_id, kind, actor, ts);
+}
+
+fn apply_candidate_review(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateReviewOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let Some(candidate) = state.candidates.get(&candidate_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "candidate does not exist".into(),
+        );
+        return;
+    };
+    if candidate.phase != crate::candidate::CandidatePhase::Pending
+        || !candidate.reviewers.iter().any(|reviewer| reviewer == actor)
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "only a named reviewer may review a pending candidate".into(),
+        );
+        return;
+    }
+    let current = candidate
+        .reviews
+        .get(actor)
+        .map(|review| review.op_id.as_str());
+    if current != o.expect_review.as_deref() {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("stale review CAS: current is {}", current.unwrap_or("none")),
+        );
+        return;
+    }
+    if o.evidence_refs.iter().any(|wanted| {
+        !candidate
+            .evidence
+            .values()
+            .any(|receipt| &receipt.evidence_id == wanted)
+    }) {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "review references unknown evidence".into(),
+        );
+        return;
+    }
+    state
+        .candidates
+        .get_mut(&candidate_id)
+        .expect("candidate checked above")
+        .reviews
+        .insert(
+            actor.to_string(),
+            crate::state::CandidateReviewRecord {
+                reviewer: actor.to_string(),
+                verdict: o.verdict,
+                body: o.body,
+                evidence_refs: o.evidence_refs,
+                op_id: op_id.to_string(),
+                ts: ts.to_string(),
+            },
+        );
+    accept(state, &candidate_id, op_id, kind, actor, ts);
+}
+
+fn apply_candidate_authorize(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateAuthorizeOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let Some(candidate) = state.candidates.get(&candidate_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "candidate does not exist".into(),
+        );
+        return;
+    };
+    if candidate.phase != crate::candidate::CandidatePhase::Pending || candidate.authorizer != actor
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "only the named authorizer may authorize a pending candidate".into(),
+        );
+        return;
+    }
+    if !matches!(
+        o.status,
+        crate::candidate::AuthorizationStatus::Granted
+            | crate::candidate::AuthorizationStatus::Conditional
+    ) || !sorted_unique_nonempty(&o.grantees)
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "authorization requires granted/conditional status and sorted unique grantees".into(),
+        );
+        return;
+    }
+    if o.status == crate::candidate::AuthorizationStatus::Granted && !o.conditions.is_empty()
+        || o.status == crate::candidate::AuthorizationStatus::Conditional && o.conditions.is_empty()
+        || !o.conditions.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "granted authorization has no conditions; conditional authorization requires sorted unique conditions".into(),
+        );
+        return;
+    }
+    let current = candidate
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.op_id.as_str());
+    if current != o.expect_authorization.as_deref() {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!(
+                "stale authorization CAS: current is {}",
+                current.unwrap_or("none")
+            ),
+        );
+        return;
+    }
+    state
+        .candidates
+        .get_mut(&candidate_id)
+        .expect("candidate checked above")
+        .authorization = Some(crate::state::CandidateAuthorizationRecord {
+        status: o.status,
+        grantees: o.grantees,
+        conditions: o.conditions,
+        op_id: op_id.to_string(),
+        ts: ts.to_string(),
+    });
+    accept(state, &candidate_id, op_id, kind, actor, ts);
+}
+
+fn apply_candidate_revoke(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateRevokeOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let Some(candidate) = state.candidates.get(&candidate_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "candidate does not exist".into(),
+        );
+        return;
+    };
+    let Some(current) = candidate.authorization.as_ref() else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "no authorization to revoke".into(),
+        );
+        return;
+    };
+    if candidate.phase != crate::candidate::CandidatePhase::Pending
+        || candidate.authorizer != actor
+        || current.op_id != o.expect_authorization
+        || current.status == crate::candidate::AuthorizationStatus::Consumed
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "revoke requires the named authorizer, pending phase, and current authorization CAS"
+                .into(),
+        );
+        return;
+    }
+    let authorization = state
+        .candidates
+        .get_mut(&candidate_id)
+        .expect("candidate checked above")
+        .authorization
+        .as_mut()
+        .expect("authorization checked above");
+    authorization.status = crate::candidate::AuthorizationStatus::Revoked;
+    authorization.op_id = op_id.to_string();
+    authorization.ts = ts.to_string();
+    accept(state, &candidate_id, op_id, kind, actor, ts);
+}
+
+fn apply_candidate_supersede(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateSupersedeOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let Some(candidate) = state.candidates.get(&candidate_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "candidate does not exist".into(),
+        );
+        return;
+    };
+    let Some(successor) = state.candidates.get(&o.successor_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "successor does not exist".into(),
+        );
+        return;
+    };
+    if candidate_id == o.successor_id
+        || candidate.phase != crate::candidate::CandidatePhase::Pending
+        || candidate.phase_op_id != o.expect_phase
+        || (candidate.proposer != actor && candidate.authorizer != actor)
+        || successor.phase != crate::candidate::CandidatePhase::Pending
+        || successor.store_id != candidate.store_id
+        || successor.repository_id != candidate.repository_id
+        || successor.entity != candidate.entity
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "supersede requires proposer ownership, current phase CAS, and a distinct pending same-repository successor".into(),
+        );
+        return;
+    }
+    let candidate = state
+        .candidates
+        .get_mut(&candidate_id)
+        .expect("candidate checked above");
+    candidate.phase = crate::candidate::CandidatePhase::Superseded;
+    candidate.phase_op_id = op_id.to_string();
+    candidate.successor_id = Some(o.successor_id);
+    accept(state, &candidate_id, op_id, kind, actor, ts);
+}
+
+fn apply_candidate_abandon(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateAbandonOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let Some(candidate) = state.candidates.get(&candidate_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "candidate does not exist".into(),
+        );
+        return;
+    };
+    if candidate.phase != crate::candidate::CandidatePhase::Pending
+        || candidate.phase_op_id != o.expect_phase
+        || (candidate.proposer != actor && candidate.authorizer != actor)
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "abandon requires proposer/authorizer ownership and current phase CAS".into(),
+        );
+        return;
+    }
+    let candidate = state
+        .candidates
+        .get_mut(&candidate_id)
+        .expect("candidate checked above");
+    candidate.phase = crate::candidate::CandidatePhase::Abandoned;
+    candidate.phase_op_id = op_id.to_string();
+    accept(state, &candidate_id, op_id, kind, actor, ts);
+}
+
+fn apply_candidate_landed(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateLandedOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let Some(candidate) = state.candidates.get(&candidate_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "candidate does not exist".into(),
+        );
+        return;
+    };
+    let authorization = candidate.authorization.as_ref();
+    if candidate.phase != crate::candidate::CandidatePhase::Pending
+        || candidate.phase_op_id != o.expect_phase
+        || authorization.map(|auth| auth.op_id.as_str()) != Some(o.expect_authorization.as_str())
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "landed requires current pending phase and authorization CAS".into(),
+        );
+        return;
+    }
+    let Some(receipt) = candidate
+        .evidence
+        .values()
+        .find(|receipt| receipt.evidence_id == o.evidence_id)
+    else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "landing evidence not found".into(),
+        );
+        return;
+    };
+    let valid_receipt = receipt.outcome == crate::candidate::EvidenceOutcome::Pass
+        && receipt.name == crate::candidate::GIT_LANDING_EVIDENCE
+        && matches!(
+            &receipt.payload,
+            crate::candidate::CandidateEvidencePayload::GitLanding(git)
+                if git.repository_id == candidate.repository_id
+                    && git.candidate_oid == candidate.commit_oid
+                    && git.target_ref == o.target_ref
+                    && git.authorization_op_id == o.expect_authorization
+                    && git.candidate_reachable == Some(true)
+        );
+    if !valid_receipt {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "landing receipt is not a passing exact-reachability receipt for this authorization"
+                .into(),
+        );
+        return;
+    }
+    let landability = state.candidate_landability(&candidate_id, Some(actor));
+    if !landability.landable {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!(
+                "candidate is not landable: {}",
+                landability.reason_codes.join(",")
+            ),
+        );
+        return;
+    }
+    let candidate = state
+        .candidates
+        .get_mut(&candidate_id)
+        .expect("candidate checked above");
+    candidate.phase = crate::candidate::CandidatePhase::Landed;
+    candidate.phase_op_id = op_id.to_string();
+    let authorization = candidate
+        .authorization
+        .as_mut()
+        .expect("authorization checked above");
+    authorization.status = crate::candidate::AuthorizationStatus::Consumed;
+    candidate.landed = Some(crate::state::CandidateLandedRecord {
+        actor: actor.to_string(),
+        evidence_id: o.evidence_id,
+        authorization_op_id: o.expect_authorization,
+        target_ref: o.target_ref,
+        op_id: op_id.to_string(),
+        ts: ts.to_string(),
+    });
+    accept(state, &candidate_id, op_id, kind, actor, ts);
 }
 
 fn apply_delete(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, o: DeleteOp) {

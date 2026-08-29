@@ -25,6 +25,41 @@ fn init_store(td: &TempDir) -> Store {
 }
 
 #[test]
+fn design_is_a_valid_note_kind() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+    let created = Command::new(mote_bin())
+        .args(["new", "design note", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    let id = String::from_utf8(created.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let note = Command::new(mote_bin())
+        .args([
+            "note",
+            &id,
+            "--kind",
+            "design",
+            "chosen shape",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        note.status.success(),
+        "{}",
+        String::from_utf8_lossy(&note.stderr)
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    assert_eq!(state.beads[&id].notes[0].note_kind, "design");
+}
+
+#[test]
 fn a8_concurrent_notes_all_accept() {
     let td = TempDir::new().unwrap();
     init_store(&td);

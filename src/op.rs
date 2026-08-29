@@ -18,7 +18,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::candidate::{
+    AuthorizationStatus, CandidateEvidencePayload, EvidenceOutcome, EvidenceRequirement,
+    ReviewVerdict,
+};
 use crate::ids;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 pub type BeadId = String;
 pub type OpId = String;
@@ -253,6 +261,12 @@ pub struct MsgSendOp {
     /// Sender-scoped retry key. Accepted keys are unique per actor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Open request ids atomically answered by this message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<String>,
+    /// Reject unless the recipient has a valid session lease at `ts`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_live: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +303,25 @@ pub struct BoardPostOp {
     /// readers can find the thread's conclusions without re-reading it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_kind: Option<String>,
+    /// Open request ids atomically answered by this public post.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<String>,
+    /// Explicit actor recipients for public-post attention routing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
+    /// Author-scoped retry key for the complete post content and routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardWatchOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub topic: String,
+    pub watching: bool,
 }
 
 /// Routing op: link a discussion post or topic to tracker work, or declare
@@ -331,6 +364,38 @@ pub struct SessionStartOp {
     pub pid: Option<u32>,
 }
 
+/// Explicit renewal of one existing session lease.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHeartbeatOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub session_id: String,
+    pub ttl_s: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+/// Session-scoped declared availability/work state. This is intentionally not
+/// actor-global: two concurrent sessions for one actor may declare different
+/// intents without racing through a last-writer-wins register.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatusOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub session_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<BeadId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEndOp {
     pub v: u32,
@@ -349,6 +414,10 @@ pub struct BoardReadOp {
     pub upto_op_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// Reject rather than silently no-op if replay has already advanced past
+    /// this boundary. Absent on legacy/head-marking operations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -372,6 +441,26 @@ pub struct BoardStickyOp {
     pub actor: String,
     pub post_id: String,
     pub sticky: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardSupersedeOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub old_post_id: String,
+    pub new_post_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardRetractOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub post_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +493,149 @@ pub struct ReserveCloseOp {
     pub paths: Option<Vec<String>>,
 }
 
+/// Re-home a still-live reservation whose bound work has become terminal.
+/// The adopter must already hold a live claim on `entity`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReserveAdoptOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub reservation_id: String,
+    pub entity: BeadId,
+    pub expect_reservation: String,
+    pub ttl_s: u32,
+}
+
+/// Immutable proposal record. Git names have already been resolved to full
+/// object ids by the publishing CLI; replay never consults the repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateProposeOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub entity: BeadId,
+    pub store_id: String,
+    pub repository_id: String,
+    pub object_format: String,
+    pub commit_oid: String,
+    pub base_oid: String,
+    pub parent_oids: Vec<String>,
+    pub paths: Vec<String>,
+    pub authorizer: String,
+    pub reviewers: Vec<String>,
+    pub evidence_requirements: Vec<EvidenceRequirement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateEvidenceOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub candidate_oid: String,
+    pub evidence_id: String,
+    pub name: String,
+    pub evidence_kind: String,
+    pub producer_tool: String,
+    pub outcome: EvidenceOutcome,
+    pub payload: CandidateEvidencePayload,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateReviewOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub verdict: ReviewVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_review: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateAuthorizeOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub status: AuthorizationStatus,
+    pub grantees: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_authorization: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateRevokeOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub expect_authorization: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateSupersedeOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub successor_id: String,
+    pub expect_phase: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateAbandonOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub expect_phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateLandedOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub evidence_id: String,
+    pub expect_phase: String,
+    pub expect_authorization: String,
+    pub target_ref: String,
+    pub idempotency_key: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Op {
@@ -425,13 +657,27 @@ pub enum Op {
     MsgResolve(MsgResolveOp),
     BoardPost(BoardPostOp),
     BoardRead(BoardReadOp),
+    BoardWatch(BoardWatchOp),
     BoardTopic(BoardTopicOp),
     BoardSticky(BoardStickyOp),
+    BoardSupersede(BoardSupersedeOp),
+    BoardRetract(BoardRetractOp),
     BoardRoute(BoardRouteOp),
     SessionStart(SessionStartOp),
+    SessionHeartbeat(SessionHeartbeatOp),
+    SessionStatus(SessionStatusOp),
     SessionEnd(SessionEndOp),
     ReserveOpen(ReserveOpenOp),
     ReserveClose(ReserveCloseOp),
+    ReserveAdopt(ReserveAdoptOp),
+    CandidatePropose(CandidateProposeOp),
+    CandidateEvidence(CandidateEvidenceOp),
+    CandidateReview(CandidateReviewOp),
+    CandidateAuthorize(CandidateAuthorizeOp),
+    CandidateRevoke(CandidateRevokeOp),
+    CandidateSupersede(CandidateSupersedeOp),
+    CandidateAbandon(CandidateAbandonOp),
+    CandidateLanded(CandidateLandedOp),
 }
 
 impl Op {
@@ -452,13 +698,27 @@ impl Op {
             Op::MsgResolve(o) => &o.op,
             Op::BoardPost(o) => &o.op,
             Op::BoardRead(o) => &o.op,
+            Op::BoardWatch(o) => &o.op,
             Op::BoardTopic(o) => &o.op,
             Op::BoardSticky(o) => &o.op,
+            Op::BoardSupersede(o) => &o.op,
+            Op::BoardRetract(o) => &o.op,
             Op::BoardRoute(o) => &o.op,
             Op::SessionStart(o) => &o.op,
+            Op::SessionHeartbeat(o) => &o.op,
+            Op::SessionStatus(o) => &o.op,
             Op::SessionEnd(o) => &o.op,
             Op::ReserveOpen(o) => &o.op,
             Op::ReserveClose(o) => &o.op,
+            Op::ReserveAdopt(o) => &o.op,
+            Op::CandidatePropose(o) => &o.op,
+            Op::CandidateEvidence(o) => &o.op,
+            Op::CandidateReview(o) => &o.op,
+            Op::CandidateAuthorize(o) => &o.op,
+            Op::CandidateRevoke(o) => &o.op,
+            Op::CandidateSupersede(o) => &o.op,
+            Op::CandidateAbandon(o) => &o.op,
+            Op::CandidateLanded(o) => &o.op,
         }
     }
 
@@ -479,13 +739,27 @@ impl Op {
             Op::MsgResolve(o) => &o.actor,
             Op::BoardPost(o) => &o.actor,
             Op::BoardRead(o) => &o.actor,
+            Op::BoardWatch(o) => &o.actor,
             Op::BoardTopic(o) => &o.actor,
             Op::BoardSticky(o) => &o.actor,
+            Op::BoardSupersede(o) => &o.actor,
+            Op::BoardRetract(o) => &o.actor,
             Op::BoardRoute(o) => &o.actor,
             Op::SessionStart(o) => &o.actor,
+            Op::SessionHeartbeat(o) => &o.actor,
+            Op::SessionStatus(o) => &o.actor,
             Op::SessionEnd(o) => &o.actor,
             Op::ReserveOpen(o) => &o.actor,
             Op::ReserveClose(o) => &o.actor,
+            Op::ReserveAdopt(o) => &o.actor,
+            Op::CandidatePropose(o) => &o.actor,
+            Op::CandidateEvidence(o) => &o.actor,
+            Op::CandidateReview(o) => &o.actor,
+            Op::CandidateAuthorize(o) => &o.actor,
+            Op::CandidateRevoke(o) => &o.actor,
+            Op::CandidateSupersede(o) => &o.actor,
+            Op::CandidateAbandon(o) => &o.actor,
+            Op::CandidateLanded(o) => &o.actor,
         }
     }
 
@@ -506,13 +780,27 @@ impl Op {
             Op::MsgResolve(o) => &o.ts,
             Op::BoardPost(o) => &o.ts,
             Op::BoardRead(o) => &o.ts,
+            Op::BoardWatch(o) => &o.ts,
             Op::BoardTopic(o) => &o.ts,
             Op::BoardSticky(o) => &o.ts,
+            Op::BoardSupersede(o) => &o.ts,
+            Op::BoardRetract(o) => &o.ts,
             Op::BoardRoute(o) => &o.ts,
             Op::SessionStart(o) => &o.ts,
+            Op::SessionHeartbeat(o) => &o.ts,
+            Op::SessionStatus(o) => &o.ts,
             Op::SessionEnd(o) => &o.ts,
             Op::ReserveOpen(o) => &o.ts,
             Op::ReserveClose(o) => &o.ts,
+            Op::ReserveAdopt(o) => &o.ts,
+            Op::CandidatePropose(o) => &o.ts,
+            Op::CandidateEvidence(o) => &o.ts,
+            Op::CandidateReview(o) => &o.ts,
+            Op::CandidateAuthorize(o) => &o.ts,
+            Op::CandidateRevoke(o) => &o.ts,
+            Op::CandidateSupersede(o) => &o.ts,
+            Op::CandidateAbandon(o) => &o.ts,
+            Op::CandidateLanded(o) => &o.ts,
         }
     }
 
@@ -536,13 +824,26 @@ impl Op {
             Op::MsgSend(o) => o.entity.as_deref(),
             Op::MsgAck(_) | Op::MsgResolve(_) => None,
             Op::BoardPost(_) => None,
-            Op::BoardRead(_) => None,
+            Op::BoardRead(_) | Op::BoardWatch(_) => None,
             Op::BoardTopic(_) => None,
             Op::BoardSticky(_) => None,
+            Op::BoardSupersede(_) | Op::BoardRetract(_) => None,
             Op::BoardRoute(_) => None,
-            Op::SessionStart(_) | Op::SessionEnd(_) => None,
+            Op::SessionStart(_)
+            | Op::SessionHeartbeat(_)
+            | Op::SessionStatus(_)
+            | Op::SessionEnd(_) => None,
             Op::ReserveOpen(o) => Some(&o.entity),
             Op::ReserveClose(_) => None,
+            Op::ReserveAdopt(o) => Some(&o.entity),
+            Op::CandidatePropose(o) => Some(&o.candidate_id),
+            Op::CandidateEvidence(o) => Some(&o.candidate_id),
+            Op::CandidateReview(o) => Some(&o.candidate_id),
+            Op::CandidateAuthorize(o) => Some(&o.candidate_id),
+            Op::CandidateRevoke(o) => Some(&o.candidate_id),
+            Op::CandidateSupersede(o) => Some(&o.candidate_id),
+            Op::CandidateAbandon(o) => Some(&o.candidate_id),
+            Op::CandidateLanded(o) => Some(&o.candidate_id),
         }
     }
 
@@ -566,13 +867,42 @@ impl Op {
             Op::MsgResolve(_) => "msg_resolve",
             Op::BoardPost(_) => "board_post",
             Op::BoardRead(_) => "board_read",
+            Op::BoardWatch(_) => "board_watch",
             Op::BoardTopic(_) => "board_topic",
             Op::BoardSticky(_) => "board_sticky",
+            Op::BoardSupersede(_) => "board_supersede",
+            Op::BoardRetract(_) => "board_retract",
             Op::BoardRoute(_) => "board_route",
             Op::SessionStart(_) => "session_start",
+            Op::SessionHeartbeat(_) => "session_heartbeat",
+            Op::SessionStatus(_) => "session_status",
             Op::SessionEnd(_) => "session_end",
             Op::ReserveOpen(_) => "reserve_open",
             Op::ReserveClose(_) => "reserve_close",
+            Op::ReserveAdopt(_) => "reserve_adopt",
+            Op::CandidatePropose(_) => "candidate_propose",
+            Op::CandidateEvidence(_) => "candidate_evidence",
+            Op::CandidateReview(_) => "candidate_review",
+            Op::CandidateAuthorize(_) => "candidate_authorize",
+            Op::CandidateRevoke(_) => "candidate_revoke",
+            Op::CandidateSupersede(_) => "candidate_supersede",
+            Op::CandidateAbandon(_) => "candidate_abandon",
+            Op::CandidateLanded(_) => "candidate_landed",
+        }
+    }
+
+    /// Candidate mutation retry identity, if this is a candidate operation.
+    pub fn candidate_idempotency(&self) -> Option<(&str, &str)> {
+        match self {
+            Op::CandidatePropose(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            Op::CandidateEvidence(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            Op::CandidateReview(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            Op::CandidateAuthorize(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            Op::CandidateRevoke(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            Op::CandidateSupersede(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            Op::CandidateAbandon(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            Op::CandidateLanded(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            _ => None,
         }
     }
 }
@@ -791,6 +1121,70 @@ pub fn make_msg_send_with_metadata(
     idempotency_key: Option<String>,
     ts: jiff::Timestamp,
 ) -> Op {
+    make_msg_send_with_metadata_and_answers(
+        actor,
+        msg_id,
+        to,
+        entity,
+        reservation,
+        msg_kind,
+        body,
+        reply_to,
+        correlation_id,
+        idempotency_key,
+        Vec::new(),
+        ts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn make_msg_send_with_metadata_and_answers(
+    actor: String,
+    msg_id: String,
+    to: String,
+    entity: Option<BeadId>,
+    reservation: Option<String>,
+    msg_kind: String,
+    body: String,
+    reply_to: Option<String>,
+    correlation_id: Option<String>,
+    idempotency_key: Option<String>,
+    answers: Vec<String>,
+    ts: jiff::Timestamp,
+) -> Op {
+    make_msg_send_with_options(
+        actor,
+        msg_id,
+        to,
+        entity,
+        reservation,
+        msg_kind,
+        body,
+        reply_to,
+        correlation_id,
+        idempotency_key,
+        answers,
+        false,
+        ts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn make_msg_send_with_options(
+    actor: String,
+    msg_id: String,
+    to: String,
+    entity: Option<BeadId>,
+    reservation: Option<String>,
+    msg_kind: String,
+    body: String,
+    reply_to: Option<String>,
+    correlation_id: Option<String>,
+    idempotency_key: Option<String>,
+    answers: Vec<String>,
+    require_live: bool,
+    ts: jiff::Timestamp,
+) -> Op {
     Op::MsgSend(MsgSendOp {
         v: 1,
         op: String::new(),
@@ -805,6 +1199,8 @@ pub fn make_msg_send_with_metadata(
         reply_to,
         correlation_id,
         idempotency_key,
+        answers,
+        require_live,
     })
 }
 
@@ -817,7 +1213,7 @@ pub fn make_reserve_open(
     ts: jiff::Timestamp,
 ) -> Op {
     Op::ReserveOpen(ReserveOpenOp {
-        v: 1,
+        v: 2,
         op: String::new(),
         ts: ids::format_rfc3339(ts),
         actor,
@@ -842,6 +1238,26 @@ pub fn make_reserve_close(
         actor,
         reservation_id,
         paths,
+    })
+}
+
+pub fn make_reserve_adopt(
+    actor: String,
+    reservation_id: String,
+    entity: BeadId,
+    expect_reservation: String,
+    ttl_s: u32,
+    ts: jiff::Timestamp,
+) -> Op {
+    Op::ReserveAdopt(ReserveAdoptOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        reservation_id,
+        entity,
+        expect_reservation,
+        ttl_s,
     })
 }
 
@@ -886,6 +1302,56 @@ pub fn make_board_post_of_kind(
     post_kind: Option<String>,
     ts: jiff::Timestamp,
 ) -> Op {
+    make_board_post_of_kind_with_answers(
+        actor,
+        post_id,
+        topic,
+        body,
+        reply_to,
+        post_kind,
+        Vec::new(),
+        ts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn make_board_post_of_kind_with_answers(
+    actor: String,
+    post_id: String,
+    topic: String,
+    body: String,
+    reply_to: Option<String>,
+    post_kind: Option<String>,
+    answers: Vec<String>,
+    ts: jiff::Timestamp,
+) -> Op {
+    make_board_post_with_options(
+        actor,
+        post_id,
+        topic,
+        body,
+        reply_to,
+        post_kind,
+        answers,
+        Vec::new(),
+        None,
+        ts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn make_board_post_with_options(
+    actor: String,
+    post_id: String,
+    topic: String,
+    body: String,
+    reply_to: Option<String>,
+    post_kind: Option<String>,
+    answers: Vec<String>,
+    notify: Vec<String>,
+    idempotency_key: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
     Op::BoardPost(BoardPostOp {
         v: 1,
         op: String::new(),
@@ -896,6 +1362,20 @@ pub fn make_board_post_of_kind(
         body,
         reply_to,
         post_kind,
+        answers,
+        notify,
+        idempotency_key,
+    })
+}
+
+pub fn make_board_watch(actor: String, topic: String, watching: bool, ts: jiff::Timestamp) -> Op {
+    Op::BoardWatch(BoardWatchOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        topic,
+        watching,
     })
 }
 
@@ -941,6 +1421,46 @@ pub fn make_session_start(
     })
 }
 
+pub fn make_session_heartbeat(
+    actor: String,
+    session_id: String,
+    ttl_s: u32,
+    idempotency_key: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
+    Op::SessionHeartbeat(SessionHeartbeatOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        session_id,
+        ttl_s,
+        idempotency_key,
+    })
+}
+
+pub fn make_session_status(
+    actor: String,
+    session_id: String,
+    status: String,
+    message: Option<String>,
+    issue: Option<BeadId>,
+    idempotency_key: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
+    Op::SessionStatus(SessionStatusOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        session_id,
+        status,
+        message,
+        issue,
+        idempotency_key,
+    })
+}
+
 pub fn make_session_end(actor: String, session_id: String, ts: jiff::Timestamp) -> Op {
     Op::SessionEnd(SessionEndOp {
         v: 1,
@@ -957,6 +1477,25 @@ pub fn make_board_read(
     topic: Option<String>,
     ts: jiff::Timestamp,
 ) -> Op {
+    make_board_read_with_policy(actor, upto_op_id, topic, false, ts)
+}
+
+pub fn make_board_read_through(
+    actor: String,
+    upto_op_id: String,
+    topic: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
+    make_board_read_with_policy(actor, upto_op_id, topic, true, ts)
+}
+
+fn make_board_read_with_policy(
+    actor: String,
+    upto_op_id: String,
+    topic: Option<String>,
+    strict: bool,
+    ts: jiff::Timestamp,
+) -> Op {
     Op::BoardRead(BoardReadOp {
         v: 1,
         op: String::new(),
@@ -964,6 +1503,7 @@ pub fn make_board_read(
         actor,
         upto_op_id,
         topic,
+        strict,
     })
 }
 
@@ -996,7 +1536,41 @@ pub fn make_board_sticky(actor: String, post_id: String, sticky: bool, ts: jiff:
     })
 }
 
-pub const VALID_NOTE_KINDS: &[&str] = &["note", "progress", "decision", "handoff", "blocker"];
+pub fn make_board_supersede(
+    actor: String,
+    old_post_id: String,
+    new_post_id: String,
+    ts: jiff::Timestamp,
+) -> Op {
+    Op::BoardSupersede(BoardSupersedeOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        old_post_id,
+        new_post_id,
+    })
+}
+
+pub fn make_board_retract(
+    actor: String,
+    post_id: String,
+    reason: String,
+    ts: jiff::Timestamp,
+) -> Op {
+    Op::BoardRetract(BoardRetractOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(ts),
+        actor,
+        post_id,
+        reason,
+    })
+}
+
+pub const VALID_NOTE_KINDS: &[&str] = &[
+    "note", "progress", "decision", "design", "handoff", "blocker",
+];
 pub const VALID_MSG_KINDS: &[&str] = &[
     "note", "request", "response", "decline", "handoff", "blocked", "fyi",
 ];
@@ -1005,6 +1579,7 @@ pub const VALID_POST_KINDS: &[&str] = &["post", "decision", "summary"];
 /// Routing states a discussion post or topic can carry. `open` is the implicit
 /// default and is also writable, so a resolved thread can be reopened.
 pub const VALID_ROUTE_STATES: &[&str] = &["open", "needs_bead", "routed", "resolved"];
+pub const VALID_SESSION_INTENTS: &[&str] = &["available", "working", "waiting", "blocked", "away"];
 
 pub fn validate_note_kind(k: &str) -> bool {
     VALID_NOTE_KINDS.contains(&k)
@@ -1018,6 +1593,10 @@ pub fn validate_route_state(s: &str) -> bool {
     VALID_ROUTE_STATES.contains(&s)
 }
 
+pub fn validate_session_intent(s: &str) -> bool {
+    VALID_SESSION_INTENTS.contains(&s)
+}
+
 pub fn validate_msg_kind(k: &str) -> bool {
     VALID_MSG_KINDS.contains(&k)
 }
@@ -1027,6 +1606,32 @@ pub fn validate_idempotency_key(key: &str) -> bool {
         && key.chars().count() <= 128
         && key.trim() == key
         && !key.chars().any(char::is_control)
+}
+
+/// Stable digest of the semantic fields covered by a session retry key.
+/// Envelope fields (`op`, `ts`) are excluded so a transport retry at a later
+/// timestamp resolves to the originally accepted action.
+pub fn session_action_digest(op: &Op) -> Option<String> {
+    let semantic = match op {
+        Op::SessionHeartbeat(o) => serde_json::json!({
+            "kind": "session_heartbeat",
+            "session_id": o.session_id,
+            "ttl_s": o.ttl_s,
+        }),
+        Op::SessionStatus(o) => serde_json::json!({
+            "kind": "session_status",
+            "session_id": o.session_id,
+            "status": o.status,
+            "message": o.message,
+            "issue": o.issue,
+        }),
+        _ => return None,
+    };
+    Some(
+        blake3::hash(semantic.to_string().as_bytes())
+            .to_hex()
+            .to_string(),
+    )
 }
 
 /// `BTreeSet` is an internal helper exposed for callers; not currently used by

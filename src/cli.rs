@@ -6,22 +6,80 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
+use clap::{Command as ClapCommand, CommandFactory, Parser, Subcommand};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::{MoteError, MoteResult};
 use crate::ids;
 use crate::op::{
-    self, ScalarSet, Status, make_board_post, make_board_read, make_board_route, make_board_sticky,
+    self, ScalarSet, Status, make_board_post, make_board_read, make_board_read_through,
+    make_board_retract, make_board_route, make_board_sticky, make_board_supersede,
     make_board_topic, make_claim, make_close, make_create, make_delete, make_dep, make_msg_ack,
-    make_msg_resolve, make_msg_send_with_metadata, make_note, make_patch, make_rel, make_release,
-    make_reserve_close, make_reserve_open, make_session_end, make_session_start, make_tag,
-    validate_msg_kind, validate_note_kind,
+    make_msg_resolve, make_note, make_patch, make_rel, make_release, make_reserve_adopt,
+    make_reserve_close, make_reserve_open, make_session_end, make_session_heartbeat,
+    make_session_start, make_session_status, make_tag, validate_msg_kind, validate_note_kind,
 };
 use crate::reducer;
 use crate::state::{Bead, MsgRecord, RequestState};
 use crate::{fsck, publish, repo::Store};
+
+/// Literal text supplied either as an argv value or explicitly through stdin.
+///
+/// Body-bearing options use `-` as the stdin sentinel (for example,
+/// `--body -` and `--note -`). Commands whose text is positional expose an
+/// explicit `--stdin` flag instead, preserving a literal positional `-` for
+/// backward compatibility. Stdin is never read unless one of those explicit
+/// forms is present, so an ordinary invocation cannot block on a terminal.
+#[derive(Debug)]
+enum TextInput {
+    Literal(String),
+    Stdin,
+}
+
+impl TextInput {
+    fn option(value: String) -> Self {
+        if value == "-" {
+            Self::Stdin
+        } else {
+            Self::Literal(value)
+        }
+    }
+
+    fn positional(value: Option<String>, stdin: bool, what: &str) -> MoteResult<Self> {
+        match (value, stdin) {
+            (Some(_), true) => Err(MoteError::Invalid(format!(
+                "provide {what} as positional text or with --stdin, not both"
+            ))),
+            (Some(value), false) => Ok(Self::Literal(value)),
+            (None, true) => Ok(Self::Stdin),
+            (None, false) => Err(MoteError::Invalid(format!(
+                "{what} is required (positional text or --stdin)"
+            ))),
+        }
+    }
+
+    fn read(self) -> MoteResult<String> {
+        match self {
+            Self::Literal(value) => Ok(value),
+            Self::Stdin => {
+                let mut value = String::new();
+                std::io::stdin().read_to_string(&mut value)?;
+                Ok(value)
+            }
+        }
+    }
+}
+
+fn resolve_optional_text(value: Option<String>) -> MoteResult<Option<String>> {
+    value
+        .map(|value| TextInput::option(value).read())
+        .transpose()
+}
+
+fn resolve_positional_text(value: Option<String>, stdin: bool, what: &str) -> MoteResult<String> {
+    TextInput::positional(value, stdin, what)?.read()
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -68,7 +126,7 @@ pub enum Command {
         /// Priority 0..=3 (0 = highest)
         #[arg(short = 'p', long)]
         priority: Option<i32>,
-        /// Initial body
+        /// Initial body; pass - to read literal UTF-8 from stdin
         #[arg(long)]
         body: Option<String>,
         /// Initial assignee
@@ -136,7 +194,12 @@ pub enum Command {
         /// One of: note | progress | decision | handoff | blocker
         #[arg(long = "kind")]
         note_kind: String,
-        text: String,
+        /// Note text (positional)
+        #[arg(required_unless_present = "stdin")]
+        text: Option<String>,
+        /// Read note text literally from stdin
+        #[arg(long, conflicts_with = "text")]
+        stdin: bool,
     },
 
     /// Print accepted (and optionally rejected) history of a bead
@@ -174,7 +237,7 @@ pub enum Command {
     Claim {
         id: String,
         /// TTL in seconds (defaults to FORMAT.json default_ttl_s.claim)
-        #[arg(long)]
+        #[arg(long, value_parser = parse_duration_seconds)]
         ttl: Option<u32>,
     },
 
@@ -221,16 +284,19 @@ pub enum Command {
         interval: u64,
     },
 
-    /// Reserve one or more repo-relative paths under an issue
+    /// Reserve one or more repo-relative paths under an issue or candidate
     Reserve {
         /// Repo-relative paths (file or directory; trailing `/` = directory prefix)
         #[arg(num_args = 1..)]
         paths: Vec<String>,
-        /// Issue (bead) the reservation is for
+        /// Issue (bead) the reservation is for; conflicts with --candidate
         #[arg(long = "issue")]
-        issue: String,
+        issue: Option<String>,
+        /// Pending candidate the reservation is for; conflicts with --issue
+        #[arg(long = "candidate")]
+        candidate: Option<String>,
         /// TTL in seconds (default: FORMAT.json default_ttl_s.reservation)
-        #[arg(long)]
+        #[arg(long, value_parser = parse_duration_seconds)]
         ttl: Option<u32>,
     },
 
@@ -243,11 +309,26 @@ pub enum Command {
         paths: Vec<String>,
     },
 
-    /// Dry-run: report any reservation overlaps for given paths
-    Preflight {
-        /// Issue context
+    /// Re-home a live orphaned reservation onto open work claimed by this actor
+    Adopt {
+        /// Reservation id (rv-...)
+        rv: String,
+        /// Open target issue already claimed by this actor
         #[arg(long = "issue")]
         issue: String,
+        /// New TTL in seconds (default: reservation TTL)
+        #[arg(long, value_parser = parse_duration_seconds)]
+        ttl: Option<u32>,
+    },
+
+    /// Dry-run: report any reservation overlaps for given paths
+    Preflight {
+        /// Issue context; conflicts with --candidate
+        #[arg(long = "issue")]
+        issue: Option<String>,
+        /// Candidate context; conflicts with --issue
+        #[arg(long = "candidate")]
+        candidate: Option<String>,
         #[arg(long = "paths", num_args = 1..)]
         paths: Vec<String>,
     },
@@ -257,9 +338,10 @@ pub enum Command {
         id: String,
         #[arg(long = "paths", num_args = 1..)]
         paths: Vec<String>,
+        /// Progress note; pass - to read literal UTF-8 from stdin
         #[arg(long)]
         note: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_duration_seconds)]
         ttl: Option<u32>,
         /// Also post a one-line claim to this discussion topic
         #[arg(long)]
@@ -271,6 +353,7 @@ pub enum Command {
         id: String,
         #[arg(long = "to")]
         to: String,
+        /// Handoff note; pass - to read literal UTF-8 from stdin
         #[arg(long)]
         note: Option<String>,
         /// Also close any current actor's reservations on this issue
@@ -281,6 +364,7 @@ pub enum Command {
     /// Compound: completion note + close + reserve_close + release
     Done {
         id: String,
+        /// Completion note; pass - to read literal UTF-8 from stdin
         #[arg(long)]
         note: Option<String>,
     },
@@ -292,6 +376,12 @@ pub enum Command {
     Session {
         #[command(subcommand)]
         cmd: SessionCmd,
+    },
+
+    /// Manage immutable Git change candidates and landing authorization
+    Candidate {
+        #[command(subcommand)]
+        cmd: CandidateCmd,
     },
 
     /// One-shot view of what is actively being worked on right now
@@ -309,7 +399,7 @@ pub enum Command {
 
     /// Emit accepted operation events, optionally following for new events
     Events {
-        /// Event categories: issue, claim, reservation, message, discussion, or all
+        /// Event categories: issue, claim, reservation, message, discussion, session, candidate, or all
         #[arg(long = "kind", value_delimiter = ',')]
         kinds: Vec<String>,
         /// Include only events authored by or directly related to this actor
@@ -336,6 +426,12 @@ pub enum Command {
     /// Open a read-only TUI dashboard. Read-only.
     Ui,
 
+    /// Serve the local web-console HTTP API on loopback
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:7717")]
+        bind: String,
+    },
+
     /// Check store layout, actor identity, and op-log health
     Doctor,
 
@@ -361,6 +457,141 @@ pub enum Command {
     Skills {
         #[command(subcommand)]
         cmd: SkillsCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CandidateCmd {
+    /// Propose an immutable commit and policy, then record initial Git ancestry
+    Propose {
+        #[arg(long)]
+        issue: String,
+        #[arg(long, default_value = "HEAD")]
+        commit: String,
+        #[arg(long)]
+        base: String,
+        #[arg(long = "path", num_args = 1..)]
+        paths: Vec<String>,
+        #[arg(long)]
+        authorizer: String,
+        #[arg(long = "reviewer", num_args = 1..)]
+        reviewers: Vec<String>,
+        /// Additional requirement as name:kind:producer[,producer]
+        #[arg(long = "require")]
+        requirements: Vec<String>,
+        #[arg(long = "evidence-ref")]
+        evidence_refs: Vec<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Show one candidate, including structured landability reasons
+    Show { candidate_id: String },
+    /// List candidates
+    List {
+        #[arg(long)]
+        phase: Option<String>,
+    },
+    /// Record or refresh evidence
+    Evidence {
+        #[command(subcommand)]
+        cmd: CandidateEvidenceCmd,
+    },
+    /// Replace this actor's review register using CAS
+    Review {
+        candidate_id: String,
+        verdict: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long = "evidence")]
+        evidence_refs: Vec<String>,
+        #[arg(long)]
+        expect: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Grant or conditionally grant landing authority using CAS
+    Authorize {
+        candidate_id: String,
+        #[arg(long = "grantee", num_args = 1..)]
+        grantees: Vec<String>,
+        #[arg(long = "condition")]
+        conditions: Vec<String>,
+        #[arg(long)]
+        expect: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Revoke the current landing authorization using CAS
+    Revoke {
+        candidate_id: String,
+        #[arg(long)]
+        expect: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Mark an old pending candidate superseded by a new pending candidate
+    Supersede {
+        candidate_id: String,
+        successor_id: String,
+        #[arg(long)]
+        expect_phase: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Abandon a pending candidate
+    Abandon {
+        candidate_id: String,
+        #[arg(long)]
+        expect_phase: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Record exact reachability after an external Git landing
+    Landed {
+        candidate_id: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long)]
+        expect_phase: String,
+        #[arg(long)]
+        expect_authorization: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CandidateEvidenceCmd {
+    /// Refresh built-in Git ancestry evidence for the immutable proposal
+    Refresh {
+        candidate_id: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Record external evidence with a caller-provided content digest
+    Record {
+        candidate_id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        outcome: String,
+        #[arg(long)]
+        digest: String,
+        /// Producer or tool identity, for example github-actions/test
+        #[arg(long)]
+        producer_tool: String,
+        #[arg(long)]
+        detail: Option<String>,
+        #[arg(long = "ref")]
+        refs: Vec<String>,
+        #[arg(long)]
+        idempotency_key: String,
     },
 }
 
@@ -393,7 +624,7 @@ pub enum SessionCmd {
         #[arg(long = "as")]
         as_actor: Option<String>,
         /// Lease duration in seconds
-        #[arg(long, default_value_t = 14400)]
+        #[arg(long, default_value = "4h", value_parser = parse_duration_seconds)]
         ttl: u32,
         /// Free-text description of what this session is doing
         #[arg(long)]
@@ -404,8 +635,43 @@ pub enum SessionCmd {
         /// Session id (default: `MOTE_SESSION`)
         #[arg(long)]
         id: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_duration_seconds)]
         ttl: Option<u32>,
+    },
+    /// Extend a session lease only when it is near renewal, unless forced
+    Heartbeat {
+        /// Session id (default: `MOTE_SESSION`)
+        #[arg(long)]
+        id: Option<String>,
+        /// New lease duration (default: the session's current TTL)
+        #[arg(long, value_parser = parse_duration_seconds)]
+        ttl: Option<u32>,
+        /// Publish when the remaining lease is at or below this margin
+        #[arg(long, default_value = "5m", value_parser = parse_duration_seconds)]
+        renew_within: u32,
+        /// Publish even when the lease is outside the renewal margin
+        #[arg(long)]
+        force: bool,
+        /// Actor-scoped retry key; an identical retry returns the first result
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Declare this session's current availability or work intent
+    Status {
+        /// One of: available | working | waiting | blocked | away
+        status: String,
+        /// Session id (default: `MOTE_SESSION`)
+        #[arg(long)]
+        id: Option<String>,
+        /// Optional single-line explanation
+        #[arg(long)]
+        message: Option<String>,
+        /// Optional existing issue context
+        #[arg(long)]
+        issue: Option<String>,
+        /// Actor-scoped retry key; an identical retry returns the first result
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// List session leases
     List {
@@ -427,7 +693,23 @@ pub enum ActorCmd {
     /// Show the actor identity that would be used for this invocation
     Show,
     /// List actors observed in accepted operations or message recipients
-    List,
+    List {
+        /// Filter by derived presence (live | recent | expired | untracked)
+        #[arg(long)]
+        presence: Option<String>,
+        /// Keep actors with substantive work or interaction in this window
+        #[arg(long, value_parser = parse_duration_seconds)]
+        active_within: Option<u32>,
+    },
+    /// Show replay-derived presence, activity, work, and pending attention
+    Status {
+        /// Actor to inspect (default: the resolved current actor)
+        #[arg(value_name = "ACTOR")]
+        name: Option<String>,
+        /// Window for sessionless recent activity
+        #[arg(long, default_value = "10m", value_parser = parse_duration_seconds)]
+        recent_window: u32,
+    },
     /// Remove the persisted local actor identity
     Clear,
 }
@@ -500,8 +782,18 @@ pub enum MsgCmd {
         /// Sender-scoped retry key; an identical retry returns the first msg-id
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Reject unless the recipient has a valid session lease at send time
+        #[arg(long)]
+        require_live: bool,
+        /// Open request msg-id answered by this message; repeatable
+        #[arg(long = "answers")]
+        answers: Vec<String>,
         /// Body text (positional)
-        text: String,
+        #[arg(required_unless_present = "stdin")]
+        text: Option<String>,
+        /// Read body text literally from stdin
+        #[arg(long, conflicts_with = "text")]
+        stdin: bool,
     },
     /// Respond to or decline an open request
     Reply {
@@ -514,7 +806,22 @@ pub enum MsgCmd {
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Body text (positional)
-        text: String,
+        #[arg(required_unless_present = "stdin")]
+        text: Option<String>,
+        /// Read body text literally from stdin
+        #[arg(long, conflicts_with = "text")]
+        stdin: bool,
+    },
+    /// Show the full two-sided message thread with another actor
+    Thread {
+        /// The other actor in the conversation
+        peer: String,
+        /// Filter by issue id
+        #[arg(long)]
+        issue: Option<String>,
+        /// Filter by msg_kind
+        #[arg(long = "kind")]
+        msg_kind: Option<String>,
     },
     /// List request lifecycles involving the current actor
     Requests {
@@ -544,7 +851,16 @@ pub enum DiscussCmd {
         /// Optional parent post id for a threaded reply
         #[arg(long = "reply-to")]
         reply_to: Option<String>,
-        /// Body text
+        /// Open request msg-id answered by this post; repeatable
+        #[arg(long = "answers")]
+        answers: Vec<String>,
+        /// Explicit notification recipient; repeatable
+        #[arg(long = "notify")]
+        notify: Vec<String>,
+        /// Author-scoped retry key for identical post content and routing
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Body text; pass - to read literal UTF-8 from stdin
         #[arg(long)]
         body: Option<String>,
         /// Body text (positional; alternatively use --body)
@@ -564,15 +880,39 @@ pub enum DiscussCmd {
         /// Filter by topic
         #[arg(long)]
         topic: Option<String>,
-        /// Maximum number of posts to print
+        /// Newest N unread posts in the selected chronological range
         #[arg(long)]
         limit: Option<usize>,
+        /// Return only unread posts chronologically before this post id
+        #[arg(long)]
+        before: Option<String>,
+        /// With --json, return {posts,page} instead of the legacy post array
+        #[arg(long)]
+        page: bool,
     },
-    /// Mark currently visible discussion posts as read for this actor
+    /// List unread posts explicitly routed to this actor's attention
+    Notifications {
+        #[arg(long)]
+        topic: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        before: Option<String>,
+    },
+    /// Watch a public topic for future external posts
+    Watch { topic: String },
+    /// Stop watching a public topic
+    Unwatch { topic: String },
+    /// List the current actor's watched topics
+    Watches,
+    /// Advance this actor's discussion cursor
     MarkRead {
         /// Mark only one topic read
         #[arg(long)]
         topic: Option<String>,
+        /// Advance exactly through this post rather than the current head
+        #[arg(long)]
+        through: Option<String>,
     },
     /// List direct replies to a post
     Replies {
@@ -603,27 +943,46 @@ pub enum DiscussCmd {
     Sticky { post_id: String },
     /// Remove sticky state from a post
     Unsticky { post_id: String },
+    /// Mark an older post obsolete in favor of a same-topic replacement
+    Supersede {
+        old_post_id: String,
+        new_post_id: String,
+    },
+    /// Retract a post without deleting its body
+    Retract {
+        post_id: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// List topics with post counts
     Topics,
     /// Record a decision on a topic as a sticky, retrievable post
     Decision {
         #[arg(long, default_value = "general")]
         topic: String,
-        /// Decision text
+        /// Decision text; pass - to read literal UTF-8 from stdin
         #[arg(long)]
         body: Option<String>,
         /// Decision text (positional; alternatively use --body)
         text: Option<String>,
+        #[arg(long = "notify")]
+        notify: Vec<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Set or show a topic's pinned current-state summary
     Summary {
         #[arg(long, default_value = "general")]
         topic: String,
-        /// Summary text; omit to print the topic's current summary
+        /// Summary text; omit to print it, or pass - to read stdin
         #[arg(long)]
         body: Option<String>,
         /// Summary text (positional; alternatively use --body)
         text: Option<String>,
+        #[arg(long = "notify")]
+        notify: Vec<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Link a post or topic to a bead
     Route {
@@ -634,7 +993,7 @@ pub enum DiscussCmd {
         /// Bead this discussion routes to
         #[arg(long = "issue")]
         issue: String,
-        /// Optional note recorded on the bead
+        /// Optional note recorded on the bead; pass - to read stdin
         #[arg(long)]
         note: Option<String>,
     },
@@ -661,7 +1020,7 @@ pub enum DiscussCmd {
         /// Bead title (default: the post's first line)
         #[arg(long)]
         title: Option<String>,
-        /// Bead body (default: the post body, with board provenance appended)
+        /// Bead body; defaults to the post body, or pass - to read stdin
         #[arg(long)]
         body: Option<String>,
         #[arg(long)]
@@ -684,13 +1043,116 @@ pub enum DiscussTopicCmd {
         /// Topic description shown in topic listings
         #[arg(long)]
         description: Option<String>,
-        /// Optional initial visible post body
+        /// Optional initial visible post body; pass - to read stdin
         #[arg(long)]
         body: Option<String>,
+        /// Explicit notification recipient for the initial post; repeatable
+        #[arg(long = "notify")]
+        notify: Vec<String>,
+        /// Author-scoped retry key for the initial post
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
 }
 
+impl Command {
+    /// Whether this command may publish an operation whose actor comes from
+    /// the ordinary flag/environment/local-file resolution chain.
+    ///
+    /// This deliberately classifies identity-neutral maintenance and every
+    /// read-only surface as false. `session start --as ...` is also false: it
+    /// is the recovery path that establishes a process-scoped identity when a
+    /// checkout-wide local actor has become ambiguous.
+    fn publishes_as_resolved_actor(&self) -> bool {
+        !matches!(
+            self,
+            Command::Init
+                | Command::Actor { .. }
+                | Command::Show { .. }
+                | Command::Parents { .. }
+                | Command::Children { .. }
+                | Command::Dependents { .. }
+                | Command::Ls { .. }
+                | Command::Ready
+                | Command::History { .. }
+                | Command::Msg {
+                    cmd: MsgCmd::Thread { .. } | MsgCmd::Requests { .. },
+                }
+                | Command::Discuss {
+                    cmd: DiscussCmd::List { .. }
+                        | DiscussCmd::Unread { .. }
+                        | DiscussCmd::Notifications { .. }
+                        | DiscussCmd::Watches
+                        | DiscussCmd::Replies { .. }
+                        | DiscussCmd::Thread { .. }
+                        | DiscussCmd::Search { .. }
+                        | DiscussCmd::Topics
+                        | DiscussCmd::Unrouted { .. }
+                        | DiscussCmd::Summary {
+                            body: None,
+                            text: None,
+                            ..
+                        },
+                }
+                | Command::Inbox { .. }
+                | Command::Preflight { .. }
+                | Command::WhoHas { .. }
+                | Command::Session {
+                    cmd: SessionCmd::List { .. }
+                        | SessionCmd::Start {
+                            as_actor: Some(_),
+                            ..
+                        },
+                }
+                | Command::Candidate {
+                    cmd: CandidateCmd::Show { .. } | CandidateCmd::List { .. },
+                }
+                | Command::InFlight { .. }
+                | Command::Board
+                | Command::Events { .. }
+                | Command::Watch { .. }
+                | Command::Ui
+                | Command::Serve { .. }
+                | Command::Doctor
+                | Command::Fsck { .. }
+                | Command::Skills { .. }
+        )
+    }
+}
+
+/// Refuse ambiguous attribution before a state-changing command reaches the
+/// op log. `.mote/local/actor` is a single checkout-wide convenience file; it
+/// cannot safely identify one process once several session leases are live.
+fn guard_concurrent_local_identity(cli: &Cli) -> MoteResult<()> {
+    if !cli.command.publishes_as_resolved_actor() {
+        return Ok(());
+    }
+
+    let store = open_store(cli.store.as_deref())?;
+    let actor = resolve_actor_with_source(&store, cli.actor.as_deref())?;
+    if actor.source != "local" {
+        return Ok(());
+    }
+
+    let state = reducer::replay_store(&store)?;
+    let now_ts = ids::format_rfc3339(Timestamp::now());
+    let live_sessions = state.live_sessions(&now_ts);
+    if live_sessions.len() <= 1 {
+        return Ok(());
+    }
+
+    Err(MoteError::Invalid(format!(
+        "refusing actor-attributed write as `{}` (source=local): {} live sessions make \
+         `.mote/local/actor` ambiguous; activate a process identity with \
+         `eval \"$(mote session start --as <unique-name> --label '<work>')\"`, \
+         export MOTE_ACTOR=<unique-name>, or pass --actor <unique-name>",
+        actor.actor,
+        live_sessions.len()
+    )))
+}
+
 pub fn run(cli: Cli) -> MoteResult<i32> {
+    guard_concurrent_local_identity(&cli)?;
     match cli.command {
         Command::Init => cmd_init(cli.quiet),
         Command::Actor { cmd } => {
@@ -748,12 +1210,14 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             id,
             note_kind,
             text,
+            stdin,
         } => cmd_note(
             cli.actor.as_deref(),
             cli.store.as_deref(),
             id,
             note_kind,
             text,
+            stdin,
         ),
         Command::History {
             id,
@@ -794,21 +1258,41 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             after,
             interval,
         ),
-        Command::Reserve { paths, issue, ttl } => cmd_reserve(
-            cli.actor.as_deref(),
-            cli.store.as_deref(),
+        Command::Reserve {
             paths,
             issue,
+            candidate,
+            ttl,
+        } => cmd_reserve(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            paths,
+            issue,
+            candidate,
             ttl,
         ),
         Command::Unreserve { rv, paths } => {
             cmd_unreserve(cli.actor.as_deref(), cli.store.as_deref(), rv, paths)
         }
-        Command::Preflight { issue, paths } => cmd_preflight(
+        Command::Adopt { rv, issue, ttl } => cmd_adopt(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            rv,
+            issue,
+            ttl,
+        ),
+        Command::Preflight {
+            issue,
+            candidate,
+            paths,
+        } => cmd_preflight(
             cli.actor.as_deref(),
             cli.store.as_deref(),
             cli.json,
             issue,
+            candidate,
             paths,
         ),
         Command::Begin {
@@ -846,6 +1330,9 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         Command::Session { cmd } => {
             cmd_session(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
         }
+        Command::Candidate { cmd } => {
+            cmd_candidate(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
+        }
         Command::InFlight { minutes, no_git } => cmd_in_flight(
             cli.actor.as_deref(),
             cli.store.as_deref(),
@@ -877,6 +1364,11 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             interval,
         ),
         Command::Ui => cmd_ui(cli.actor.as_deref(), cli.store.as_deref()),
+        Command::Serve { bind } => {
+            let store = open_store(cli.store.as_deref())?;
+            crate::server::serve(store, &bind)?;
+            Ok(0)
+        }
         Command::Doctor => cmd_doctor(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
         Command::Fsck { clean_tmp } => cmd_fsck(cli.store.as_deref(), cli.json, clean_tmp),
         Command::Batch { input } => {
@@ -887,6 +1379,728 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         }
         Command::Skills { cmd } => cmd_skills(cli.json, cli.quiet, cmd),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct HelpLeaf {
+    path: String,
+    usage: String,
+    about: String,
+}
+
+pub fn run_help_all(json_mode: bool) -> MoteResult<i32> {
+    let command = Cli::command();
+    let mut leaves = Vec::new();
+    collect_help_leaves(&command, &mut Vec::new(), &mut leaves);
+    leaves.sort_by(|a, b| a.path.cmp(&b.path));
+    if json_mode {
+        println!("{}", serde_json::to_string(&leaves)?);
+    } else {
+        for leaf in leaves {
+            println!("{:<34}  {}", leaf.path, leaf.usage);
+        }
+    }
+    Ok(0)
+}
+
+fn collect_help_leaves(
+    command: &ClapCommand,
+    parent: &mut Vec<String>,
+    output: &mut Vec<HelpLeaf>,
+) {
+    let children: Vec<_> = command.get_subcommands().collect();
+    if children.is_empty() {
+        let mut rendered = command.clone();
+        output.push(HelpLeaf {
+            path: parent.join(" "),
+            usage: rendered.render_usage().to_string().trim().to_string(),
+            about: command
+                .get_about()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        });
+        return;
+    }
+    for child in children {
+        if child.get_name() == "help" {
+            continue;
+        }
+        parent.push(child.get_name().to_string());
+        collect_help_leaves(child, parent, output);
+        parent.pop();
+    }
+}
+
+fn known_candidates(state: &crate::state::State) -> Vec<crate::candidate::KnownCandidate> {
+    state
+        .candidates
+        .values()
+        .map(|candidate| crate::candidate::KnownCandidate {
+            candidate_id: candidate.candidate_id.clone(),
+            proposal_op_id: candidate.proposal_op_id.clone(),
+            repository_id: candidate.repository_id.clone(),
+            commit_oid: candidate.commit_oid.clone(),
+        })
+        .collect()
+}
+
+fn candidate_json(
+    state: &crate::state::State,
+    candidate: &crate::state::CandidateRecord,
+) -> serde_json::Value {
+    let now = ids::format_rfc3339(Timestamp::now());
+    serde_json::json!({
+        "candidate_id": candidate.candidate_id,
+        "entity": candidate.entity,
+        "proposer": candidate.proposer,
+        "proposal_op_id": candidate.proposal_op_id,
+        "identity": {
+            "store_id": candidate.store_id,
+            "repository_id": candidate.repository_id,
+            "object_format": candidate.object_format,
+            "commit_oid": candidate.commit_oid,
+            "base_oid": candidate.base_oid,
+            "parent_oids": candidate.parent_oids,
+        },
+        "phase": {
+            "value": candidate.phase,
+            "op_id": candidate.phase_op_id,
+        },
+        "policy": {
+            "paths": candidate.paths,
+            "authorizer": candidate.authorizer,
+            "reviewers": candidate.reviewers,
+            "evidence_requirements": candidate.evidence_requirements,
+            "evidence_refs": candidate.evidence_refs,
+        },
+        "reviews": candidate.reviews,
+        "evidence": candidate.evidence.values().collect::<Vec<_>>(),
+        "authorization": candidate.authorization,
+        "supersession": { "successor_id": candidate.successor_id },
+        "landing": candidate.landed,
+        "reservations": state.candidate_reservations(&candidate.candidate_id).iter().map(|reservation| serde_json::json!({
+            "reservation_id": reservation.reservation_id,
+            "actor": reservation.actor,
+            "paths": reservation.live_paths(),
+            "lease_until_ts": reservation.lease_until_ts,
+            "disposition": state.reservation_disposition(reservation, &now),
+        })).collect::<Vec<_>>(),
+        "landability": state.candidate_landability(&candidate.candidate_id, None),
+    })
+}
+
+fn print_candidate(
+    state: &crate::state::State,
+    candidate: &crate::state::CandidateRecord,
+    json_mode: bool,
+) -> MoteResult<()> {
+    let value = candidate_json(state, candidate);
+    if json_mode {
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        let landability = state.candidate_landability(&candidate.candidate_id, None);
+        println!(
+            "{}  {}  {}  issue={}  commit={}",
+            candidate.candidate_id,
+            candidate.phase.as_str(),
+            if landability.landable {
+                "landable"
+            } else {
+                "blocked"
+            },
+            candidate.entity,
+            candidate.commit_oid,
+        );
+        for reason in landability.reasons {
+            println!("  {}: {}", reason.code, reason.detail);
+        }
+    }
+    Ok(())
+}
+
+fn publish_candidate_op(store: &Store, op: &op::Op) -> MoteResult<String> {
+    let name = publish::publish_op(store, op)?;
+    let state = reducer::replay_store(store)?;
+    if !state.was_accepted(name.as_str()) {
+        return Err(MoteError::Rejected(
+            state
+                .rejection_reason(name.as_str())
+                .unwrap_or_else(|| "unknown reducer rejection".into()),
+        ));
+    }
+    Ok(name.into_string())
+}
+
+fn parse_evidence_requirement(raw: &str) -> MoteResult<crate::candidate::EvidenceRequirement> {
+    let mut parts = raw.splitn(3, ':');
+    let name = parts.next().unwrap_or_default().trim();
+    let kind = parts.next().unwrap_or_default().trim();
+    let producers = parts.next().unwrap_or_default();
+    if name.is_empty() || kind.is_empty() || producers.is_empty() {
+        return Err(MoteError::Invalid(format!(
+            "invalid --require `{raw}`; expected name:kind:producer[,producer]"
+        )));
+    }
+    let mut producers: Vec<String> = producers
+        .split(',')
+        .map(str::trim)
+        .filter(|producer| !producer.is_empty())
+        .map(str::to_string)
+        .collect();
+    producers.sort();
+    producers.dedup();
+    if producers.is_empty() {
+        return Err(MoteError::Invalid(format!(
+            "invalid --require `{raw}`; at least one producer is required"
+        )));
+    }
+    Ok(crate::candidate::EvidenceRequirement {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        producers,
+    })
+}
+
+fn evidence_outcome(raw: &str) -> MoteResult<crate::candidate::EvidenceOutcome> {
+    crate::candidate::EvidenceOutcome::parse(raw).ok_or_else(|| {
+        MoteError::Invalid(format!(
+            "invalid evidence outcome `{raw}`; expected pass|fail|unavailable|ambiguous"
+        ))
+    })
+}
+
+fn ancestry_outcome(
+    receipt: &crate::candidate::GitAncestryReceipt,
+) -> crate::candidate::EvidenceOutcome {
+    if receipt.base_is_ancestor == Some(false) {
+        crate::candidate::EvidenceOutcome::Fail
+    } else if receipt.base_is_ancestor.is_none()
+        || receipt.candidate_relations.iter().any(|relation| {
+            matches!(
+                relation.relation,
+                crate::candidate::GitRelationKind::Unavailable
+                    | crate::candidate::GitRelationKind::Ambiguous
+            )
+        })
+    {
+        crate::candidate::EvidenceOutcome::Ambiguous
+    } else {
+        crate::candidate::EvidenceOutcome::Pass
+    }
+}
+
+fn cmd_candidate(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    cmd: CandidateCmd,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    match cmd {
+        CandidateCmd::Show { candidate_id } => {
+            let state = reducer::replay_store(&store)?;
+            let candidate = state.candidates.get(&candidate_id).ok_or_else(|| {
+                MoteError::Invalid(format!("candidate `{candidate_id}` does not exist"))
+            })?;
+            print_candidate(&state, candidate, json_mode)?;
+        }
+        CandidateCmd::List { phase } => {
+            let state = reducer::replay_store(&store)?;
+            let phase = phase
+                .map(|value| match value.as_str() {
+                    "pending" => Ok(crate::candidate::CandidatePhase::Pending),
+                    "superseded" => Ok(crate::candidate::CandidatePhase::Superseded),
+                    "abandoned" => Ok(crate::candidate::CandidatePhase::Abandoned),
+                    "landed" => Ok(crate::candidate::CandidatePhase::Landed),
+                    _ => Err(MoteError::Invalid(format!(
+                        "invalid candidate phase `{value}`"
+                    ))),
+                })
+                .transpose()?;
+            let candidates: Vec<_> = state
+                .candidates
+                .values()
+                .filter(|candidate| phase.is_none_or(|wanted| candidate.phase == wanted))
+                .map(|candidate| candidate_json(&state, candidate))
+                .collect();
+            if json_mode {
+                println!("{}", serde_json::to_string(&candidates)?);
+            } else {
+                for candidate in state
+                    .candidates
+                    .values()
+                    .filter(|candidate| phase.is_none_or(|wanted| candidate.phase == wanted))
+                {
+                    print_candidate(&state, candidate, false)?;
+                }
+            }
+        }
+        CandidateCmd::Propose {
+            issue,
+            commit,
+            base,
+            mut paths,
+            authorizer,
+            mut reviewers,
+            requirements,
+            evidence_refs,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            if !op::validate_idempotency_key(&idempotency_key) {
+                return Err(MoteError::Invalid("invalid idempotency key".into()));
+            }
+            let format = store.read_format()?;
+            let candidate_id =
+                ids::candidate_id_for_retry(&format.store_id, &actor, &idempotency_key);
+            let initial = reducer::replay_store(&store)?;
+            let had_initial_ancestry =
+                initial
+                    .candidates
+                    .get(&candidate_id)
+                    .is_some_and(|existing| {
+                        existing.evidence.contains_key(&(
+                            crate::candidate::GIT_ANCESTRY_EVIDENCE.into(),
+                            actor.clone(),
+                        ))
+                    });
+            paths = paths
+                .iter()
+                .map(|path| crate::paths::normalize(path).map_err(MoteError::Invalid))
+                .collect::<MoteResult<Vec<_>>>()?;
+            paths.sort();
+            paths.dedup();
+            reviewers.sort();
+            reviewers.dedup();
+            let cwd = std::env::current_dir()?;
+            let mut known = known_candidates(&initial);
+            known.retain(|candidate| candidate.candidate_id != candidate_id);
+            let receipt = crate::candidate::probe_ancestry(&cwd, &commit, &base, &known)
+                .map_err(crate::candidate::git_probe_error)?;
+            let mut evidence_requirements = vec![crate::candidate::EvidenceRequirement {
+                name: crate::candidate::GIT_ANCESTRY_EVIDENCE.into(),
+                kind: "git".into(),
+                producers: vec![actor.clone()],
+            }];
+            for raw in requirements {
+                evidence_requirements.push(parse_evidence_requirement(&raw)?);
+            }
+            evidence_requirements
+                .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.kind.cmp(&b.kind)));
+            let proposal = op::Op::CandidatePropose(op::CandidateProposeOp {
+                v: crate::candidate::CANDIDATE_PROTOCOL_VERSION,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor: actor.clone(),
+                candidate_id: candidate_id.clone(),
+                entity: issue,
+                store_id: format.store_id,
+                repository_id: receipt.repository_id.clone(),
+                object_format: receipt.object_format.clone(),
+                commit_oid: receipt.commit_oid.clone(),
+                base_oid: receipt.base_oid.clone(),
+                parent_oids: receipt.parent_oids.clone(),
+                paths,
+                authorizer,
+                reviewers,
+                evidence_requirements,
+                evidence_refs,
+                idempotency_key: idempotency_key.clone(),
+            });
+            publish_candidate_op(&store, &proposal)?;
+            if had_initial_ancestry {
+                let state = reducer::replay_store(&store)?;
+                print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+                return Ok(0);
+            }
+            let payload = crate::candidate::CandidateEvidencePayload::GitAncestry(receipt.clone());
+            let evidence = op::Op::CandidateEvidence(op::CandidateEvidenceOp {
+                v: crate::candidate::CANDIDATE_PROTOCOL_VERSION,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id: candidate_id.clone(),
+                candidate_oid: receipt.commit_oid.clone(),
+                evidence_id: crate::candidate::evidence_id(&payload)?,
+                name: crate::candidate::GIT_ANCESTRY_EVIDENCE.into(),
+                evidence_kind: "git".into(),
+                producer_tool: receipt.git_version.clone(),
+                outcome: ancestry_outcome(&receipt),
+                payload,
+                refs: Vec::new(),
+                idempotency_key: format!(
+                    "initial-{}",
+                    blake3::hash(idempotency_key.as_bytes()).to_hex()
+                ),
+            });
+            publish_candidate_op(&store, &evidence)?;
+            let state = reducer::replay_store(&store)?;
+            print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
+        CandidateCmd::Evidence { cmd } => {
+            return cmd_candidate_evidence(actor_flag, &store, json_mode, cmd);
+        }
+        CandidateCmd::Review {
+            candidate_id,
+            verdict,
+            body,
+            evidence_refs,
+            expect,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let verdict = crate::candidate::ReviewVerdict::parse(&verdict).ok_or_else(|| {
+                MoteError::Invalid("verdict must be approve|block|comment".into())
+            })?;
+            let candidate_id_for_op = candidate_id.clone();
+            let mutation = op::Op::CandidateReview(op::CandidateReviewOp {
+                v: 1,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id: candidate_id_for_op,
+                verdict,
+                body,
+                evidence_refs,
+                expect_review: expect,
+                idempotency_key,
+            });
+            publish_candidate_op(&store, &mutation)?;
+            let state = reducer::replay_store(&store)?;
+            print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
+        CandidateCmd::Authorize {
+            candidate_id,
+            mut grantees,
+            mut conditions,
+            expect,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            grantees.sort();
+            grantees.dedup();
+            conditions.sort();
+            conditions.dedup();
+            let status = if conditions.is_empty() {
+                crate::candidate::AuthorizationStatus::Granted
+            } else {
+                crate::candidate::AuthorizationStatus::Conditional
+            };
+            let mutation = op::Op::CandidateAuthorize(op::CandidateAuthorizeOp {
+                v: 1,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id: candidate_id.clone(),
+                status,
+                grantees,
+                conditions,
+                expect_authorization: expect,
+                idempotency_key,
+            });
+            publish_candidate_op(&store, &mutation)?;
+            let state = reducer::replay_store(&store)?;
+            print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
+        CandidateCmd::Revoke {
+            candidate_id,
+            expect,
+            reason,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let mutation = op::Op::CandidateRevoke(op::CandidateRevokeOp {
+                v: 1,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id: candidate_id.clone(),
+                expect_authorization: expect,
+                reason,
+                idempotency_key,
+            });
+            publish_candidate_op(&store, &mutation)?;
+            let state = reducer::replay_store(&store)?;
+            print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
+        CandidateCmd::Supersede {
+            candidate_id,
+            successor_id,
+            expect_phase,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let mutation = op::Op::CandidateSupersede(op::CandidateSupersedeOp {
+                v: 1,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id: candidate_id.clone(),
+                successor_id,
+                expect_phase,
+                idempotency_key,
+            });
+            publish_candidate_op(&store, &mutation)?;
+            let state = reducer::replay_store(&store)?;
+            print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
+        CandidateCmd::Abandon {
+            candidate_id,
+            expect_phase,
+            reason,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let mutation = op::Op::CandidateAbandon(op::CandidateAbandonOp {
+                v: 1,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id: candidate_id.clone(),
+                expect_phase,
+                reason,
+                idempotency_key,
+            });
+            publish_candidate_op(&store, &mutation)?;
+            let state = reducer::replay_store(&store)?;
+            print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
+        CandidateCmd::Landed {
+            candidate_id,
+            target,
+            before,
+            expect_phase,
+            expect_authorization,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let state = reducer::replay_store(&store)?;
+            let candidate = state
+                .candidates
+                .get(&candidate_id)
+                .ok_or_else(|| MoteError::Invalid("candidate does not exist".into()))?;
+            let mut basis: Vec<String> = candidate
+                .reviews
+                .values()
+                .map(|review| review.op_id.clone())
+                .chain(
+                    candidate
+                        .evidence
+                        .values()
+                        .map(|receipt| receipt.op_id.clone()),
+                )
+                .collect();
+            basis.sort();
+            basis.dedup();
+            let receipt = crate::candidate::probe_landing(
+                &std::env::current_dir()?,
+                &candidate.repository_id,
+                &candidate.object_format,
+                &candidate.commit_oid,
+                &target,
+                before.as_deref(),
+                &expect_authorization,
+                basis,
+            )
+            .map_err(crate::candidate::git_probe_error)?;
+            let outcome = match receipt.candidate_reachable {
+                Some(true) => crate::candidate::EvidenceOutcome::Pass,
+                Some(false) => crate::candidate::EvidenceOutcome::Fail,
+                None => crate::candidate::EvidenceOutcome::Ambiguous,
+            };
+            let payload = crate::candidate::CandidateEvidencePayload::GitLanding(receipt);
+            let evidence_id = crate::candidate::evidence_id(&payload)?;
+            let evidence = op::Op::CandidateEvidence(op::CandidateEvidenceOp {
+                v: 1,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor: actor.clone(),
+                candidate_id: candidate_id.clone(),
+                candidate_oid: candidate.commit_oid.clone(),
+                evidence_id: evidence_id.clone(),
+                name: crate::candidate::GIT_LANDING_EVIDENCE.into(),
+                evidence_kind: "git".into(),
+                producer_tool: match &payload {
+                    crate::candidate::CandidateEvidencePayload::GitLanding(git) => {
+                        git.git_version.clone()
+                    }
+                    _ => unreachable!(),
+                },
+                outcome,
+                payload,
+                refs: Vec::new(),
+                idempotency_key: format!(
+                    "landing-evidence-{}",
+                    blake3::hash(idempotency_key.as_bytes()).to_hex()
+                ),
+            });
+            publish_candidate_op(&store, &evidence)?;
+            let landed = op::Op::CandidateLanded(op::CandidateLandedOp {
+                v: 1,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id: candidate_id.clone(),
+                evidence_id,
+                expect_phase,
+                expect_authorization,
+                target_ref: target,
+                idempotency_key,
+            });
+            publish_candidate_op(&store, &landed)?;
+            let state = reducer::replay_store(&store)?;
+            print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
+    }
+    Ok(0)
+}
+
+fn cmd_candidate_evidence(
+    actor_flag: Option<&str>,
+    store: &Store,
+    json_mode: bool,
+    cmd: CandidateEvidenceCmd,
+) -> MoteResult<i32> {
+    let actor = store.resolve_actor(actor_flag)?;
+    let state = reducer::replay_store(store)?;
+    let candidate_id = match &cmd {
+        CandidateEvidenceCmd::Refresh { candidate_id, .. }
+        | CandidateEvidenceCmd::Record { candidate_id, .. } => candidate_id.clone(),
+    };
+    let candidate = state
+        .candidates
+        .get(&candidate_id)
+        .ok_or_else(|| MoteError::Invalid(format!("candidate `{candidate_id}` does not exist")))?;
+
+    let mutation = match cmd {
+        CandidateEvidenceCmd::Refresh {
+            candidate_id,
+            idempotency_key,
+        } => {
+            let mut known = known_candidates(&state);
+            known.retain(|known| known.candidate_id != candidate.candidate_id);
+            let probe = crate::candidate::probe_ancestry(
+                &std::env::current_dir()?,
+                &candidate.commit_oid,
+                &candidate.base_oid,
+                &known,
+            );
+            let (receipt, outcome) = match probe {
+                Ok(receipt) => {
+                    let outcome = ancestry_outcome(&receipt);
+                    (receipt, outcome)
+                }
+                Err(error) => {
+                    let mut candidate_relations = Vec::new();
+                    let mut covered_candidates = Vec::new();
+                    for other in state.candidates.values().filter(|other| {
+                        other.candidate_id != candidate.candidate_id
+                            && other.repository_id == candidate.repository_id
+                    }) {
+                        candidate_relations.push(crate::candidate::GitCandidateRelation {
+                            candidate_id: other.candidate_id.clone(),
+                            proposal_op_id: other.proposal_op_id.clone(),
+                            commit_oid: other.commit_oid.clone(),
+                            relation: crate::candidate::GitRelationKind::Unavailable,
+                        });
+                        covered_candidates
+                            .push((other.candidate_id.clone(), other.proposal_op_id.clone()));
+                    }
+                    (
+                        crate::candidate::GitAncestryReceipt {
+                            repository_id: candidate.repository_id.clone(),
+                            object_format: candidate.object_format.clone(),
+                            common_dir_hash: String::new(),
+                            commit_oid: candidate.commit_oid.clone(),
+                            base_oid: candidate.base_oid.clone(),
+                            parent_oids: candidate.parent_oids.clone(),
+                            base_is_ancestor: None,
+                            candidate_relations,
+                            covered_candidates,
+                            git_version: "unavailable".into(),
+                            detail: Some(error),
+                        },
+                        crate::candidate::EvidenceOutcome::Unavailable,
+                    )
+                }
+            };
+            let payload = crate::candidate::CandidateEvidencePayload::GitAncestry(receipt);
+            op::Op::CandidateEvidence(op::CandidateEvidenceOp {
+                v: 1,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id,
+                candidate_oid: candidate.commit_oid.clone(),
+                evidence_id: crate::candidate::evidence_id(&payload)?,
+                name: crate::candidate::GIT_ANCESTRY_EVIDENCE.into(),
+                evidence_kind: "git".into(),
+                producer_tool: match &payload {
+                    crate::candidate::CandidateEvidencePayload::GitAncestry(git) => {
+                        git.git_version.clone()
+                    }
+                    _ => unreachable!(),
+                },
+                outcome,
+                payload,
+                refs: Vec::new(),
+                idempotency_key,
+            })
+        }
+        CandidateEvidenceCmd::Record {
+            candidate_id,
+            name,
+            outcome,
+            digest,
+            producer_tool,
+            detail,
+            refs,
+            idempotency_key,
+        } => {
+            if digest.trim().is_empty() {
+                return Err(MoteError::Invalid(
+                    "external evidence digest is required".into(),
+                ));
+            }
+            let payload = crate::candidate::CandidateEvidencePayload::External { digest, detail };
+            let evidence_kind = candidate
+                .evidence_requirements
+                .iter()
+                .find(|requirement| {
+                    requirement.name == name
+                        && requirement
+                            .producers
+                            .iter()
+                            .any(|producer| producer == &actor)
+                })
+                .map(|requirement| requirement.kind.clone())
+                .ok_or_else(|| {
+                    MoteError::Invalid(format!(
+                        "actor `{actor}` is not a producer for evidence `{name}`"
+                    ))
+                })?;
+            op::Op::CandidateEvidence(op::CandidateEvidenceOp {
+                v: 1,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id,
+                candidate_oid: candidate.commit_oid.clone(),
+                evidence_id: crate::candidate::evidence_id(&payload)?,
+                name,
+                evidence_kind,
+                producer_tool,
+                outcome: evidence_outcome(&outcome)?,
+                payload,
+                refs,
+                idempotency_key,
+            })
+        }
+    };
+    publish_candidate_op(store, &mutation)?;
+    let state = reducer::replay_store(store)?;
+    print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+    Ok(0)
 }
 
 fn cmd_init(quiet: bool) -> MoteResult<i32> {
@@ -948,25 +2162,81 @@ fn cmd_actor(
             }
             Ok(0)
         }
-        ActorCmd::List => {
+        ActorCmd::List {
+            presence,
+            active_within,
+        } => {
+            if presence.as_deref().is_some_and(|presence| {
+                !["live", "recent", "expired", "untracked"].contains(&presence)
+            }) {
+                return Err(MoteError::Invalid(
+                    "--presence must be live | recent | expired | untracked".into(),
+                ));
+            }
             let state = reducer::replay_store(&store)?;
             let current = store.resolve_actor(actor_flag).ok();
-            let actors = actor_summaries(&state, current.as_deref());
+            let mut actors = actor_summaries(
+                &state,
+                current.as_deref(),
+                Timestamp::now(),
+                active_within.unwrap_or(crate::actor_status::DEFAULT_RECENT_WINDOW_S),
+            );
+            actors.retain(|actor| {
+                presence
+                    .as_deref()
+                    .is_none_or(|wanted| actor.status.presence.state == wanted)
+                    && active_within.is_none_or(|_| actor.status.activity.recent)
+            });
             if json_mode {
                 println!("{}", serde_json::to_string(&actors)?);
             } else {
                 for actor in actors {
                     let marker = if actor.current { "*" } else { " " };
                     println!(
-                        "{marker} {}  last={}  claims={}  reservations={}  inbox={}  open-requests={}",
+                        "{marker} {}  presence={} source={} reason={} last={} claims={} reservations={} orphan-claims={} orphan-reservations={} inbox={} open-requests={}",
                         actor.actor,
+                        actor.status.presence.state,
+                        actor.status.presence.source,
+                        actor.status.presence.reason,
                         actor.last_activity_ts.as_deref().unwrap_or("-"),
                         actor.active_claims,
                         actor.active_reservations,
+                        actor.orphaned_claims,
+                        actor.orphaned_reservations,
                         actor.inbox_unacked,
                         actor.incoming_open_requests,
                     );
                 }
+            }
+            Ok(0)
+        }
+        ActorCmd::Status {
+            name,
+            recent_window,
+        } => {
+            let current_resolution = resolve_actor_with_source(&store, actor_flag).ok();
+            let current = current_resolution
+                .as_ref()
+                .map(|resolution| resolution.actor.clone());
+            let actor = match name {
+                Some(actor) => normalize_actor(&actor)?,
+                None => current.clone().ok_or(MoteError::ActorUnresolved)?,
+            };
+            let state = reducer::replay_store(&store)?;
+            let status = crate::actor_status::actor_status(
+                &state,
+                &actor,
+                current.as_deref(),
+                Timestamp::now(),
+                recent_window,
+            );
+            if json_mode {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                let identity_source = current_resolution.as_ref().and_then(|resolution| {
+                    (resolution.actor == actor).then_some(resolution.source)
+                });
+                print_actor_status(&status, identity_source);
             }
             Ok(0)
         }
@@ -1022,14 +2292,25 @@ struct ActorSummary {
     last_activity_op_id: Option<String>,
     active_claims: usize,
     active_reservations: usize,
+    orphaned_claims: usize,
+    orphaned_reservations: usize,
     inbox_unacked: usize,
     incoming_open_requests: usize,
+    status: crate::actor_status::ActorStatus,
 }
 
-fn actor_summaries(state: &crate::state::State, current: Option<&str>) -> Vec<ActorSummary> {
+fn actor_summaries(
+    state: &crate::state::State,
+    current: Option<&str>,
+    as_of: Timestamp,
+    recent_window_s: u32,
+) -> Vec<ActorSummary> {
     let mut activity: BTreeMap<String, ActorActivity> = BTreeMap::new();
     if let Some(actor) = current {
         activity.entry(actor.to_string()).or_default();
+    }
+    for actor in crate::actor_status::known_actor_names(state) {
+        activity.entry(actor).or_default();
     }
 
     for entry in state
@@ -1063,7 +2344,7 @@ fn actor_summaries(state: &crate::state::State, current: Option<&str>) -> Vec<Ac
         activity.entry(reservation.actor.clone()).or_default();
     }
 
-    let now = ids::format_rfc3339(Timestamp::now());
+    let now = ids::format_rfc3339(as_of);
     activity
         .into_iter()
         .map(|(name, activity)| ActorSummary {
@@ -1072,15 +2353,41 @@ fn actor_summaries(state: &crate::state::State, current: Option<&str>) -> Vec<Ac
                 .beads
                 .values()
                 .filter(|bead| {
-                    bead.claim
-                        .as_ref()
-                        .is_some_and(|claim| claim.claimed_by == name && claim.is_live(&now))
+                    bead.claim.as_ref().is_some_and(|claim| {
+                        claim.claimed_by == name
+                            && state.claim_disposition(bead, &now)
+                                == crate::state::LeaseDisposition::Active
+                    })
                 })
                 .count(),
             active_reservations: state
                 .reservations
                 .values()
-                .filter(|reservation| reservation.actor == name && reservation.is_active(&now))
+                .filter(|reservation| {
+                    reservation.actor == name
+                        && state.reservation_disposition(reservation, &now)
+                            == crate::state::LeaseDisposition::Active
+                })
+                .count(),
+            orphaned_claims: state
+                .beads
+                .values()
+                .filter(|bead| {
+                    bead.claim.as_ref().is_some_and(|claim| {
+                        claim.claimed_by == name
+                            && state.claim_disposition(bead, &now)
+                                == crate::state::LeaseDisposition::Orphaned
+                    })
+                })
+                .count(),
+            orphaned_reservations: state
+                .reservations
+                .values()
+                .filter(|reservation| {
+                    reservation.actor == name
+                        && state.reservation_disposition(reservation, &now)
+                            == crate::state::LeaseDisposition::Orphaned
+                })
                 .count(),
             inbox_unacked: state.inbox_for(&name).len(),
             incoming_open_requests: state
@@ -1090,11 +2397,66 @@ fn actor_summaries(state: &crate::state::State, current: Option<&str>) -> Vec<Ac
                     message.to == name && message.request_state == Some(RequestState::Open)
                 })
                 .count(),
+            status: crate::actor_status::actor_status(
+                state,
+                &name,
+                current,
+                as_of,
+                recent_window_s,
+            ),
             actor: name,
             last_activity_ts: activity.last_activity_ts,
             last_activity_op_id: activity.last_activity_op_id,
         })
         .collect()
+}
+
+fn print_actor_status(status: &crate::actor_status::ActorStatus, identity_source: Option<&str>) {
+    if !status.known {
+        println!("actor:       {} (unknown)", status.actor);
+    } else {
+        println!("actor:       {}", status.actor);
+    }
+    if let Some(source) = identity_source {
+        println!("identity:    source={source}");
+    }
+    println!(
+        "presence:    {} source={} reason={} as-of={}",
+        status.presence.state, status.presence.source, status.presence.reason, status.as_of_ts,
+    );
+    println!(
+        "sessions:    {} live / {} known",
+        status.presence.live_session_count,
+        status.sessions.len()
+    );
+    let observed = status
+        .activity
+        .last_observed
+        .as_ref()
+        .map(|evidence| format!("{} at {}", evidence.event_type, evidence.ts))
+        .unwrap_or_else(|| "none".into());
+    println!("activity:    {observed}");
+    let intent = if status.intent.states.is_empty() {
+        "none".into()
+    } else if status.intent.mixed {
+        format!("mixed ({})", status.intent.states.join(", "))
+    } else {
+        status.intent.states.join(", ")
+    };
+    println!("intent:      {intent}");
+    println!(
+        "work:        {} claims, {} reservations, {} doing, {} candidates",
+        status.work.active_claims.len(),
+        status.work.active_reservations.len(),
+        status.work.doing_beads.len(),
+        status.work.candidates.len()
+    );
+    println!(
+        "attention:   {} inbox, {} open requests, {} discussion unread",
+        status.attention.inbox_unacked,
+        status.attention.incoming_open_requests,
+        status.attention.discussion_unread
+    );
 }
 
 fn resolve_actor_with_source(
@@ -1720,6 +3082,7 @@ fn cmd_new(
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
+    let body = resolve_optional_text(body)?;
 
     if title.trim().is_empty() {
         return Err(MoteError::Invalid("title must be non-empty".into()));
@@ -2295,7 +3658,8 @@ fn cmd_note(
     store_flag: Option<&Path>,
     id: String,
     note_kind: String,
-    text: String,
+    text: Option<String>,
+    stdin: bool,
 ) -> MoteResult<i32> {
     if !validate_note_kind(&note_kind) {
         return Err(MoteError::Invalid(format!(
@@ -2303,6 +3667,7 @@ fn cmd_note(
             op::VALID_NOTE_KINDS.join(" | ")
         )));
     }
+    let text = resolve_positional_text(text, stdin, "note text")?;
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let op = make_note(actor, id, note_kind, text, Timestamp::now());
@@ -2473,6 +3838,8 @@ struct MessageDraft {
     reply_to: Option<String>,
     correlation_id: Option<String>,
     idempotency_key: Option<String>,
+    answers: Vec<String>,
+    require_live: bool,
 }
 
 fn message_matches_draft(message: &MsgRecord, draft: &MessageDraft) -> bool {
@@ -2487,6 +3854,8 @@ fn message_matches_draft(message: &MsgRecord, draft: &MessageDraft) -> bool {
         && message.msg_kind == draft.msg_kind
         && message.body == draft.body
         && message.reply_to == draft.reply_to
+        && message.answers == draft.answers
+        && message.require_live == draft.require_live
         && correlation_matches
 }
 
@@ -2516,10 +3885,19 @@ fn existing_idempotent_message(
     }
 }
 
-fn publish_message(store: &Store, actor: String, draft: MessageDraft) -> MoteResult<i32> {
+fn publish_message(
+    store: &Store,
+    actor: String,
+    draft: MessageDraft,
+    json_mode: bool,
+) -> MoteResult<i32> {
     let state = reducer::replay_store(store)?;
     if let Some(existing) = existing_idempotent_message(&state, &actor, &draft)? {
-        println!("{existing}");
+        let message = state
+            .messages
+            .get(&existing)
+            .expect("idempotency index referenced a missing message");
+        print_message_send_result(message, json_mode, true)?;
         return Ok(0);
     }
 
@@ -2529,7 +3907,8 @@ fn publish_message(store: &Store, actor: String, draft: MessageDraft) -> MoteRes
     } else {
         draft.correlation_id.clone()
     };
-    let op = make_msg_send_with_metadata(
+    let send_ts = Timestamp::now();
+    let op = op::make_msg_send_with_options(
         actor.clone(),
         msg_id.clone(),
         draft.to.clone(),
@@ -2540,26 +3919,106 @@ fn publish_message(store: &Store, actor: String, draft: MessageDraft) -> MoteRes
         draft.reply_to.clone(),
         correlation_id,
         draft.idempotency_key.clone(),
-        Timestamp::now(),
+        draft.answers.clone(),
+        draft.require_live,
+        send_ts,
     );
     let name = publish::publish_op(store, &op)?;
     let state = reducer::replay_store(store)?;
     if state.was_accepted(name.as_str()) {
-        println!("{msg_id}");
+        let message = state
+            .messages
+            .get(&msg_id)
+            .expect("accepted send did not produce a message record");
+        print_message_send_result(message, json_mode, false)?;
         return Ok(0);
     }
 
     // Two publishers can race after both pass the preflight read. Treat the
     // losing duplicate as the same successful send when its content matches.
     if let Some(existing) = existing_idempotent_message(&state, &actor, &draft)? {
-        println!("{existing}");
+        let message = state
+            .messages
+            .get(&existing)
+            .expect("idempotency index referenced a missing message");
+        print_message_send_result(message, json_mode, true)?;
         return Ok(0);
     }
     let reason = state
         .rejection_reason(name.as_str())
         .unwrap_or_else(|| "unknown".into());
-    eprintln!("rejected: {reason}");
+    if json_mode {
+        let recipient = crate::actor_status::actor_status(
+            &state,
+            &draft.to,
+            None,
+            send_ts,
+            crate::actor_status::DEFAULT_RECENT_WINDOW_S,
+        );
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "accepted": false,
+                "msg_id": msg_id,
+                "delivery": "rejected",
+                "addressed": true,
+                "private": false,
+                "require_live": draft.require_live,
+                "recipient": draft.to,
+                "recipient_presence": {
+                    "state": recipient.presence.state,
+                    "source": recipient.presence.source,
+                    "reason": recipient.presence.reason,
+                    "as_of_ts": recipient.as_of_ts,
+                },
+                "reason": reason,
+            }))?
+        );
+    } else {
+        eprintln!("rejected: {reason}");
+    }
     Ok(2)
+}
+
+fn print_message_send_result(
+    message: &MsgRecord,
+    json_mode: bool,
+    idempotent_retry: bool,
+) -> MoteResult<()> {
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "accepted": true,
+                "msg_id": message.msg_id,
+                "delivery": "queued",
+                "addressed": true,
+                "private": false,
+                "require_live": message.require_live,
+                "idempotent_retry": idempotent_retry,
+                "recipient": message.to,
+                "recipient_presence": message.recipient_presence,
+            }))?
+        );
+    } else {
+        // Keep stdout as the bare id for existing shell integrations. The
+        // evidence line is diagnostic output for an interactive sender.
+        println!("{}", message.msg_id);
+        eprintln!(
+            "recipient {}: {} source={} reason={} as-of={}; delivery=queued{}",
+            message.to,
+            message.recipient_presence.state,
+            message.recipient_presence.source,
+            message.recipient_presence.reason,
+            message.recipient_presence.as_of_ts,
+            if idempotent_retry {
+                "; idempotent-retry=true"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
 }
 
 fn cmd_msg(
@@ -2577,7 +4036,10 @@ fn cmd_msg(
             reservation,
             msg_kind,
             idempotency_key,
+            require_live,
+            answers,
             text,
+            stdin,
         } => {
             if !validate_msg_kind(&msg_kind) {
                 return Err(MoteError::Invalid(format!(
@@ -2590,6 +4052,7 @@ fn cmd_msg(
                     "message kind `{msg_kind}` requires `mote msg reply <request-id>`"
                 )));
             }
+            let text = resolve_positional_text(text, stdin, "message body")?;
             publish_message(
                 &store,
                 actor,
@@ -2602,7 +4065,10 @@ fn cmd_msg(
                     reply_to: None,
                     correlation_id: None,
                     idempotency_key,
+                    answers,
+                    require_live,
                 },
+                json_mode,
             )
         }
         MsgCmd::Ack { msg_id } => {
@@ -2615,6 +4081,7 @@ fn cmd_msg(
             msg_kind,
             idempotency_key,
             text,
+            stdin,
         } => {
             if !op::VALID_REPLY_KINDS.contains(&msg_kind.as_str()) {
                 return Err(MoteError::Invalid(format!(
@@ -2622,6 +4089,7 @@ fn cmd_msg(
                     op::VALID_REPLY_KINDS.join(" | ")
                 )));
             }
+            let text = resolve_positional_text(text, stdin, "reply body")?;
             let state = reducer::replay_store(&store)?;
             let request = state
                 .messages
@@ -2652,17 +4120,23 @@ fn cmd_msg(
                         .unwrap_or_else(|| msg_id.clone()),
                 ),
                 idempotency_key,
+                answers: Vec::new(),
+                require_live: false,
             };
             if request.request_state != Some(RequestState::Open) {
                 if let Some(existing) = existing_idempotent_message(&state, &actor, &draft)? {
-                    println!("{existing}");
+                    let message = state
+                        .messages
+                        .get(&existing)
+                        .expect("idempotency index referenced a missing message");
+                    print_message_send_result(message, json_mode, true)?;
                     return Ok(0);
                 }
                 return Err(MoteError::Invalid(format!(
                     "request `{msg_id}` is not open"
                 )));
             }
-            publish_message(&store, actor, draft)
+            publish_message(&store, actor, draft, json_mode)
         }
         MsgCmd::Requests { request_state } => {
             let requested = match request_state.as_deref() {
@@ -2682,13 +4156,13 @@ fn cmd_msg(
             if json_mode {
                 let rows: Vec<_> = requests
                     .iter()
-                    .map(|request| request_json(request))
+                    .map(|request| message_json(request))
                     .collect();
                 println!("{}", serde_json::to_string(&rows)?);
             } else {
                 for request in requests {
                     println!(
-                        "{}  {}  from={}  to={}  state={}  {}",
+                        "{}  {}  from={}  to={}  state={}{}{}  {}",
                         request.msg_id,
                         request.sent_ts,
                         request.from,
@@ -2697,7 +4171,49 @@ fn cmd_msg(
                             .request_state
                             .expect("requests_for returned a non-request")
                             .as_str(),
+                        request_answer_marker(request),
+                        recipient_presence_marker(request),
                         request.body
+                    );
+                }
+            }
+            Ok(0)
+        }
+        MsgCmd::Thread {
+            peer,
+            issue,
+            msg_kind,
+        } => {
+            let state = reducer::replay_store(&store)?;
+            let thread: Vec<&MsgRecord> = state
+                .conversation_between(&actor, &peer)
+                .into_iter()
+                .filter(|m| {
+                    issue
+                        .as_deref()
+                        .is_none_or(|i| m.entity.as_deref() == Some(i))
+                        && msg_kind.as_deref().is_none_or(|k| m.msg_kind == k)
+                })
+                .collect();
+            if json_mode {
+                let rows: Vec<_> = thread
+                    .iter()
+                    .map(|m| thread_message_json(m, &actor))
+                    .collect();
+                println!("{}", serde_json::to_string(&rows)?);
+            } else {
+                for m in thread {
+                    println!(
+                        "{}  {}  {}{}  kind={}  issue={}{}{}  {}",
+                        m.msg_id,
+                        m.sent_ts,
+                        if m.from == actor { "->" } else { "<-" },
+                        peer,
+                        m.msg_kind,
+                        m.entity.as_deref().unwrap_or("-"),
+                        thread_state_marker(m),
+                        recipient_presence_marker(m),
+                        m.body
                     );
                 }
             }
@@ -2711,7 +4227,9 @@ fn cmd_msg(
     }
 }
 
-fn request_json(request: &MsgRecord) -> serde_json::Value {
+/// Full JSON projection of a message record, shared by `msg requests`
+/// and `msg thread`.
+fn message_json(request: &MsgRecord) -> serde_json::Value {
     serde_json::json!({
         "msg_id": request.msg_id,
         "from": request.from,
@@ -2723,13 +4241,67 @@ fn request_json(request: &MsgRecord) -> serde_json::Value {
         "reply_to": request.reply_to,
         "correlation_id": request.correlation_id,
         "idempotency_key": request.idempotency_key,
+        "answers": request.answers,
+        "require_live": request.require_live,
+        "recipient_presence": request.recipient_presence,
         "request_state": request.request_state.map(RequestState::as_str),
         "response_msg_id": request.response_msg_id,
+        "response_post_id": request.response_post_id,
         "resolved_op_id": request.resolved_op_id,
         "resolved_ts": request.resolved_ts,
         "sent_ts": request.sent_ts,
         "ack_ts": request.ack_ts,
     })
+}
+
+/// `message_json` plus the direction the viewing actor saw it from.
+fn thread_message_json(m: &MsgRecord, viewer: &str) -> serde_json::Value {
+    let mut value = message_json(m);
+    let direction = if m.from == viewer { "out" } else { "in" };
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("direction".to_string(), serde_json::json!(direction));
+    }
+    value
+}
+
+/// Trailing `state=` / `acked` markers for a human-readable thread line.
+fn thread_state_marker(m: &MsgRecord) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(state) = m.request_state {
+        parts.push(format!("state={}", state.as_str()));
+    }
+    if m.ack_ts.is_some() {
+        parts.push("acked".to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", parts.join("  "))
+    }
+}
+
+fn recipient_presence_marker(message: &MsgRecord) -> String {
+    format!(
+        "  recipient-at-send={} source={} reason={} as-of={}",
+        message.recipient_presence.state,
+        message.recipient_presence.source,
+        message.recipient_presence.reason,
+        message.recipient_presence.as_of_ts,
+    )
+}
+
+fn request_answer_marker(request: &MsgRecord) -> String {
+    request
+        .response_msg_id
+        .as_deref()
+        .map(|id| format!("  answer=msg:{id}"))
+        .or_else(|| {
+            request
+                .response_post_id
+                .as_deref()
+                .map(|id| format!("  answer=post:{id}"))
+        })
+        .unwrap_or_default()
 }
 
 fn cmd_discuss(
@@ -2744,32 +4316,27 @@ fn cmd_discuss(
         DiscussCmd::Post {
             topic,
             reply_to,
+            answers,
+            notify,
+            idempotency_key,
             body,
             text,
         } => {
             let actor = store.resolve_actor(actor_flag)?;
             let topic = normalize_discussion_topic(&topic)?;
-            let text = match (text, body) {
-                (Some(_), Some(_)) => {
-                    return Err(MoteError::Invalid(
-                        "provide discussion post text either as positional text or --body, not both"
-                            .into(),
-                    ));
-                }
-                (Some(text), None) | (None, Some(text)) => text,
-                (None, None) => {
-                    return Err(MoteError::Invalid(
-                        "discussion post text is required (positional text or --body)".into(),
-                    ));
-                }
-            };
-            if text.trim().is_empty() {
-                return Err(MoteError::Invalid(
-                    "discussion post text must be non-empty".into(),
-                ));
-            }
+            let text = require_post_text(text, body, "discussion post")?;
             publish_discussion_post(
-                &store, actor, &topic, text, reply_to, None, json_mode, "posted",
+                &store,
+                actor,
+                &topic,
+                text,
+                reply_to,
+                None,
+                answers,
+                notify,
+                idempotency_key,
+                json_mode,
+                "posted",
             )
         }
         DiscussCmd::List { topic, limit } => {
@@ -2784,32 +4351,70 @@ fn cmd_discuss(
             }
             print_board_posts(posts, json_mode)
         }
-        DiscussCmd::Unread { topic, limit } => {
+        DiscussCmd::Unread {
+            topic,
+            limit,
+            before,
+            page,
+        } => print_discussion_attention_page(
+            &store, actor_flag, topic, limit, before, false, page, json_mode,
+        ),
+        DiscussCmd::Notifications {
+            topic,
+            limit,
+            before,
+        } => print_discussion_attention_page(
+            &store, actor_flag, topic, limit, before, true, true, json_mode,
+        ),
+        DiscussCmd::Watch { topic } => {
+            set_discussion_watch(&store, actor_flag, topic, true, json_mode)
+        }
+        DiscussCmd::Unwatch { topic } => {
+            set_discussion_watch(&store, actor_flag, topic, false, json_mode)
+        }
+        DiscussCmd::Watches => {
             let actor = store.resolve_actor(actor_flag)?;
             let state = reducer::replay_store(&store)?;
-            let normalized_topic = topic
-                .as_deref()
-                .map(normalize_discussion_topic)
-                .transpose()?;
-            let mut posts = state.unread_board_posts_for(&actor, normalized_topic.as_deref());
-            if let Some(limit) = limit {
-                if posts.len() > limit {
-                    posts = posts.split_off(posts.len() - limit);
+            let topics = state.watched_topics_for(&actor);
+            if json_mode {
+                println!("{}", serde_json::to_string(&topics)?);
+            } else if topics.is_empty() {
+                println!("no watched topics for {actor}");
+            } else {
+                for topic in topics {
+                    println!("{topic}");
                 }
             }
-            print_board_posts(posts, json_mode)
+            Ok(0)
         }
-        DiscussCmd::MarkRead { topic } => {
+        DiscussCmd::MarkRead { topic, through } => {
             let actor = store.resolve_actor(actor_flag)?;
             let state = reducer::replay_store(&store)?;
             let normalized_topic = topic
                 .as_deref()
                 .map(normalize_discussion_topic)
                 .transpose()?;
-            let latest = state
-                .board_posts_for(normalized_topic.as_deref())
-                .into_iter()
-                .max_by(|a, b| a.sent_op_id.cmp(&b.sent_op_id));
+            let latest = if let Some(post_id) = through.as_deref() {
+                let post = state.board_posts.get(post_id).ok_or_else(|| {
+                    MoteError::Invalid(format!("no such discussion post {post_id}"))
+                })?;
+                if normalized_topic
+                    .as_deref()
+                    .is_some_and(|topic| topic != post.topic)
+                {
+                    return Err(MoteError::Invalid(format!(
+                        "post {post_id} belongs to topic {}, not {}",
+                        post.topic,
+                        normalized_topic.as_deref().unwrap_or_default()
+                    )));
+                }
+                Some(post)
+            } else {
+                state
+                    .board_posts_for(normalized_topic.as_deref())
+                    .into_iter()
+                    .max_by(|a, b| a.sent_op_id.cmp(&b.sent_op_id))
+            };
             let Some(latest) = latest else {
                 if let Some(topic) = normalized_topic.as_deref() {
                     eprintln!("no posts in topic {topic}");
@@ -2818,12 +4423,21 @@ fn cmd_discuss(
                 }
                 return Ok(0);
             };
-            let op = make_board_read(
-                actor,
-                latest.sent_op_id.clone(),
-                normalized_topic,
-                Timestamp::now(),
-            );
+            let op = if through.is_some() {
+                make_board_read_through(
+                    actor,
+                    latest.sent_op_id.clone(),
+                    normalized_topic,
+                    Timestamp::now(),
+                )
+            } else {
+                make_board_read(
+                    actor,
+                    latest.sent_op_id.clone(),
+                    normalized_topic,
+                    Timestamp::now(),
+                )
+            };
             let name = publish::publish_op(&store, &op)?;
             println!("{}", latest.post_id);
             verify_accept(&store, &name)
@@ -2848,9 +4462,12 @@ fn cmd_discuss(
                 title,
                 description,
                 body,
+                notify,
+                idempotency_key,
             } => {
                 let actor = store.resolve_actor(actor_flag)?;
                 let topic = normalize_discussion_topic(&topic)?;
+                let body = resolve_optional_text(body)?;
                 if body.as_deref().is_some_and(|text| text.trim().is_empty()) {
                     return Err(MoteError::Invalid(
                         "initial post body must be non-empty".into(),
@@ -2877,12 +4494,16 @@ fn cmd_discuss(
                 let mut initial_post_id = None;
                 if let Some(body) = body {
                     let post_id = ids::new_post_id();
-                    let post_op = make_board_post(
+                    let post_op = op::make_board_post_with_options(
                         actor,
                         post_id.clone(),
                         topic.clone(),
                         body,
                         None,
+                        None,
+                        Vec::new(),
+                        notify,
+                        idempotency_key,
                         Timestamp::now(),
                     );
                     let post_name = publish::publish_op(&store, &post_op)?;
@@ -2959,11 +4580,41 @@ fn cmd_discuss(
             let name = publish::publish_op(&store, &op)?;
             verify_accept(&store, &name)
         }
+        DiscussCmd::Supersede {
+            old_post_id,
+            new_post_id,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let op = make_board_supersede(actor, old_post_id, new_post_id, Timestamp::now());
+            let name = publish::publish_op(&store, &op)?;
+            verify_accept(&store, &name)
+        }
+        DiscussCmd::Retract { post_id, reason } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            if reason.trim().is_empty()
+                || reason
+                    .chars()
+                    .any(|character| matches!(character, '\0' | '\n' | '\r'))
+            {
+                return Err(MoteError::Invalid(
+                    "discussion retraction reason must be non-empty and single-line".into(),
+                ));
+            }
+            let op = make_board_retract(actor, post_id, reason, Timestamp::now());
+            let name = publish::publish_op(&store, &op)?;
+            verify_accept(&store, &name)
+        }
         DiscussCmd::Topics => {
             let state = reducer::replay_store(&store)?;
             print_discussion_topics(state.board_topics_by_activity(), json_mode)
         }
-        DiscussCmd::Decision { topic, body, text } => {
+        DiscussCmd::Decision {
+            topic,
+            body,
+            text,
+            notify,
+            idempotency_key,
+        } => {
             let actor = store.resolve_actor(actor_flag)?;
             let topic = normalize_discussion_topic(&topic)?;
             let text = require_post_text(text, body, "decision")?;
@@ -2974,6 +4625,9 @@ fn cmd_discuss(
                 text,
                 None,
                 Some("decision".to_string()),
+                Vec::new(),
+                notify,
+                idempotency_key,
                 json_mode,
                 "recorded decision",
             )?;
@@ -2985,9 +4639,20 @@ fn cmd_discuss(
             }
             Ok(code)
         }
-        DiscussCmd::Summary { topic, body, text } => {
+        DiscussCmd::Summary {
+            topic,
+            body,
+            text,
+            notify,
+            idempotency_key,
+        } => {
             let topic = normalize_discussion_topic(&topic)?;
             if text.is_none() && body.is_none() {
+                if !notify.is_empty() || idempotency_key.is_some() {
+                    return Err(MoteError::Invalid(
+                        "--notify and --idempotency-key require summary text".into(),
+                    ));
+                }
                 // No text: read the pinned summary rather than write one.
                 let state = reducer::replay_store(&store)?;
                 return print_topic_summary(&state, &topic, json_mode);
@@ -3001,6 +4666,9 @@ fn cmd_discuss(
                 text,
                 None,
                 Some("summary".to_string()),
+                Vec::new(),
+                notify,
+                idempotency_key,
                 json_mode,
                 "set summary",
             )?;
@@ -3019,6 +4687,7 @@ fn cmd_discuss(
         } => {
             let actor = store.resolve_actor(actor_flag)?;
             let (post_id, topic) = route_target(post_id, topic)?;
+            let note = resolve_optional_text(note)?;
             let op = make_board_route(
                 actor.clone(),
                 post_id.clone(),
@@ -3151,6 +4820,115 @@ fn cmd_discuss(
     }
 }
 
+fn set_discussion_watch(
+    store: &Store,
+    actor_flag: Option<&str>,
+    topic: String,
+    watching: bool,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    let actor = store.resolve_actor(actor_flag)?;
+    let topic = normalize_discussion_topic(&topic)?;
+    let op = op::make_board_watch(actor, topic.clone(), watching, Timestamp::now());
+    let name = publish::publish_op(store, &op)?;
+    let state = reducer::replay_store(store)?;
+    if !state.was_accepted(name.as_str()) {
+        let reason = state
+            .rejection_reason(name.as_str())
+            .unwrap_or_else(|| "unknown".into());
+        eprintln!("rejected: {reason}");
+        return Ok(2);
+    }
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "topic": topic,
+                "watching": watching,
+                "op_id": name.as_str(),
+            }))?
+        );
+    } else {
+        println!("{topic}  watching={watching}");
+    }
+    Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_discussion_attention_page(
+    store: &Store,
+    actor_flag: Option<&str>,
+    topic: Option<String>,
+    limit: Option<usize>,
+    before: Option<String>,
+    notifications_only: bool,
+    page_metadata: bool,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    let actor = store.resolve_actor(actor_flag)?;
+    let state = reducer::replay_store(store)?;
+    let normalized_topic = topic
+        .as_deref()
+        .map(normalize_discussion_topic)
+        .transpose()?;
+    let all_posts = if notifications_only {
+        state.unread_board_notifications_for(&actor, normalized_topic.as_deref())
+    } else {
+        state.unread_board_posts_for(&actor, normalized_topic.as_deref())
+    };
+    let before_op_id = before
+        .as_deref()
+        .map(|post_id| {
+            let post = state
+                .board_posts
+                .get(post_id)
+                .ok_or_else(|| MoteError::Invalid(format!("no such discussion post {post_id}")))?;
+            if normalized_topic
+                .as_deref()
+                .is_some_and(|topic| topic != post.topic)
+            {
+                return Err(MoteError::Invalid(format!(
+                    "post {post_id} belongs to topic {}, not {}",
+                    post.topic,
+                    normalized_topic.as_deref().unwrap_or_default()
+                )));
+            }
+            Ok(post.sent_op_id.clone())
+        })
+        .transpose()?;
+    let mut posts: Vec<_> = all_posts
+        .iter()
+        .copied()
+        .filter(|post| {
+            before_op_id
+                .as_deref()
+                .is_none_or(|boundary| post.sent_op_id.as_str() < boundary)
+        })
+        .collect();
+    let eligible_count = posts.len();
+    if let Some(limit) = limit {
+        if posts.len() > limit {
+            posts = posts.split_off(posts.len() - limit);
+        }
+    }
+    print_unread_board_posts(
+        posts,
+        &all_posts,
+        UnreadPageMeta {
+            topic: normalized_topic.as_deref(),
+            before: before.as_deref(),
+            before_op_id: before_op_id.as_deref(),
+            limit,
+            eligible_count,
+            effective_cursor_op_id: state
+                .discussion_cursor_for(&actor, normalized_topic.as_deref())
+                .map(String::as_str),
+        },
+        page_metadata,
+        json_mode,
+    )
+}
+
 /// Shared post publisher: mints the id, publishes, and reports the topic's
 /// resulting post count so callers can confirm the text is actually visible.
 /// Returns the minted post id alongside the exit code; callers that need to
@@ -3164,48 +4942,84 @@ fn publish_discussion_post_id(
     text: String,
     reply_to: Option<String>,
     post_kind: Option<String>,
+    answers: Vec<String>,
+    notify: Vec<String>,
+    idempotency_key: Option<String>,
     json_mode: bool,
     verb: &str,
 ) -> MoteResult<(i32, String)> {
+    let expected_notify = normalize_notification_recipients(&actor, &notify)?;
+    if let Some(key) = idempotency_key.as_deref() {
+        if !op::validate_idempotency_key(key) {
+            return Err(MoteError::Invalid(
+                "--idempotency-key must be 1..=128 trimmed printable characters".into(),
+            ));
+        }
+        let state = reducer::replay_store(store)?;
+        if let Some(existing) = state.board_post_by_idempotency(&actor, key) {
+            if discussion_post_matches(
+                existing,
+                topic,
+                &text,
+                reply_to.as_deref(),
+                post_kind.as_deref(),
+                &answers,
+                &expected_notify,
+            ) {
+                print_discussion_publish_result(&state, &existing.post_id, json_mode, verb, true)?;
+                return Ok((0, existing.post_id.clone()));
+            }
+            return Err(MoteError::Invalid(format!(
+                "idempotency key `{key}` is already used by {} with different post content or routing",
+                existing.post_id
+            )));
+        }
+    }
     let post_id = ids::new_post_id();
-    let op = op::make_board_post_of_kind(
-        actor,
+    let op = op::make_board_post_with_options(
+        actor.clone(),
         post_id.clone(),
         topic.to_string(),
-        text,
+        text.clone(),
         reply_to.clone(),
         post_kind.clone(),
+        answers.clone(),
+        notify,
+        idempotency_key.clone(),
         Timestamp::now(),
     );
     let name = publish::publish_op(store, &op)?;
     let state = reducer::replay_store(store)?;
     if !state.was_accepted(name.as_str()) {
+        if let Some(key) = idempotency_key.as_deref() {
+            if let Some(existing) = state.board_post_by_idempotency(&actor, key) {
+                if discussion_post_matches(
+                    existing,
+                    topic,
+                    &text,
+                    reply_to.as_deref(),
+                    post_kind.as_deref(),
+                    &answers,
+                    &expected_notify,
+                ) {
+                    print_discussion_publish_result(
+                        &state,
+                        &existing.post_id,
+                        json_mode,
+                        verb,
+                        true,
+                    )?;
+                    return Ok((0, existing.post_id.clone()));
+                }
+            }
+        }
         let reason = state
             .rejection_reason(name.as_str())
             .unwrap_or_else(|| "unknown".into());
         eprintln!("rejected: {reason}");
         return Ok((2, post_id));
     }
-    let posts = state
-        .board_topics
-        .get(topic)
-        .map(|t| t.post_count)
-        .unwrap_or(0);
-
-    if json_mode {
-        let v = serde_json::json!({
-            "post_id": post_id,
-            "topic": topic,
-            "reply_to": reply_to,
-            "post_kind": post_kind.as_deref().unwrap_or("post"),
-            "posts": posts,
-            "visible_in_list": state.board_posts.contains_key(&post_id),
-        });
-        println!("{}", serde_json::to_string(&v)?);
-    } else {
-        println!("{post_id}");
-        eprintln!("{verb} {post_id} in topic {topic} (posts={posts})");
-    }
+    print_discussion_publish_result(&state, &post_id, json_mode, verb, false)?;
     Ok((0, post_id))
 }
 
@@ -3217,29 +5031,133 @@ fn publish_discussion_post(
     text: String,
     reply_to: Option<String>,
     post_kind: Option<String>,
+    answers: Vec<String>,
+    notify: Vec<String>,
+    idempotency_key: Option<String>,
     json_mode: bool,
     verb: &str,
 ) -> MoteResult<i32> {
     let (code, _) = publish_discussion_post_id(
-        store, actor, topic, text, reply_to, post_kind, json_mode, verb,
+        store,
+        actor,
+        topic,
+        text,
+        reply_to,
+        post_kind,
+        answers,
+        notify,
+        idempotency_key,
+        json_mode,
+        verb,
     )?;
     Ok(code)
 }
 
+fn normalize_notification_recipients(
+    actor: &str,
+    recipients: &[String],
+) -> MoteResult<Vec<String>> {
+    let mut normalized = BTreeSet::new();
+    for recipient in recipients {
+        let recipient = normalize_actor(recipient)?;
+        if recipient != actor {
+            normalized.insert(recipient);
+        }
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn discussion_post_matches(
+    post: &crate::state::BoardPostRecord,
+    topic: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    post_kind: Option<&str>,
+    answers: &[String],
+    explicit_notify: &[String],
+) -> bool {
+    let expected_answers: BTreeSet<&str> = answers.iter().map(String::as_str).collect();
+    post.topic == topic
+        && post.body == text
+        && post.reply_to.as_deref() == reply_to
+        && post.post_kind == post_kind.unwrap_or("post")
+        && post
+            .answers
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            == expected_answers
+        && post.explicit_notify == explicit_notify
+}
+
+fn print_discussion_publish_result(
+    state: &crate::state::State,
+    post_id: &str,
+    json_mode: bool,
+    verb: &str,
+    idempotent_retry: bool,
+) -> MoteResult<()> {
+    let post = state
+        .board_posts
+        .get(post_id)
+        .expect("accepted discussion post is absent from state");
+    let posts = state
+        .board_topics
+        .get(&post.topic)
+        .map(|topic| topic.post_count)
+        .unwrap_or(0);
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "post_id": post.post_id,
+                "topic": post.topic,
+                "reply_to": post.reply_to,
+                "post_kind": post.post_kind,
+                "answers": post.answers,
+                "explicit_notify": post.explicit_notify,
+                "notification_recipients": post.notification_recipients,
+                "idempotency_key": post.idempotency_key,
+                "idempotent_retry": idempotent_retry,
+                "public": true,
+                "posts": posts,
+                "visible_in_list": true,
+            }))?
+        );
+    } else {
+        println!("{}", post.post_id);
+        eprintln!(
+            "{verb} {} in topic {} (posts={posts}) notifications={}{}",
+            post.post_id,
+            post.topic,
+            post.notification_recipients.len(),
+            if idempotent_retry {
+                " idempotent-retry=true"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
 fn require_post_text(text: Option<String>, body: Option<String>, what: &str) -> MoteResult<String> {
-    let text = match (text, body) {
+    let input = match (text, body) {
         (Some(_), Some(_)) => {
             return Err(MoteError::Invalid(format!(
                 "provide {what} text either as positional text or --body, not both"
             )));
         }
-        (Some(text), None) | (None, Some(text)) => text,
+        (Some(text), None) => TextInput::Literal(text),
+        (None, Some(body)) => TextInput::option(body),
         (None, None) => {
             return Err(MoteError::Invalid(format!(
                 "{what} text is required (positional text or --body)"
             )));
         }
     };
+    let text = input.read()?;
     if text.trim().is_empty() {
         return Err(MoteError::Invalid(format!("{what} text must be non-empty")));
     }
@@ -3344,6 +5262,7 @@ fn cmd_discuss_promote(
     deps: Vec<String>,
 ) -> MoteResult<i32> {
     let actor = store.resolve_actor(actor_flag)?;
+    let body = resolve_optional_text(body)?;
     let state = reducer::replay_store(store)?;
     let Some(post) = state.board_posts.get(&post_id) else {
         return Err(MoteError::Invalid(format!("no such post {post_id}")));
@@ -3594,8 +5513,15 @@ fn print_discussion_search(
             let sticky = if p.sticky { " sticky" } else { "" };
             let reply = p.reply_to.as_deref().unwrap_or("-");
             println!(
-                "post   {}{}  {}  from={}  topic={}  reply={}  {}",
-                p.post_id, sticky, p.sent_ts, p.from, p.topic, reply, p.body
+                "post   {}{}  {}  from={}  topic={}  reply={}{}  {}",
+                p.post_id,
+                sticky,
+                p.sent_ts,
+                p.from,
+                p.topic,
+                reply,
+                revision_marker(p),
+                p.body
             );
         }
     }
@@ -3614,7 +5540,7 @@ fn print_board_posts(
             let reply = p.reply_to.as_deref().unwrap_or("-");
             let sticky = if p.sticky { " sticky" } else { "" };
             println!(
-                "{}{}{}  {}  from={}  topic={}  reply={}{}  {}",
+                "{}{}{}  {}  from={}  topic={}  reply={}{}{}{}{}  {}",
                 p.post_id,
                 sticky,
                 post_kind_marker(&p.post_kind),
@@ -3623,10 +5549,65 @@ fn print_board_posts(
                 p.topic,
                 reply,
                 route_marker(&p.route),
+                answers_marker(&p.answers),
+                revision_marker(p),
+                notification_marker(p),
                 p.body
             );
         }
     }
+    Ok(0)
+}
+
+struct UnreadPageMeta<'a> {
+    topic: Option<&'a str>,
+    before: Option<&'a str>,
+    before_op_id: Option<&'a str>,
+    limit: Option<usize>,
+    eligible_count: usize,
+    effective_cursor_op_id: Option<&'a str>,
+}
+
+fn print_unread_board_posts(
+    posts: Vec<&crate::state::BoardPostRecord>,
+    all_posts: &[&crate::state::BoardPostRecord],
+    meta: UnreadPageMeta<'_>,
+    page_metadata: bool,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    if !json_mode || !page_metadata {
+        return print_board_posts(posts, json_mode);
+    }
+
+    let first = posts.first().copied();
+    let last = posts.last().copied();
+    let snapshot_last = all_posts.last().copied();
+    let has_newer = meta.before_op_id.is_some_and(|boundary| {
+        all_posts
+            .iter()
+            .any(|post| post.sent_op_id.as_str() >= boundary)
+    });
+    let value = serde_json::json!({
+        "posts": posts.iter().map(|post| board_post_json(post)).collect::<Vec<_>>(),
+        "page": {
+            "order": "chronological",
+            "window": "newest",
+            "topic": meta.topic,
+            "before": meta.before,
+            "limit": meta.limit,
+            "count": posts.len(),
+            "has_older": meta.eligible_count > posts.len(),
+            "has_newer": has_newer,
+            "first_post_id": first.map(|post| post.post_id.as_str()),
+            "first_op_id": first.map(|post| post.sent_op_id.as_str()),
+            "last_post_id": last.map(|post| post.post_id.as_str()),
+            "last_op_id": last.map(|post| post.sent_op_id.as_str()),
+            "snapshot_last_post_id": snapshot_last.map(|post| post.post_id.as_str()),
+            "snapshot_last_op_id": snapshot_last.map(|post| post.sent_op_id.as_str()),
+            "effective_cursor_op_id": meta.effective_cursor_op_id,
+        }
+    });
+    println!("{}", serde_json::to_string(&value)?);
     Ok(0)
 }
 
@@ -3653,6 +5634,37 @@ fn route_marker(route: &crate::state::RouteRecord) -> String {
             route.state.as_str(),
             issues.join(",")
         )
+    }
+}
+
+fn answers_marker(answers: &[String]) -> String {
+    if answers.is_empty() {
+        String::new()
+    } else {
+        format!("  answers={}", answers.join(","))
+    }
+}
+
+fn notification_marker(post: &crate::state::BoardPostRecord) -> String {
+    if post.notification_recipients.is_empty() {
+        String::new()
+    } else {
+        format!("  notify={}", post.notification_recipients.join(","))
+    }
+}
+
+fn revision_marker(post: &crate::state::BoardPostRecord) -> String {
+    if post.retracted {
+        format!(
+            "  status=retracted reason={}",
+            post.retraction_reason.as_deref().unwrap_or("-")
+        )
+    } else if let Some(replacement) = post.superseded_by.as_deref() {
+        format!("  status=superseded-by:{replacement}")
+    } else if post.supersedes.is_empty() {
+        "  status=active".to_string()
+    } else {
+        format!("  status=active supersedes={}", post.supersedes.join(","))
     }
 }
 
@@ -3709,8 +5721,17 @@ fn print_thread_posts(
             let reply = post.reply_to.as_deref().unwrap_or("-");
             let sticky = if post.sticky { " sticky" } else { "" };
             println!(
-                "{}{}{}  {}  from={}  topic={}  reply={}  {}",
-                indent, post.post_id, sticky, post.sent_ts, post.from, post.topic, reply, post.body
+                "{}{}{}  {}  from={}  topic={}  reply={}{}{}  {}",
+                indent,
+                post.post_id,
+                sticky,
+                post.sent_ts,
+                post.from,
+                post.topic,
+                reply,
+                answers_marker(&post.answers),
+                revision_marker(post),
+                post.body
             );
         }
     }
@@ -3725,11 +5746,24 @@ fn board_post_json(p: &crate::state::BoardPostRecord) -> serde_json::Value {
         "body": p.body,
         "reply_to": p.reply_to,
         "post_kind": p.post_kind,
+        "answers": p.answers,
+        "explicit_notify": p.explicit_notify,
+        "notification_recipients": p.notification_recipients,
+        "idempotency_key": p.idempotency_key,
+        "public": true,
         "sticky": p.sticky,
         "sticky_op_id": p.sticky_op_id,
+        "disposition": p.disposition(),
+        "superseded_by": p.superseded_by,
+        "superseded_op_id": p.superseded_op_id,
+        "supersedes": p.supersedes,
+        "retracted": p.retracted,
+        "retraction_reason": p.retraction_reason,
+        "retracted_op_id": p.retracted_op_id,
         "route_state": p.route.state.as_str(),
         "issues": p.route.issues.iter().collect::<Vec<_>>(),
         "sent_ts": p.sent_ts,
+        "sent_op_id": p.sent_op_id,
     })
 }
 
@@ -3763,12 +5797,12 @@ fn cmd_inbox(
     interval: u64,
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
-    let actor = store.resolve_actor(actor_flag)?;
+    let actor = resolve_actor_with_source(&store, actor_flag)?;
 
     if follow {
         return cmd_inbox_follow(
             &store,
-            &actor,
+            &actor.actor,
             json_mode,
             issue.as_deref(),
             from.as_deref(),
@@ -3796,12 +5830,12 @@ fn cmd_inbox(
     let state = reducer::replay_store(&store)?;
     let filtered = filtered_inbox(
         &state,
-        &actor,
+        &actor.actor,
         issue.as_deref(),
         from.as_deref(),
         kind.as_deref(),
     );
-    write_inbox_messages(&filtered, json_mode)?;
+    write_inbox_messages(&filtered, json_mode, Some(&actor))?;
     Ok(0)
 }
 
@@ -3823,7 +5857,11 @@ fn filtered_inbox<'a>(
         .collect()
 }
 
-fn write_inbox_messages(messages: &[&MsgRecord], json_mode: bool) -> MoteResult<()> {
+fn write_inbox_messages(
+    messages: &[&MsgRecord],
+    json_mode: bool,
+    actor: Option<&ActorResolution>,
+) -> MoteResult<()> {
     if json_mode {
         let arr: Vec<_> = messages
             .iter()
@@ -3839,19 +5877,35 @@ fn write_inbox_messages(messages: &[&MsgRecord], json_mode: bool) -> MoteResult<
                     "reply_to": m.reply_to,
                     "correlation_id": m.correlation_id,
                     "idempotency_key": m.idempotency_key,
+                    "answers": m.answers,
+                    "require_live": m.require_live,
+                    "recipient_presence": m.recipient_presence,
                     "request_state": m.request_state.map(RequestState::as_str),
                     "response_msg_id": m.response_msg_id,
+                    "response_post_id": m.response_post_id,
                     "sent_ts": m.sent_ts,
                 })
             })
             .collect();
         println!("{}", serde_json::to_string(&arr)?);
+    } else if messages.is_empty() {
+        let actor = actor.expect("empty finite inbox output carries resolved identity");
+        println!(
+            "inbox for {} (source={}): no unacknowledged messages",
+            actor.actor, actor.source
+        );
     } else {
         for m in messages {
             let issue_s = m.entity.as_deref().unwrap_or("-");
             println!(
-                "{}  {}  from={}  issue={}  kind={}  {}",
-                m.msg_id, m.sent_ts, m.from, issue_s, m.msg_kind, m.body
+                "{}  {}  from={}  issue={}  kind={}{}  {}",
+                m.msg_id,
+                m.sent_ts,
+                m.from,
+                issue_s,
+                m.msg_kind,
+                recipient_presence_marker(m),
+                m.body
             );
         }
     }
@@ -3861,7 +5915,7 @@ fn write_inbox_messages(messages: &[&MsgRecord], json_mode: bool) -> MoteResult<
 #[allow(clippy::too_many_arguments)]
 fn cmd_inbox_wait(
     store: &Store,
-    actor: &str,
+    actor: &ActorResolution,
     json_mode: bool,
     issue: Option<&str>,
     from: Option<&str>,
@@ -3869,16 +5923,16 @@ fn cmd_inbox_wait(
     timeout: Duration,
     interval: u64,
 ) -> MoteResult<i32> {
-    let filter = crate::events::EventFilter::messages_for(actor);
+    let filter = crate::events::EventFilter::messages_for(&actor.actor);
     let mut tailer = crate::events::EventTailer::new(store, None, interval)?;
     let baseline = crate::events::state_for_names(store, tailer.initial_names())?;
-    let pending = filtered_inbox(&baseline, actor, issue, from, kind);
+    let pending = filtered_inbox(&baseline, &actor.actor, issue, from, kind);
     if !pending.is_empty() {
-        write_inbox_messages(&pending, json_mode)?;
+        write_inbox_messages(&pending, json_mode, Some(actor))?;
         return Ok(0);
     }
     if timeout.is_zero() {
-        write_inbox_messages(&[], json_mode)?;
+        write_inbox_messages(&[], json_mode, Some(actor))?;
         return Ok(0);
     }
 
@@ -3886,11 +5940,11 @@ fn cmd_inbox_wait(
     if tailer
         .poll(store, &filter)?
         .iter()
-        .any(|event| inbox_event_matches(event, actor, issue, from, kind))
+        .any(|event| inbox_event_matches(event, &actor.actor, issue, from, kind))
     {
         let state = reducer::replay_store(store)?;
-        let messages = filtered_inbox(&state, actor, issue, from, kind);
-        write_inbox_messages(&messages, json_mode)?;
+        let messages = filtered_inbox(&state, &actor.actor, issue, from, kind);
+        write_inbox_messages(&messages, json_mode, Some(actor))?;
         return Ok(0);
     }
 
@@ -3906,11 +5960,11 @@ fn cmd_inbox_wait(
         if tailer
             .poll(store, &filter)?
             .iter()
-            .any(|event| inbox_event_matches(event, actor, issue, from, kind))
+            .any(|event| inbox_event_matches(event, &actor.actor, issue, from, kind))
         {
             let state = reducer::replay_store(store)?;
-            let messages = filtered_inbox(&state, actor, issue, from, kind);
-            write_inbox_messages(&messages, json_mode)?;
+            let messages = filtered_inbox(&state, &actor.actor, issue, from, kind);
+            write_inbox_messages(&messages, json_mode, Some(actor))?;
             return Ok(0);
         }
     }
@@ -3919,8 +5973,8 @@ fn cmd_inbox_wait(
     // truth. Replay once at the deadline so a missed/coalesced notification or
     // a fallback tick racing the timeout cannot hide a durable delivery.
     let state = reducer::replay_store(store)?;
-    let messages = filtered_inbox(&state, actor, issue, from, kind);
-    write_inbox_messages(&messages, json_mode)?;
+    let messages = filtered_inbox(&state, &actor.actor, issue, from, kind);
+    write_inbox_messages(&messages, json_mode, Some(actor))?;
     Ok(0)
 }
 
@@ -4012,10 +6066,13 @@ fn inbox_event_matches(
 fn cmd_reserve(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
+    json_mode: bool,
     paths: Vec<String>,
-    issue: String,
+    issue: Option<String>,
+    candidate: Option<String>,
     ttl: Option<u32>,
 ) -> MoteResult<i32> {
+    let entity = reservation_entity_arg(issue, candidate)?;
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let format = store.read_format()?;
@@ -4024,17 +6081,49 @@ fn cmd_reserve(
         return Err(MoteError::Invalid("at least one path required".into()));
     }
     let rv_id = ids::new_reservation_id();
-    let op = make_reserve_open(actor, rv_id.clone(), issue, paths, ttl_s, Timestamp::now());
+    let op = make_reserve_open(
+        actor,
+        rv_id.clone(),
+        entity.clone(),
+        paths.clone(),
+        ttl_s,
+        Timestamp::now(),
+    );
     let name = publish::publish_op(&store, &op)?;
     let state = reducer::replay_store(&store)?;
     if state.was_accepted(name.as_str()) {
-        println!("{rv_id}");
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "accepted": true,
+                    "reservation_id": rv_id,
+                    "entity": entity,
+                    "paths": state.reservations[&rv_id].live_paths(),
+                }))?
+            );
+        } else {
+            println!("{rv_id}");
+        }
         Ok(0)
     } else {
         let reason = state
             .rejection_reason(name.as_str())
             .unwrap_or_else(|| "unknown".into());
-        eprintln!("reserve rejected: {reason}");
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "accepted": false,
+                    "reservation_id": rv_id,
+                    "entity": entity,
+                    "paths": paths,
+                    "reason": reason,
+                }))?
+            );
+        } else {
+            eprintln!("reserve rejected: {reason}");
+        }
         Ok(2)
     }
 }
@@ -4053,13 +6142,70 @@ fn cmd_unreserve(
     verify_accept(&store, &name)
 }
 
+fn cmd_adopt(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    rv: String,
+    issue: String,
+    ttl: Option<u32>,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let actor = store.resolve_actor(actor_flag)?;
+    let state = reducer::replay_store(&store)?;
+    let reservation = state
+        .reservations
+        .get(&rv)
+        .ok_or_else(|| MoteError::Invalid(format!("no such reservation `{rv}`")))?;
+    let ttl_s = ttl.unwrap_or(store.read_format()?.default_ttl_s.reservation);
+    let op = make_reserve_adopt(
+        actor,
+        rv.clone(),
+        issue,
+        reservation.clock.clone(),
+        ttl_s,
+        Timestamp::now(),
+    );
+    let name = publish::publish_op(&store, &op)?;
+    let state = reducer::replay_store(&store)?;
+    if !state.was_accepted(name.as_str()) {
+        let reason = state
+            .rejection_reason(name.as_str())
+            .unwrap_or_else(|| "unknown".into());
+        eprintln!("adopt rejected: {reason}");
+        return Ok(2);
+    }
+    let reservation = &state.reservations[&rv];
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "reservation_id": reservation.reservation_id,
+                "actor": reservation.actor,
+                "entity": reservation.entity,
+                "binding_kind": state.reservation_binding_kind(reservation),
+                "paths": reservation.live_paths(),
+                "lease_until_ts": reservation.lease_until_ts,
+                "clock": reservation.clock,
+                "disposition": state.reservation_disposition(reservation, &ids::format_rfc3339(Timestamp::now())),
+                "adoptions": reservation.adoptions,
+            }))?
+        );
+    } else {
+        println!("{rv}");
+    }
+    Ok(0)
+}
+
 fn cmd_preflight(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
     json_mode: bool,
-    issue: String,
+    issue: Option<String>,
+    candidate: Option<String>,
     paths: Vec<String>,
 ) -> MoteResult<i32> {
+    let entity = reservation_entity_arg(issue, candidate)?;
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let state = reducer::replay_store(&store)?;
@@ -4072,10 +6218,10 @@ fn cmd_preflight(
         normalized.push(n);
     }
 
-    let mut conflicts: Vec<(String, String, String, String)> = Vec::new();
-    // (new_path, held_path, holder_actor, reservation_id)
+    let mut conflicts: Vec<(String, String, String, String, String, String)> = Vec::new();
+    // (new_path, held_path, holder_actor, reservation_id, disposition, conflict_kind)
     for r in state.reservations.values() {
-        if r.actor == actor || !r.is_live(&now) {
+        if !r.is_live(&now) {
             continue;
         }
         for p_new in &normalized {
@@ -4090,6 +6236,12 @@ fn cmd_preflight(
                         p_held.clone(),
                         r.actor.clone(),
                         r.reservation_id.clone(),
+                        state.reservation_disposition(r, &now).as_str().into(),
+                        if r.actor == actor {
+                            "same_actor_duplicate".into()
+                        } else {
+                            "foreign_overlap".into()
+                        },
                     ));
                 }
             }
@@ -4098,29 +6250,46 @@ fn cmd_preflight(
 
     let issue_status = state
         .beads
-        .get(&issue)
+        .get(&entity)
         .map(|b| b.status.as_str().to_string());
     let claim_holder = state
         .beads
-        .get(&issue)
+        .get(&entity)
         .and_then(|b| b.claim.as_ref().map(|c| c.claimed_by.clone()));
+    let binding_kind = if state.candidates.contains_key(&entity) {
+        "candidate"
+    } else {
+        "bead"
+    };
+    let candidate_phase = state
+        .candidates
+        .get(&entity)
+        .map(|candidate| candidate.phase.as_str());
 
     if json_mode {
         let v = serde_json::json!({
-            "issue": issue,
+            "issue": (binding_kind == "bead").then_some(&entity),
+            "candidate": (binding_kind == "candidate").then_some(&entity),
+            "entity": entity,
+            "binding_kind": binding_kind,
             "issue_status": issue_status,
+            "candidate_phase": candidate_phase,
             "claim_holder": claim_holder,
             "actor": actor,
             "paths": normalized,
-            "conflicts": conflicts.iter().map(|(p_new, p_held, who, rv)| serde_json::json!({
+            "conflicts": conflicts.iter().map(|(p_new, p_held, who, rv, disposition, conflict_kind)| serde_json::json!({
                 "new_path": p_new, "held_path": p_held, "actor": who, "reservation_id": rv,
+                "disposition": disposition, "conflict_kind": conflict_kind,
             })).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string(&v)?);
     } else {
         println!(
-            "issue:    {issue} ({})",
-            issue_status.as_deref().unwrap_or("unknown")
+            "{binding_kind}:    {entity} ({})",
+            issue_status
+                .as_deref()
+                .or(candidate_phase)
+                .unwrap_or("unknown")
         );
         if let Some(h) = &claim_holder {
             println!("claim:    held by {h}");
@@ -4129,13 +6298,60 @@ fn cmd_preflight(
             println!("paths:    {} clear", normalized.len());
         } else {
             println!("conflicts:");
-            for (p_new, p_held, who, rv) in &conflicts {
-                println!("  {p_new} overlaps {p_held} held by {who} (rv {rv})");
+            for (p_new, p_held, who, rv, disposition, conflict_kind) in &conflicts {
+                if conflict_kind == "same_actor_duplicate" {
+                    println!(
+                        "  {p_new} overlaps {p_held} already held by you (rv {rv}, {disposition}); release or reuse it"
+                    );
+                } else {
+                    println!("  {p_new} overlaps {p_held} held by {who} (rv {rv}, {disposition})");
+                }
             }
         }
     }
 
     Ok(if conflicts.is_empty() { 0 } else { 2 })
+}
+
+fn reservation_entity_arg(issue: Option<String>, candidate: Option<String>) -> MoteResult<String> {
+    match (issue, candidate) {
+        (Some(entity), None) | (None, Some(entity)) => Ok(entity),
+        (None, None) => Err(MoteError::Invalid(
+            "exactly one of --issue or --candidate is required".into(),
+        )),
+        (Some(_), Some(_)) => Err(MoteError::Invalid(
+            "--issue and --candidate are mutually exclusive".into(),
+        )),
+    }
+}
+
+fn parse_duration_seconds(raw: &str) -> Result<u32, String> {
+    if raw.is_empty() {
+        return Err("duration must not be empty".into());
+    }
+    let (digits, multiplier) = match raw.as_bytes().last().copied() {
+        Some(b's') => (&raw[..raw.len() - 1], 1_u32),
+        Some(b'm') => (&raw[..raw.len() - 1], 60_u32),
+        Some(b'h') => (&raw[..raw.len() - 1], 60_u32 * 60),
+        Some(b'd') => (&raw[..raw.len() - 1], 24_u32 * 60 * 60),
+        Some(last) if last.is_ascii_digit() => (raw, 1_u32),
+        _ => {
+            return Err(format!(
+                "invalid duration `{raw}`; use bare seconds or one suffix: s, m, h, d"
+            ));
+        }
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "invalid duration `{raw}`; use a whole number followed by at most one of s, m, h, d"
+        ));
+    }
+    let value: u32 = digits
+        .parse()
+        .map_err(|_| format!("duration `{raw}` exceeds {} seconds", u32::MAX))?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("duration `{raw}` exceeds {} seconds", u32::MAX))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4150,6 +6366,7 @@ fn cmd_begin(
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
+    let note = resolve_optional_text(note)?;
     let format = store.read_format()?;
     let reserve_ttl = ttl.unwrap_or(format.default_ttl_s.reservation);
     let claim_ttl = format.default_ttl_s.claim;
@@ -4292,6 +6509,7 @@ fn cmd_handoff(
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
+    let note = resolve_optional_text(note)?;
     let format = store.read_format()?;
 
     // Note (handoff)
@@ -4356,6 +6574,7 @@ fn cmd_done(
     use std::collections::BTreeMap;
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
+    let note = resolve_optional_text(note)?;
 
     // Completion note (note_kind=note). Best effort.
     let text = note.unwrap_or_else(|| "done".into());
@@ -4444,8 +6663,8 @@ fn cmd_who_has(store_flag: Option<&Path>, json_mode: bool, path: String) -> Mote
     let normalized = crate::paths::normalize(&path)
         .map_err(|e| MoteError::Invalid(format!("path `{path}`: {e}")))?;
 
-    let mut hits: Vec<(String, String, String, String, String)> = Vec::new();
-    // (held_path, actor, reservation_id, entity, lease_until_ts)
+    let mut hits: Vec<(String, String, String, String, String, String)> = Vec::new();
+    // (held_path, actor, reservation_id, entity, lease_until_ts, disposition)
     for r in state.reservations.values() {
         if !r.is_live(&now) {
             continue;
@@ -4462,6 +6681,7 @@ fn cmd_who_has(store_flag: Option<&Path>, json_mode: bool, path: String) -> Mote
                     r.reservation_id.clone(),
                     r.entity.clone(),
                     r.lease_until_ts.clone(),
+                    state.reservation_disposition(r, &now).as_str().into(),
                 ));
             }
         }
@@ -4470,10 +6690,10 @@ fn cmd_who_has(store_flag: Option<&Path>, json_mode: bool, path: String) -> Mote
     if json_mode {
         let arr: Vec<_> = hits
             .iter()
-            .map(|(p, a, rv, e, until)| {
+            .map(|(p, a, rv, e, until, disposition)| {
                 serde_json::json!({
                     "path": p, "actor": a, "reservation_id": rv,
-                    "entity": e, "lease_until_ts": until,
+                    "entity": e, "lease_until_ts": until, "disposition": disposition,
                 })
             })
             .collect();
@@ -4481,8 +6701,8 @@ fn cmd_who_has(store_flag: Option<&Path>, json_mode: bool, path: String) -> Mote
     } else if hits.is_empty() {
         println!("no live reservations overlap {normalized}");
     } else {
-        for (p, a, rv, e, until) in &hits {
-            println!("  {p} held by {a} (issue {e}, rv {rv}, until {until})");
+        for (p, a, rv, e, until, disposition) in &hits {
+            println!("  {p} held by {a} (issue {e}, rv {rv}, {disposition}, until {until})");
         }
     }
     Ok(0)
@@ -4501,6 +6721,250 @@ fn env_session_id() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn required_session_id(id: Option<String>) -> MoteResult<String> {
+    id.or_else(env_session_id)
+        .ok_or_else(|| MoteError::Invalid("no session id (pass --id or set MOTE_SESSION)".into()))
+}
+
+fn existing_session_retry(
+    state: &crate::state::State,
+    actor: &str,
+    key: Option<&str>,
+    action: &op::Op,
+) -> MoteResult<Option<String>> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    if !op::validate_idempotency_key(key) {
+        return Err(MoteError::Invalid(
+            "--idempotency-key must be 1..=128 trimmed printable characters".into(),
+        ));
+    }
+    let Some(previous) = state
+        .session_idempotency
+        .get(&(actor.to_string(), key.to_string()))
+    else {
+        return Ok(None);
+    };
+    let digest = op::session_action_digest(action).expect("session action has digest");
+    if previous.kind == action.kind_name() && previous.digest == digest {
+        Ok(Some(previous.op_id.clone()))
+    } else {
+        Err(MoteError::Invalid(format!(
+            "idempotency key `{key}` is already used by {} for a different session action",
+            previous.op_id
+        )))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_session_heartbeat(
+    store: &Store,
+    actor: String,
+    session_id: String,
+    ttl: Option<u32>,
+    renew_within: u32,
+    force: bool,
+    idempotency_key: Option<String>,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    let state = reducer::replay_store(store)?;
+    let Some(session) = state.sessions.get(&session_id).cloned() else {
+        return Err(MoteError::Invalid(format!("no such session {session_id}")));
+    };
+    let invalid_owner_or_ended = session.actor != actor || session.ended_ts.is_some();
+    let ttl = ttl.unwrap_or(session.ttl_s);
+    if ttl == 0 {
+        return Err(MoteError::Invalid("--ttl must be > 0".into()));
+    }
+    let now = Timestamp::now();
+    let now_ts = ids::format_rfc3339(now);
+    let action = make_session_heartbeat(
+        actor.clone(),
+        session_id.clone(),
+        ttl,
+        idempotency_key.clone(),
+        now,
+    );
+    if let Some(op_id) =
+        existing_session_retry(&state, &actor, idempotency_key.as_deref(), &action)?
+    {
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "session_id": session_id,
+                    "ttl_s": session.ttl_s,
+                    "lease_until_ts": session.lease_until_ts,
+                    "published": false,
+                    "idempotent_replay": true,
+                    "op_id": op_id,
+                }))?
+            );
+        } else {
+            println!("{session_id}");
+            eprintln!("heartbeat already accepted as {op_id}");
+        }
+        return Ok(0);
+    }
+
+    // Do not let the renewal-margin optimization turn an invalid ownership or
+    // ended-session attempt into a successful no-op. Publish it so the reducer
+    // records and reports the ordinary protocol rejection.
+    if invalid_owner_or_ended {
+        let name = publish::publish_op(store, &action)?;
+        return verify_accept(store, &name);
+    }
+
+    let deadline: Timestamp = session
+        .lease_until_ts
+        .parse()
+        .map_err(|error: jiff::Error| MoteError::Other(error.to_string()))?;
+    let renew_at = deadline
+        .checked_sub(jiff::SignedDuration::from_secs(renew_within.into()))
+        .map_err(|error| MoteError::Invalid(format!("bad renewal margin: {error}")))?;
+    if !force && now < renew_at {
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "session_id": session_id,
+                    "ttl_s": session.ttl_s,
+                    "lease_until_ts": session.lease_until_ts,
+                    "published": false,
+                    "idempotent_replay": false,
+                    "reason": "outside_renewal_margin",
+                    "renew_at_ts": ids::format_rfc3339(renew_at),
+                    "as_of_ts": now_ts,
+                }))?
+            );
+        } else {
+            println!("{session_id}");
+            eprintln!(
+                "heartbeat skipped; lease is healthy until {} (renew at or after {})",
+                session.lease_until_ts,
+                ids::format_rfc3339(renew_at)
+            );
+        }
+        return Ok(0);
+    }
+
+    let name = publish::publish_op(store, &action)?;
+    let code = verify_accept(store, &name)?;
+    if code == 0 {
+        let state = reducer::replay_store(store)?;
+        let session = state.sessions.get(&session_id).expect("accepted heartbeat");
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "session_id": session_id,
+                    "ttl_s": session.ttl_s,
+                    "last_heartbeat_ts": session.last_heartbeat_ts,
+                    "last_heartbeat_op_id": session.last_heartbeat_op_id,
+                    "lease_until_ts": session.lease_until_ts,
+                    "published": true,
+                    "idempotent_replay": false,
+                    "op_id": name.as_str(),
+                }))?
+            );
+        } else {
+            println!("{session_id}");
+            eprintln!("heartbeat accepted; live until {}", session.lease_until_ts);
+        }
+    }
+    Ok(code)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_session_status(
+    store: &Store,
+    actor: String,
+    session_id: String,
+    status: String,
+    message: Option<String>,
+    issue: Option<String>,
+    idempotency_key: Option<String>,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    if !op::validate_session_intent(&status) {
+        return Err(MoteError::Invalid(format!(
+            "invalid session status `{status}` (expected: {})",
+            op::VALID_SESSION_INTENTS.join(" | ")
+        )));
+    }
+    if message.as_deref().is_some_and(|message| {
+        message.is_empty()
+            || message.trim() != message
+            || message.chars().any(|c| c == '\0' || c == '\n' || c == '\r')
+    }) {
+        return Err(MoteError::Invalid(
+            "--message must be non-empty, trimmed, and single-line".into(),
+        ));
+    }
+    let state = reducer::replay_store(store)?;
+    let Some(session) = state.sessions.get(&session_id) else {
+        return Err(MoteError::Invalid(format!("no such session {session_id}")));
+    };
+    if session.actor != actor {
+        return Err(MoteError::Invalid(format!(
+            "session {session_id} belongs to {}, not {actor}",
+            session.actor
+        )));
+    }
+    let action = make_session_status(
+        actor.clone(),
+        session_id.clone(),
+        status,
+        message,
+        issue,
+        idempotency_key.clone(),
+        Timestamp::now(),
+    );
+    if let Some(op_id) =
+        existing_session_retry(&state, &actor, idempotency_key.as_deref(), &action)?
+    {
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "session_id": session_id,
+                    "published": false,
+                    "idempotent_replay": true,
+                    "op_id": op_id,
+                    "intent": session.intent,
+                }))?
+            );
+        } else {
+            println!("{session_id}");
+            eprintln!("session status already accepted as {op_id}");
+        }
+        return Ok(0);
+    }
+    let name = publish::publish_op(store, &action)?;
+    let code = verify_accept(store, &name)?;
+    if code == 0 {
+        let state = reducer::replay_store(store)?;
+        let session = state.sessions.get(&session_id).expect("accepted status");
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "session_id": session_id,
+                    "published": true,
+                    "idempotent_replay": false,
+                    "op_id": name.as_str(),
+                    "intent": session.intent,
+                }))?
+            );
+        } else {
+            println!("{session_id}");
+            eprintln!("session status changed");
+        }
+    }
+    Ok(code)
 }
 
 fn cmd_session(
@@ -4584,50 +7048,49 @@ fn cmd_session(
             Ok(0)
         }
         SessionCmd::Renew { id, ttl } => {
-            let Some(session_id) = id.or_else(env_session_id) else {
-                return Err(MoteError::Invalid(
-                    "no session id (pass --id or set MOTE_SESSION)".into(),
-                ));
-            };
-            // Publish as the invoker, never as the recorded owner: forging the
-            // op actor would misattribute the action and make the reducer's
-            // ownership check unreachable.
+            let session_id = required_session_id(id)?;
             let actor = store.resolve_actor(actor_flag)?;
-            let state = reducer::replay_store(&store)?;
-            let Some(session) = state.sessions.get(&session_id) else {
-                return Err(MoteError::Invalid(format!("no such session {session_id}")));
-            };
-            let ttl = ttl.unwrap_or(session.ttl_s);
-            let op = make_session_start(
+            publish_session_heartbeat(&store, actor, session_id, ttl, 0, true, None, json_mode)
+        }
+        SessionCmd::Heartbeat {
+            id,
+            ttl,
+            renew_within,
+            force,
+            idempotency_key,
+        } => {
+            let session_id = required_session_id(id)?;
+            let actor = store.resolve_actor(actor_flag)?;
+            publish_session_heartbeat(
+                &store,
                 actor,
-                session_id.clone(),
+                session_id,
                 ttl,
-                session.label.clone(),
-                Some(std::process::id()),
-                Timestamp::now(),
-            );
-            let name = publish::publish_op(&store, &op)?;
-            let code = verify_accept(&store, &name)?;
-            if code == 0 {
-                let state = reducer::replay_store(&store)?;
-                let lease_until = state
-                    .sessions
-                    .get(&session_id)
-                    .map(|s| s.lease_until_ts.clone())
-                    .unwrap_or_default();
-                if json_mode {
-                    let v = serde_json::json!({
-                        "session_id": session_id,
-                        "ttl_s": ttl,
-                        "lease_until_ts": lease_until,
-                    });
-                    println!("{}", serde_json::to_string(&v)?);
-                } else {
-                    println!("{session_id}");
-                    eprintln!("renewed until {lease_until}");
-                }
-            }
-            Ok(code)
+                renew_within,
+                force,
+                idempotency_key,
+                json_mode,
+            )
+        }
+        SessionCmd::Status {
+            status,
+            id,
+            message,
+            issue,
+            idempotency_key,
+        } => {
+            let session_id = required_session_id(id)?;
+            let actor = store.resolve_actor(actor_flag)?;
+            publish_session_status(
+                &store,
+                actor,
+                session_id,
+                status,
+                message,
+                issue,
+                idempotency_key,
+                json_mode,
+            )
         }
         SessionCmd::List { all } => {
             let state = reducer::replay_store(&store)?;
@@ -4642,11 +7105,25 @@ fn cmd_session(
                 println!("{}", serde_json::to_string(&arr)?);
             } else {
                 for s in &sessions {
-                    let live = if s.is_live(&now) { "live" } else { "ended" };
+                    let disposition = if s.is_live(&now) {
+                        "live"
+                    } else if s.ended_ts.is_some() {
+                        "ended"
+                    } else {
+                        "expired"
+                    };
                     let pid = s.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
                     let label = s.label.as_deref().unwrap_or("");
+                    let intent = if s.is_live(&now) {
+                        s.intent
+                            .as_ref()
+                            .map(|intent| intent.state.as_str())
+                            .unwrap_or("-")
+                    } else {
+                        "-"
+                    };
                     println!(
-                        "{}  {}  {live}  pid={pid}  until={}  {label}",
+                        "{}  {}  {disposition}  intent={intent}  pid={pid}  until={}  {label}",
                         s.session_id, s.actor, s.lease_until_ts
                     );
                 }
@@ -4679,6 +7156,8 @@ fn cmd_session(
 }
 
 fn session_json(s: &crate::state::SessionRecord, now_ts: &str) -> serde_json::Value {
+    let live = s.is_live(now_ts);
+    let intent = if live { s.intent.as_ref() } else { None };
     serde_json::json!({
         "session_id": s.session_id,
         "actor": s.actor,
@@ -4686,9 +7165,14 @@ fn session_json(s: &crate::state::SessionRecord, now_ts: &str) -> serde_json::Va
         "pid": s.pid,
         "ttl_s": s.ttl_s,
         "started_ts": s.started_ts,
+        "started_op_id": s.started_op_id,
+        "last_heartbeat_ts": s.last_heartbeat_ts,
+        "last_heartbeat_op_id": s.last_heartbeat_op_id,
         "lease_until_ts": s.lease_until_ts,
         "ended_ts": s.ended_ts,
-        "live": s.is_live(now_ts),
+        "ended_op_id": s.ended_op_id,
+        "live": live,
+        "intent": intent,
     })
 }
 
@@ -4701,7 +7185,14 @@ fn cmd_board(
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag).ok();
     let state = reducer::replay_store(&store)?;
-    let now = ids::format_rfc3339(Timestamp::now());
+    let as_of = Timestamp::now();
+    let now = ids::format_rfc3339(as_of);
+    let actors = crate::actor_status::actor_statuses(
+        &state,
+        actor.as_deref(),
+        as_of,
+        crate::actor_status::DEFAULT_RECENT_WINDOW_S,
+    );
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for b in state.live_beads() {
@@ -4709,12 +7200,42 @@ fn cmd_board(
     }
     let active_claims: Vec<&Bead> = state
         .live_beads()
-        .filter(|b| b.claim.as_ref().is_some_and(|c| c.is_live(&now)))
+        .filter(|b| state.claim_disposition(b, &now) == crate::state::LeaseDisposition::Active)
+        .collect();
+    let orphaned_claims: Vec<&Bead> = state
+        .beads
+        .values()
+        .filter(|b| state.claim_disposition(b, &now) == crate::state::LeaseDisposition::Orphaned)
         .collect();
     let active_reservations: Vec<_> = state
         .reservations
         .values()
-        .filter(|r| r.is_active(&now))
+        .filter(|r| {
+            state.reservation_disposition(r, &now) == crate::state::LeaseDisposition::Active
+        })
+        .collect();
+    let orphaned_reservations: Vec<_> = state
+        .reservations
+        .values()
+        .filter(|r| {
+            state.reservation_disposition(r, &now) == crate::state::LeaseDisposition::Orphaned
+        })
+        .collect();
+    let expiring_reservations: Vec<_> = state
+        .reservations
+        .values()
+        .filter(|reservation| {
+            state.reservation_expiry_phase(reservation, &now)
+                == Some(crate::state::ReservationExpiryPhase::Expiring)
+        })
+        .collect();
+    let expired_reservations: Vec<_> = state
+        .reservations
+        .values()
+        .filter(|reservation| {
+            state.reservation_expiry_phase(reservation, &now)
+                == Some(crate::state::ReservationExpiryPhase::Expired)
+        })
         .collect();
     let inbox_count = actor
         .as_ref()
@@ -4728,6 +7249,7 @@ fn cmd_board(
     if json_mode {
         let v = serde_json::json!({
             "actor": actor,
+            "as_of_ts": now,
             "status_counts": counts,
             "active_claims": active_claims.iter().map(|b| serde_json::json!({
                 "id": b.id, "title": b.title, "status": b.status.as_str(),
@@ -4736,10 +7258,35 @@ fn cmd_board(
             })).collect::<Vec<_>>(),
             "active_reservations": active_reservations.iter().map(|r| serde_json::json!({
                 "reservation_id": r.reservation_id, "actor": r.actor, "entity": r.entity,
+                "binding_kind": state.reservation_binding_kind(r),
                 "paths": r.live_paths(), "lease_until_ts": r.lease_until_ts,
+            })).collect::<Vec<_>>(),
+            "orphaned_claims": orphaned_claims.iter().map(|b| serde_json::json!({
+                "id": b.id, "title": b.title,
+                "claimed_by": b.claim.as_ref().map(|c| &c.claimed_by),
+                "lease_until_ts": b.claim.as_ref().map(|c| &c.lease_until_ts),
+                "disposition": "orphaned",
+            })).collect::<Vec<_>>(),
+            "orphaned_reservations": orphaned_reservations.iter().map(|r| serde_json::json!({
+                "reservation_id": r.reservation_id, "actor": r.actor, "entity": r.entity,
+                "binding_kind": state.reservation_binding_kind(r),
+                "paths": r.live_paths(), "lease_until_ts": r.lease_until_ts,
+                "clock": r.clock, "disposition": "orphaned", "adoptions": r.adoptions,
+            })).collect::<Vec<_>>(),
+            "expiring_reservations": expiring_reservations.iter().map(|r| serde_json::json!({
+                "reservation_id": r.reservation_id, "holder": r.actor, "entity": r.entity,
+                "binding_kind": state.reservation_binding_kind(r), "paths": r.live_paths(),
+                "deadline": r.lease_until_ts, "reason": "ttl_near_deadline",
+                "warning_at": state.reservation_warning_ts(r),
+            })).collect::<Vec<_>>(),
+            "expired_reservations": expired_reservations.iter().map(|r| serde_json::json!({
+                "reservation_id": r.reservation_id, "holder": r.actor, "entity": r.entity,
+                "binding_kind": state.reservation_binding_kind(r), "paths": r.live_paths(),
+                "deadline": r.lease_until_ts, "reason": "ttl_elapsed",
             })).collect::<Vec<_>>(),
             "inbox_unacked": inbox_count,
             "discussion_unread": discussion_unread_count,
+            "actors": actors,
         });
         println!("{}", serde_json::to_string(&v)?);
     } else {
@@ -4767,8 +7314,46 @@ fn cmd_board(
                 r.reservation_id, r.actor, r.entity, live
             );
         }
+        println!(
+            "orphans:      {} claims, {} reservations",
+            orphaned_claims.len(),
+            orphaned_reservations.len()
+        );
+        for b in &orphaned_claims {
+            let claim = b.claim.as_ref().expect("orphan disposition requires claim");
+            println!(
+                "  ORPHAN claim {} by {} until {}",
+                b.id, claim.claimed_by, claim.lease_until_ts
+            );
+        }
+        for r in &orphaned_reservations {
+            println!(
+                "  ORPHAN {} by {} on {}: {}",
+                r.reservation_id,
+                r.actor,
+                r.entity,
+                r.live_paths().join(", ")
+            );
+        }
         println!("inbox:        {inbox_count} unacked");
         println!("discussion:   {discussion_unread_count} unread");
+        println!("actors:       {} known", actors.len());
+        for status in &actors {
+            println!(
+                "  {}  {} source={} reason={} as-of={} sessions={} intent={}",
+                status.actor,
+                status.presence.state,
+                status.presence.source,
+                status.presence.reason,
+                status.as_of_ts,
+                status.presence.live_session_count,
+                if status.intent.states.is_empty() {
+                    "-".into()
+                } else {
+                    status.intent.states.join(",")
+                }
+            );
+        }
     }
     Ok(0)
 }
@@ -4803,7 +7388,32 @@ fn cmd_in_flight(
     let reservations: Vec<_> = state
         .reservations
         .values()
-        .filter(|r| r.is_active(&now_ts))
+        .filter(|r| {
+            state.reservation_disposition(r, &now_ts) == crate::state::LeaseDisposition::Active
+        })
+        .collect();
+    let orphaned_reservations: Vec<_> = state
+        .reservations
+        .values()
+        .filter(|r| {
+            state.reservation_disposition(r, &now_ts) == crate::state::LeaseDisposition::Orphaned
+        })
+        .collect();
+    let expiring_reservations: Vec<_> = state
+        .reservations
+        .values()
+        .filter(|reservation| {
+            state.reservation_expiry_phase(reservation, &now_ts)
+                == Some(crate::state::ReservationExpiryPhase::Expiring)
+        })
+        .collect();
+    let expired_reservations: Vec<_> = state
+        .reservations
+        .values()
+        .filter(|reservation| {
+            state.reservation_expiry_phase(reservation, &now_ts)
+                == Some(crate::state::ReservationExpiryPhase::Expired)
+        })
         .collect();
     let doing: Vec<&Bead> = state
         .live_beads()
@@ -4811,7 +7421,12 @@ fn cmd_in_flight(
         .collect();
     let claims: Vec<&Bead> = state
         .live_beads()
-        .filter(|b| b.claim.as_ref().is_some_and(|c| c.is_live(&now_ts)))
+        .filter(|b| state.claim_disposition(b, &now_ts) == crate::state::LeaseDisposition::Active)
+        .collect();
+    let orphaned_claims: Vec<&Bead> = state
+        .beads
+        .values()
+        .filter(|b| state.claim_disposition(b, &now_ts) == crate::state::LeaseDisposition::Orphaned)
         .collect();
     let topics: Vec<_> = state
         .board_topics_by_activity()
@@ -4823,6 +7438,13 @@ fn cmd_in_flight(
     } else {
         Vec::new()
     };
+    let candidates: Vec<_> = state.candidates.values().collect();
+    let actors = crate::actor_status::actor_statuses(
+        &state,
+        actor.as_deref(),
+        now,
+        window_secs.max(0).min(u32::MAX as i64) as u32,
+    );
 
     if json_mode {
         let v = serde_json::json!({
@@ -4832,6 +7454,7 @@ fn cmd_in_flight(
             "sessions": sessions.iter().map(|s| session_json(s, &now_ts)).collect::<Vec<_>>(),
             "reservations": reservations.iter().map(|r| serde_json::json!({
                 "reservation_id": r.reservation_id, "actor": r.actor, "entity": r.entity,
+                "binding_kind": state.reservation_binding_kind(r),
                 "paths": r.live_paths(), "lease_until_ts": r.lease_until_ts,
             })).collect::<Vec<_>>(),
             "doing": doing.iter().map(|b| serde_json::json!({
@@ -4844,6 +7467,29 @@ fn cmd_in_flight(
                 "claimed_by": b.claim.as_ref().map(|c| &c.claimed_by),
                 "lease_until_ts": b.claim.as_ref().map(|c| &c.lease_until_ts),
             })).collect::<Vec<_>>(),
+            "orphaned_claims": orphaned_claims.iter().map(|b| serde_json::json!({
+                "id": b.id, "status": b.status.as_str(),
+                "claimed_by": b.claim.as_ref().map(|c| &c.claimed_by),
+                "lease_until_ts": b.claim.as_ref().map(|c| &c.lease_until_ts),
+                "disposition": "orphaned",
+            })).collect::<Vec<_>>(),
+            "orphaned_reservations": orphaned_reservations.iter().map(|r| serde_json::json!({
+                "reservation_id": r.reservation_id, "actor": r.actor, "entity": r.entity,
+                "binding_kind": state.reservation_binding_kind(r),
+                "paths": r.live_paths(), "lease_until_ts": r.lease_until_ts,
+                "clock": r.clock, "disposition": "orphaned", "adoptions": r.adoptions,
+            })).collect::<Vec<_>>(),
+            "expiring_reservations": expiring_reservations.iter().map(|r| serde_json::json!({
+                "reservation_id": r.reservation_id, "holder": r.actor, "entity": r.entity,
+                "binding_kind": state.reservation_binding_kind(r), "paths": r.live_paths(),
+                "warning_at": state.reservation_warning_ts(r), "deadline": r.lease_until_ts,
+                "reason": "ttl_near_deadline",
+            })).collect::<Vec<_>>(),
+            "expired_reservations": expired_reservations.iter().map(|r| serde_json::json!({
+                "reservation_id": r.reservation_id, "holder": r.actor, "entity": r.entity,
+                "binding_kind": state.reservation_binding_kind(r), "paths": r.live_paths(),
+                "deadline": r.lease_until_ts, "reason": "ttl_elapsed",
+            })).collect::<Vec<_>>(),
             "topics": topics.iter().map(|t| {
                 let mut v = topic_json(t);
                 if let Some(obj) = v.as_object_mut() {
@@ -4854,9 +7500,17 @@ fn cmd_in_flight(
                 }
                 v
             }).collect::<Vec<_>>(),
+            "candidates": candidates.iter().map(|candidate| {
+                let mut value = candidate_json(&state, candidate);
+                value["landability"] = serde_json::json!(
+                    state.candidate_landability(&candidate.candidate_id, actor.as_deref())
+                );
+                value
+            }).collect::<Vec<_>>(),
             "recent_commits_advisory": commits.iter().map(|(sha, subject)| serde_json::json!({
                 "sha": sha, "subject": subject,
             })).collect::<Vec<_>>(),
+            "actors": actors,
         });
         println!("{}", serde_json::to_string(&v)?);
         return Ok(0);
@@ -4883,6 +7537,29 @@ fn cmd_in_flight(
         );
     }
 
+    println!("\nACTORS ({}):", actors.len());
+    for status in &actors {
+        let observed = status
+            .activity
+            .last_observed
+            .as_ref()
+            .map(|evidence| evidence.ts.as_str())
+            .unwrap_or("-");
+        println!(
+            "  {}  {} source={} reason={} as-of={} observed={} work={} interaction={} inbox={} requests={}",
+            status.actor,
+            status.presence.state,
+            status.presence.source,
+            status.presence.reason,
+            status.as_of_ts,
+            observed,
+            status.work.active_claims.len() + status.work.active_reservations.len(),
+            status.activity.last_interaction.is_some(),
+            status.attention.inbox_unacked,
+            status.attention.incoming_open_requests,
+        );
+    }
+
     println!("\nRESERVATIONS ({}):", reservations.len());
     for r in &reservations {
         println!(
@@ -4891,6 +7568,52 @@ fn cmd_in_flight(
             r.reservation_id,
             r.actor,
             r.entity,
+            r.lease_until_ts
+        );
+    }
+
+    println!(
+        "\nORPHANED LEASES ({} claims, {} reservations):",
+        orphaned_claims.len(),
+        orphaned_reservations.len()
+    );
+    for b in &orphaned_claims {
+        let claim = b.claim.as_ref().expect("orphan disposition requires claim");
+        println!(
+            "  claim {} by {} until {}",
+            b.id, claim.claimed_by, claim.lease_until_ts
+        );
+    }
+    for r in &orphaned_reservations {
+        println!(
+            "  reservation {} by {} on {}: {} until {}",
+            r.reservation_id,
+            r.actor,
+            r.entity,
+            r.live_paths().join(", "),
+            r.lease_until_ts
+        );
+    }
+
+    println!("\nEXPIRY WARNINGS ({}):", expiring_reservations.len());
+    for r in &expiring_reservations {
+        println!(
+            "  {} by {} on {}: {} expires {}",
+            r.reservation_id,
+            r.actor,
+            r.entity,
+            r.live_paths().join(", "),
+            r.lease_until_ts
+        );
+    }
+    println!("\nEXPIRED RESERVATIONS ({}):", expired_reservations.len());
+    for r in &expired_reservations {
+        println!(
+            "  {} by {} on {}: {} deadline {} reason=ttl_elapsed",
+            r.reservation_id,
+            r.actor,
+            r.entity,
+            r.live_paths().join(", "),
             r.lease_until_ts
         );
     }
@@ -4918,6 +7641,23 @@ fn cmd_in_flight(
             t.post_count,
             t.route.state.as_str(),
             t.last_activity_ts
+        );
+    }
+
+    println!("\nCANDIDATES ({}):", candidates.len());
+    for candidate in &candidates {
+        let landability = state.candidate_landability(&candidate.candidate_id, actor.as_deref());
+        let disposition = if landability.landable {
+            "landable".to_string()
+        } else {
+            landability.reason_codes.join(",")
+        };
+        println!(
+            "  {}  {}  issue={}  {}",
+            candidate.candidate_id,
+            candidate.phase.as_str(),
+            candidate.entity,
+            disposition
         );
     }
 
@@ -5069,13 +7809,13 @@ fn identity_warnings(store: &Store, actor: &ActorResolution) -> MoteResult<Vec<S
     let state = reducer::replay_store(store)?;
     let now_ts = ids::format_rfc3339(Timestamp::now());
 
-    // Same-actor reservations never conflict by design, so an overlap here is
-    // silent: two sessions are editing the same paths believing they are alone.
+    // Stores written by older Mote versions may contain same-actor overlaps.
+    // New reserve_open v2 operations reject these, but doctor keeps historical
+    // state actionable until those leases close or expire.
     for (rv_a, rv_b, path) in overlapping_same_actor_reservations(&state, &actor.actor, &now_ts) {
         warnings.push(format!(
             "reservations {rv_a} and {rv_b} both hold `{path}` under actor `{}`; \
-             same-actor reservations do not conflict, so this overlap is invisible to \
-             `mote preflight` and `mote who-has`",
+             this legacy overlap can make a partial release misleading; release one reservation",
             actor.actor
         ));
     }
@@ -5093,7 +7833,9 @@ fn identity_warnings(store: &Store, actor: &ActorResolution) -> MoteResult<Vec<S
     if actor.source == "local" && live_sessions.len() > 1 {
         warnings.push(format!(
             "actor resolved from `.mote/local/actor` while {} sessions are live; \
-             that file is shared by every process in this checkout — prefer MOTE_ACTOR",
+             that file is shared by every process in this checkout; actor-attributed writes \
+             fail closed until you run `eval \"$(mote session start --as <unique-name> \
+             --label '<work>')\"`, export MOTE_ACTOR=<unique-name>, or pass --actor",
             live_sessions.len()
         ));
     }
@@ -5112,7 +7854,11 @@ fn overlapping_same_actor_reservations(
     let live: Vec<&crate::state::ReservationState> = state
         .reservations
         .values()
-        .filter(|r| r.actor == actor && r.is_active(now_ts))
+        .filter(|r| {
+            r.actor == actor
+                && state.reservation_disposition(r, now_ts)
+                    == crate::state::LeaseDisposition::Active
+        })
         .collect();
     let mut out = Vec::new();
     for (i, a) in live.iter().enumerate() {

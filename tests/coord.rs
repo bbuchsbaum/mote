@@ -7,7 +7,11 @@ use std::thread;
 use jiff::Timestamp;
 use tempfile::TempDir;
 
-use mote::op::{ScalarSet, make_create, make_reserve_open};
+use mote::op::{
+    ScalarSet, make_claim, make_close, make_create, make_release, make_reserve_adopt,
+    make_reserve_open,
+};
+use mote::state::LeaseDisposition;
 use mote::{ids, paths, publish, reducer, repo::Store};
 
 fn mote_bin() -> &'static str {
@@ -36,6 +40,62 @@ fn new_bead(td: &TempDir, title: &str, actor: &str) -> String {
         .unwrap();
     assert!(out.status.success());
     String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn reservation_accepts_human_ttl_and_rejects_overflow() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+    let id = new_bead(&td, "human ttl", "alice");
+    let out = Command::new(mote_bin())
+        .args([
+            "reserve",
+            "src/ttl.rs",
+            "--issue",
+            &id,
+            "--ttl",
+            "2h",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reservation_id = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    assert_eq!(
+        reducer::replay_store(&store).unwrap().reservations[&reservation_id].ttl_s,
+        7200
+    );
+
+    let overflow = Command::new(mote_bin())
+        .args([
+            "reserve",
+            "src/overflow.rs",
+            "--issue",
+            &id,
+            "--ttl",
+            "4294967295d",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(overflow.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&overflow.stderr).contains("exceeds"));
+
+    let invalid_unit = Command::new(mote_bin())
+        .args(["claim", &id, "--ttl", "10w", "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(invalid_unit.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&invalid_unit.stderr).contains("invalid duration"));
 }
 
 #[test]
@@ -100,7 +160,7 @@ fn reserve_blocks_overlapping_from_other_actor() {
         &make_reserve_open(
             "bob".into(),
             ids::new_reservation_id(),
-            id,
+            id.clone(),
             vec!["src/authn/".to_string()],
             3600,
             Timestamp::now(),
@@ -112,16 +172,17 @@ fn reserve_blocks_overlapping_from_other_actor() {
 }
 
 #[test]
-fn reserve_allows_same_actor_overlap() {
+fn reserve_rejects_same_actor_overlap_with_existing_reservation_diagnostic() {
     let td = TempDir::new().unwrap();
     let store = init_store(&td);
     let id = new_bead(&td, "auth", "alice");
 
+    let first_id = ids::new_reservation_id();
     let _ = publish::publish_op(
         &store,
         &make_reserve_open(
             "alice".into(),
-            ids::new_reservation_id(),
+            first_id.clone(),
             id.clone(),
             vec!["src/auth/".to_string()],
             3600,
@@ -134,7 +195,7 @@ fn reserve_allows_same_actor_overlap() {
         &make_reserve_open(
             "alice".into(),
             ids::new_reservation_id(),
-            id,
+            id.clone(),
             vec!["src/auth/token.rs".to_string()],
             3600,
             Timestamp::now(),
@@ -142,10 +203,67 @@ fn reserve_allows_same_actor_overlap() {
     )
     .unwrap();
     let s = reducer::replay_store(&store).unwrap();
-    assert!(
-        s.was_accepted(n2.as_str()),
-        "same-actor overlap must be allowed"
-    );
+    assert!(!s.was_accepted(n2.as_str()));
+    let reason = s.rejection_reason(n2.as_str()).unwrap();
+    assert!(reason.contains("duplicate reservation"), "{reason}");
+    assert!(reason.contains(&first_id), "{reason}");
+
+    let json = Command::new(mote_bin())
+        .args([
+            "--json",
+            "reserve",
+            "src/auth/another.rs",
+            "--issue",
+            &id,
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(2));
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["accepted"], false);
+    assert!(value["reason"].as_str().unwrap().contains(&first_id));
+}
+
+#[test]
+fn concurrent_same_actor_duplicate_attempts_accept_exactly_one() {
+    let td = TempDir::new().unwrap();
+    init_store(&td);
+    let id = new_bead(&td, "same actor race", "alice");
+    let bin = mote_bin();
+    let dir_a = td.path().to_path_buf();
+    let dir_b = td.path().to_path_buf();
+    let id_a = id.clone();
+    let id_b = id;
+    let a = thread::spawn(move || {
+        Command::new(bin)
+            .args(["reserve", "src/race/", "--issue", &id_a, "--actor", "alice"])
+            .current_dir(dir_a)
+            .output()
+            .unwrap()
+    });
+    let b = thread::spawn(move || {
+        Command::new(bin)
+            .args([
+                "reserve",
+                "src/race/file.rs",
+                "--issue",
+                &id_b,
+                "--actor",
+                "alice",
+            ])
+            .current_dir(dir_b)
+            .output()
+            .unwrap()
+    });
+    let a = a.join().unwrap();
+    let b = b.join().unwrap();
+    assert_ne!(a.status.success(), b.status.success());
+    let loser = if a.status.success() { b } else { a };
+    assert_eq!(loser.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&loser.stderr).contains("duplicate reservation"));
 }
 
 #[test]
@@ -462,6 +580,364 @@ fn cli_smoke_done_compound() {
         .filter(|r| r.actor == "alice" && r.is_active(&now))
         .collect();
     assert!(live_alice.is_empty(), "all reservations should be closed");
+}
+
+#[test]
+fn orphaned_reservation_is_visible_blocking_and_adoptable_with_provenance() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+    let source = new_bead(&td, "source", "alice");
+    let target = new_bead(&td, "target", "bob");
+    let bin = mote_bin();
+
+    let reserve = Command::new(bin)
+        .args([
+            "reserve",
+            "src/shared/",
+            "--issue",
+            &source,
+            "--ttl",
+            "3600",
+            "--actor",
+            "alice",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(reserve.status.success());
+    let reservation_id = String::from_utf8(reserve.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let claim = Command::new(bin)
+        .args(["claim", &target, "--ttl", "3600", "--actor", "bob"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(claim.status.success());
+
+    let live_takeover = Command::new(bin)
+        .args([
+            "adopt",
+            &reservation_id,
+            "--issue",
+            &target,
+            "--actor",
+            "bob",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(live_takeover.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&live_takeover.stderr).contains("only a still-live orphaned"));
+
+    let close = Command::new(bin)
+        .args(["close", &source, "--actor", "alice"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(close.status.success());
+
+    let state = reducer::replay_store(&store).unwrap();
+    let now = ids::format_rfc3339(Timestamp::now());
+    let orphan = &state.reservations[&reservation_id];
+    assert_eq!(
+        state.reservation_disposition(orphan, &now),
+        LeaseDisposition::Orphaned
+    );
+
+    let preflight = Command::new(bin)
+        .args([
+            "preflight",
+            "--issue",
+            &target,
+            "--paths",
+            "src/shared/file.rs",
+            "--actor",
+            "carol",
+            "--json",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(preflight.status.code(), Some(2));
+    let preflight_json: serde_json::Value = serde_json::from_slice(&preflight.stdout).unwrap();
+    assert_eq!(preflight_json["conflicts"][0]["disposition"], "orphaned");
+
+    let unclaimed = Command::new(bin)
+        .args([
+            "adopt",
+            &reservation_id,
+            "--issue",
+            &target,
+            "--actor",
+            "carol",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert_eq!(unclaimed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&unclaimed.stderr).contains("must hold a live claim"));
+
+    let adopt = Command::new(bin)
+        .args([
+            "adopt",
+            &reservation_id,
+            "--issue",
+            &target,
+            "--actor",
+            "bob",
+            "--json",
+        ])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        adopt.status.success(),
+        "adopt failed: {}",
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+    let adopted_json: serde_json::Value = serde_json::from_slice(&adopt.stdout).unwrap();
+    assert_eq!(adopted_json["actor"], "bob");
+    assert_eq!(adopted_json["entity"], target);
+    assert_eq!(adopted_json["disposition"], "active");
+    assert_eq!(adopted_json["adoptions"][0]["from_actor"], "alice");
+    assert_eq!(adopted_json["adoptions"][0]["from_entity"], source);
+
+    let state = reducer::replay_store(&store).unwrap();
+    let adopted = &state.reservations[&reservation_id];
+    assert_eq!(adopted.live_paths(), vec!["src/shared/".to_string()]);
+    assert_eq!(adopted.adoptions.len(), 1);
+    assert_eq!(adopted.clock, adopted.adoptions[0].op_id);
+
+    let events = Command::new(bin)
+        .args(["events", "--kind", "all", "--json"])
+        .current_dir(td.path())
+        .output()
+        .unwrap();
+    assert!(events.status.success());
+    let event_lines = String::from_utf8(events.stdout).unwrap();
+    let values: Vec<serde_json::Value> = event_lines
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(values.iter().any(|value| {
+        value["type"] == "reservation.adopted" && value["data"]["reservation_id"] == reservation_id
+    }));
+    let close_event = values
+        .iter()
+        .find(|value| value["type"] == "issue.closed" && value["data"]["entity"] == source)
+        .expect("source close event");
+    assert_eq!(
+        close_event["data"]["lease_effects"]["orphaned_reservations"][0]["reservation_id"],
+        reservation_id
+    );
+}
+
+#[test]
+fn orphan_adoption_cas_race_accepts_exactly_one() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+    let source = new_bead(&td, "source", "alice");
+    let target_bob = new_bead(&td, "bob target", "bob");
+    let target_carol = new_bead(&td, "carol target", "carol");
+    let now = Timestamp::now();
+
+    let reserve_id = ids::new_reservation_id();
+    let opened = publish::publish_op(
+        &store,
+        &make_reserve_open(
+            "alice".into(),
+            reserve_id.clone(),
+            source.clone(),
+            vec!["src/race.rs".into()],
+            3600,
+            now,
+        ),
+    )
+    .unwrap();
+    for (actor, target) in [("bob", &target_bob), ("carol", &target_carol)] {
+        publish::publish_op(
+            &store,
+            &make_claim(actor.into(), target.clone(), actor.into(), 3600, None, now),
+        )
+        .unwrap();
+    }
+    publish::publish_op(
+        &store,
+        &make_close("alice".into(), source, Default::default(), now),
+    )
+    .unwrap();
+
+    let a = publish::publish_op(
+        &store,
+        &make_reserve_adopt(
+            "bob".into(),
+            reserve_id.clone(),
+            target_bob,
+            opened.as_str().into(),
+            3600,
+            now,
+        ),
+    )
+    .unwrap();
+    let b = publish::publish_op(
+        &store,
+        &make_reserve_adopt(
+            "carol".into(),
+            reserve_id.clone(),
+            target_carol,
+            opened.as_str().into(),
+            3600,
+            now,
+        ),
+    )
+    .unwrap();
+    let state = reducer::replay_store(&store).unwrap();
+    assert_ne!(
+        state.was_accepted(a.as_str()),
+        state.was_accepted(b.as_str())
+    );
+    let loser = if state.was_accepted(a.as_str()) {
+        &b
+    } else {
+        &a
+    };
+    assert!(
+        state
+            .rejection_reason(loser.as_str())
+            .unwrap()
+            .contains("stale reservation CAS")
+    );
+    assert_eq!(state.reservations[&reserve_id].adoptions.len(), 1);
+    let replayed = reducer::replay_store(&store).unwrap();
+    assert_eq!(
+        replayed.reservations[&reserve_id].clock,
+        state.reservations[&reserve_id].clock
+    );
+    assert_eq!(
+        serde_json::to_value(&replayed.reservations[&reserve_id].adoptions).unwrap(),
+        serde_json::to_value(&state.reservations[&reserve_id].adoptions).unwrap()
+    );
+}
+
+#[test]
+fn expired_orphan_cannot_be_adopted_and_closed_claim_cannot_be_renewed() {
+    let td = TempDir::new().unwrap();
+    let store = init_store(&td);
+    let source = ids::new_bead_id();
+    let target = ids::new_bead_id();
+    let t_create: Timestamp = "2025-12-31T23:59:59Z".parse().unwrap();
+    let t0: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+    let t1: Timestamp = "2026-01-01T00:00:01Z".parse().unwrap();
+    let t3: Timestamp = "2026-01-01T00:00:03Z".parse().unwrap();
+
+    for (actor, id, title) in [("alice", &source, "source"), ("bob", &target, "target")] {
+        publish::publish_op(
+            &store,
+            &make_create(
+                actor.into(),
+                id.clone(),
+                ScalarSet {
+                    title: Some(title.into()),
+                    ..Default::default()
+                },
+                t_create,
+            ),
+        )
+        .unwrap();
+    }
+
+    let reservation_id = ids::new_reservation_id();
+    let opened = publish::publish_op(
+        &store,
+        &make_reserve_open(
+            "alice".into(),
+            reservation_id.clone(),
+            source.clone(),
+            vec!["src/expired.rs".into()],
+            2,
+            t0,
+        ),
+    )
+    .unwrap();
+    publish::publish_op(
+        &store,
+        &make_claim(
+            "alice".into(),
+            source.clone(),
+            "alice".into(),
+            3600,
+            None,
+            t0,
+        ),
+    )
+    .unwrap();
+    publish::publish_op(
+        &store,
+        &make_claim("bob".into(), target.clone(), "bob".into(), 3600, None, t0),
+    )
+    .unwrap();
+    publish::publish_op(
+        &store,
+        &make_close("alice".into(), source.clone(), Default::default(), t1),
+    )
+    .unwrap();
+
+    let expired = publish::publish_op(
+        &store,
+        &make_reserve_adopt(
+            "bob".into(),
+            reservation_id.clone(),
+            target,
+            opened.as_str().into(),
+            3600,
+            t3,
+        ),
+    )
+    .unwrap();
+    let renew = publish::publish_op(
+        &store,
+        &make_claim(
+            "alice".into(),
+            source.clone(),
+            "alice".into(),
+            3600,
+            None,
+            t1,
+        ),
+    )
+    .unwrap();
+    let release = publish::publish_op(
+        &store,
+        &make_release("alice".into(), source.clone(), None, t1),
+    )
+    .unwrap();
+
+    let state = reducer::replay_store(&store).unwrap();
+    assert!(!state.was_accepted(expired.as_str()));
+    let expired_reason = state.rejection_reason(expired.as_str()).unwrap();
+    assert!(
+        expired_reason.contains("only a still-live orphaned"),
+        "unexpected rejection: {expired_reason}"
+    );
+    assert!(!state.was_accepted(renew.as_str()));
+    assert!(
+        state
+            .rejection_reason(renew.as_str())
+            .unwrap()
+            .contains("cannot claim or renew closed work")
+    );
+    assert!(state.was_accepted(release.as_str()));
+    assert!(state.beads[&source].claim.is_none());
+    assert_eq!(
+        state.reservation_disposition(
+            &state.reservations[&reservation_id],
+            &ids::format_rfc3339(t3)
+        ),
+        LeaseDisposition::Expired
+    );
 }
 
 // Defensive: confirm scalar-set unused-import warning doesn't actually appear.

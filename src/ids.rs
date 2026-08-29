@@ -21,6 +21,26 @@ pub fn new_bead_id() -> String {
     format!("bd-{}", Ulid::new())
 }
 
+pub fn new_candidate_id() -> String {
+    format!("cand-{}", Ulid::new())
+}
+
+/// Derive a stable candidate ULID from an actor-scoped retry identity. This
+/// lets concurrent `candidate propose` retries construct the same immutable
+/// action before either publication is visible.
+pub fn candidate_id_for_retry(store_id: &str, actor: &str, key: &str) -> String {
+    let mut input = Vec::new();
+    input.extend_from_slice(store_id.as_bytes());
+    input.push(0);
+    input.extend_from_slice(actor.as_bytes());
+    input.push(0);
+    input.extend_from_slice(key.as_bytes());
+    let digest = blake3::hash(&input);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    format!("cand-{}", Ulid::from_bytes(bytes))
+}
+
 /// Validate a user-supplied bead id (e.g. when migrating from another tracker
 /// via `mote new --id`). Mote-minted ids start with `bd-`; external ids must
 /// not, so the two namespaces stay distinguishable in op files and CLI output.

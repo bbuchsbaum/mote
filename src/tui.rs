@@ -54,12 +54,28 @@ fn io_err(e: io::Error) -> MoteError {
 enum Tab {
     Overview,
     Beads,
+    Candidates,
     Discussion,
     Activity,
+    Agents,
 }
 
-const TABS: [Tab; 4] = [Tab::Overview, Tab::Beads, Tab::Discussion, Tab::Activity];
-const TAB_TITLES: [&str; 4] = ["Overview", "Beads", "Discussion", "Activity"];
+const TABS: [Tab; 6] = [
+    Tab::Overview,
+    Tab::Beads,
+    Tab::Candidates,
+    Tab::Discussion,
+    Tab::Activity,
+    Tab::Agents,
+];
+const TAB_TITLES: [&str; 6] = [
+    "Overview",
+    "Beads",
+    "Candidates",
+    "Discussion",
+    "Activity",
+    "Agents",
+];
 
 impl Tab {
     fn index(self) -> usize {
@@ -85,8 +101,10 @@ struct App {
 
     // Per-tab selections.
     beads_state: ListState,
+    candidates_state: ListState,
     topics_state: ListState,
     activity_state: ListState,
+    agents_state: ListState,
     discussion_scroll: u16,
     discussion_scroll_max: u16,
     discussion_page_rows: u16,
@@ -100,8 +118,10 @@ struct App {
 
     // Derived caches refreshed on each replay.
     bead_ids: Vec<String>,
+    candidate_ids: Vec<String>,
     topic_names: Vec<String>,
     activity: Vec<ActivityEntry>,
+    actor_names: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -126,8 +146,10 @@ impl App {
             show_help: false,
             store_root: store.root().display().to_string(),
             beads_state: ListState::default(),
+            candidates_state: ListState::default(),
             topics_state: ListState::default(),
             activity_state: ListState::default(),
+            agents_state: ListState::default(),
             discussion_scroll: 0,
             discussion_scroll_max: 0,
             discussion_page_rows: 1,
@@ -136,8 +158,10 @@ impl App {
             post_starts: Vec::new(),
             post_unread: Vec::new(),
             bead_ids: Vec::new(),
+            candidate_ids: Vec::new(),
             topic_names: Vec::new(),
             activity: Vec::new(),
+            actor_names: Vec::new(),
         }
     }
 
@@ -152,8 +176,19 @@ impl App {
                     .collect();
                 self.bead_ids.sort();
 
+                self.candidate_ids = state.candidates.keys().cloned().collect();
+
                 self.topic_names = state.board_topics.keys().cloned().collect();
                 self.topic_names.sort();
+
+                self.actor_names = crate::actor_status::known_actor_names(&state)
+                    .into_iter()
+                    .collect();
+                if let Some(actor) = &self.actor {
+                    self.actor_names.push(actor.clone());
+                    self.actor_names.sort();
+                    self.actor_names.dedup();
+                }
 
                 let mut acts: Vec<ActivityEntry> = Vec::new();
                 for (entity, entries) in &state.history {
@@ -185,16 +220,24 @@ impl App {
                 self.activity = acts;
 
                 clamp_selection(&mut self.beads_state, self.bead_ids.len());
+                clamp_selection(&mut self.candidates_state, self.candidate_ids.len());
                 clamp_selection(&mut self.topics_state, self.topic_names.len());
                 clamp_selection(&mut self.activity_state, self.activity.len());
+                clamp_selection(&mut self.agents_state, self.actor_names.len());
                 if self.beads_state.selected().is_none() && !self.bead_ids.is_empty() {
                     self.beads_state.select(Some(0));
+                }
+                if self.candidates_state.selected().is_none() && !self.candidate_ids.is_empty() {
+                    self.candidates_state.select(Some(0));
                 }
                 if self.topics_state.selected().is_none() && !self.topic_names.is_empty() {
                     self.topics_state.select(Some(0));
                 }
                 if self.activity_state.selected().is_none() && !self.activity.is_empty() {
                     self.activity_state.select(Some(0));
+                }
+                if self.agents_state.selected().is_none() && !self.actor_names.is_empty() {
+                    self.agents_state.select(Some(0));
                 }
 
                 self.state = Some(state);
@@ -399,8 +442,10 @@ impl App {
     fn current_list_mut(&mut self) -> (&mut ListState, usize) {
         match self.tab {
             Tab::Beads => (&mut self.beads_state, self.bead_ids.len()),
+            Tab::Candidates => (&mut self.candidates_state, self.candidate_ids.len()),
             Tab::Discussion => (&mut self.topics_state, self.topic_names.len()),
             Tab::Activity => (&mut self.activity_state, self.activity.len()),
+            Tab::Agents => (&mut self.agents_state, self.actor_names.len()),
             Tab::Overview => (&mut self.beads_state, 0),
         }
     }
@@ -470,8 +515,10 @@ fn event_loop<B: Backend>(
                         (KeyCode::BackTab, _) => app.prev_tab(),
                         (KeyCode::Char('1'), _) => app.tab = Tab::Overview,
                         (KeyCode::Char('2'), _) => app.tab = Tab::Beads,
-                        (KeyCode::Char('3'), _) => app.tab = Tab::Discussion,
-                        (KeyCode::Char('4'), _) => app.tab = Tab::Activity,
+                        (KeyCode::Char('3'), _) => app.tab = Tab::Candidates,
+                        (KeyCode::Char('4'), _) => app.tab = Tab::Discussion,
+                        (KeyCode::Char('5'), _) => app.tab = Tab::Activity,
+                        (KeyCode::Char('6'), _) => app.tab = Tab::Agents,
                         (KeyCode::Right, _) | (KeyCode::Enter, _) if app.tab == Tab::Discussion => {
                             app.focus_posts()
                         }
@@ -570,12 +617,12 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
     if app.tab == Tab::Discussion {
         spans.push(Span::raw(
-            "  q quit · 1-4 tab · ←/→ pane · j/k or n/p post · u unread · PgUp/PgDn scroll · ? help"
+            "  q quit · 1-6 tab · ←/→ pane · j/k or n/p post · u unread · PgUp/PgDn scroll · ? help"
                 .to_string(),
         ));
     } else {
         spans.push(Span::raw(
-            "  q quit · Tab next · 1-4 jump · j/k move · PgUp/PgDn page · r refresh · ? help"
+            "  q quit · Tab next · 1-6 jump · j/k move · PgUp/PgDn page · r refresh · ? help"
                 .to_string(),
         ));
     }
@@ -604,8 +651,10 @@ fn render_body(f: &mut Frame, app: &mut App, area: Rect) {
     match app.tab {
         Tab::Overview => render_overview(f, app, &state, area),
         Tab::Beads => render_beads(f, app, &state, area),
+        Tab::Candidates => render_candidates(f, app, &state, area),
         Tab::Discussion => render_discussion(f, app, &state, area),
         Tab::Activity => render_activity(f, app, &state, area),
+        Tab::Agents => render_agents(f, app, &state, area),
     }
 }
 
@@ -620,12 +669,42 @@ fn render_overview(f: &mut Frame, app: &App, state: &State, area: Rect) {
     let total_beads: usize = counts.values().sum();
     let active_claims: Vec<&Bead> = state
         .live_beads()
-        .filter(|b| b.claim.as_ref().is_some_and(|c| c.is_live(&now)))
+        .filter(|b| state.claim_disposition(b, &now) == crate::state::LeaseDisposition::Active)
         .collect();
     let active_reservations: Vec<_> = state
         .reservations
         .values()
-        .filter(|r| r.is_active(&now))
+        .filter(|r| {
+            state.reservation_disposition(r, &now) == crate::state::LeaseDisposition::Active
+        })
+        .collect();
+    let orphaned_claims: Vec<&Bead> = state
+        .beads
+        .values()
+        .filter(|b| state.claim_disposition(b, &now) == crate::state::LeaseDisposition::Orphaned)
+        .collect();
+    let orphaned_reservations: Vec<_> = state
+        .reservations
+        .values()
+        .filter(|r| {
+            state.reservation_disposition(r, &now) == crate::state::LeaseDisposition::Orphaned
+        })
+        .collect();
+    let expiring_reservations: Vec<_> = state
+        .reservations
+        .values()
+        .filter(|reservation| {
+            state.reservation_expiry_phase(reservation, &now)
+                == Some(crate::state::ReservationExpiryPhase::Expiring)
+        })
+        .collect();
+    let expired_reservations: Vec<_> = state
+        .reservations
+        .values()
+        .filter(|reservation| {
+            state.reservation_expiry_phase(reservation, &now)
+                == Some(crate::state::ReservationExpiryPhase::Expired)
+        })
         .collect();
     let inbox = app
         .actor
@@ -642,6 +721,8 @@ fn render_overview(f: &mut Frame, app: &App, state: &State, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6),
+            Constraint::Min(3),
+            Constraint::Min(3),
             Constraint::Min(3),
             Constraint::Min(3),
         ])
@@ -668,6 +749,8 @@ fn render_overview(f: &mut Frame, app: &App, state: &State, area: Rect) {
         Line::from(vec![
             Span::raw("beads:        "),
             Span::styled(total_beads.to_string(), Style::default().bold()),
+            Span::raw("    candidates: "),
+            Span::styled(state.candidates.len().to_string(), Style::default().bold()),
         ]),
         Line::from(status_line),
         Line::from(vec![
@@ -766,6 +849,76 @@ fn render_overview(f: &mut Frame, app: &App, state: &State, area: Rect) {
                 .title("Active reservations"),
         ),
         chunks[2],
+    );
+
+    let mut orphan_items: Vec<ListItem> = orphaned_claims
+        .iter()
+        .map(|b| {
+            let claim = b.claim.as_ref().expect("orphan disposition requires claim");
+            ListItem::new(format!(
+                "claim {} by {} until {}",
+                b.id, claim.claimed_by, claim.lease_until_ts
+            ))
+        })
+        .collect();
+    orphan_items.extend(orphaned_reservations.iter().map(|r| {
+        ListItem::new(format!(
+            "reservation {} by {} on {}: {}",
+            r.reservation_id,
+            r.actor,
+            r.entity,
+            r.live_paths().join(", ")
+        ))
+    }));
+    if orphan_items.is_empty() {
+        orphan_items.push(ListItem::new(Span::styled(
+            "(none)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(
+        List::new(orphan_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Orphaned leases"),
+        ),
+        chunks[3],
+    );
+
+    let mut expiry_items: Vec<ListItem> = expiring_reservations
+        .iter()
+        .map(|reservation| {
+            ListItem::new(format!(
+                "EXPIRING {} by {} deadline {} — {}",
+                reservation.reservation_id,
+                reservation.actor,
+                reservation.lease_until_ts,
+                reservation.live_paths().join(", ")
+            ))
+        })
+        .collect();
+    expiry_items.extend(expired_reservations.iter().map(|reservation| {
+        ListItem::new(format!(
+            "EXPIRED {} by {} deadline {} reason=ttl_elapsed — {}",
+            reservation.reservation_id,
+            reservation.actor,
+            reservation.lease_until_ts,
+            reservation.live_paths().join(", ")
+        ))
+    }));
+    if expiry_items.is_empty() {
+        expiry_items.push(ListItem::new(Span::styled(
+            "(none)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(
+        List::new(expiry_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Reservation expiry"),
+        ),
+        chunks[4],
     );
 }
 
@@ -950,6 +1103,195 @@ fn bead_detail_lines(state: &State, b: &Bead) -> Vec<Line<'static>> {
                 r.live_paths().join(", ")
             )));
         }
+    }
+    lines
+}
+
+fn render_candidates(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Min(24)])
+        .split(area);
+    let items: Vec<ListItem> = app
+        .candidate_ids
+        .iter()
+        .filter_map(|id| state.candidates.get(id))
+        .map(|candidate| {
+            let landability =
+                state.candidate_landability(&candidate.candidate_id, app.actor.as_deref());
+            let disposition = if landability.landable {
+                "landable".to_string()
+            } else {
+                landability
+                    .reason_codes
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "blocked".into())
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:>10}", candidate.phase.as_str()),
+                    Style::default().fg(candidate_phase_color(candidate.phase)),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    candidate.candidate_id.clone(),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    truncate(&disposition, 28),
+                    if landability.landable {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Red)
+                    },
+                ),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Candidates ({})", app.candidate_ids.len())),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, chunks[0], &mut app.candidates_state);
+
+    let lines = app
+        .candidates_state
+        .selected()
+        .and_then(|index| app.candidate_ids.get(index))
+        .and_then(|id| state.candidates.get(id))
+        .map(|candidate| candidate_detail_lines(state, candidate, app.actor.as_deref()))
+        .unwrap_or_else(|| vec![Line::from("(no selection)")]);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Candidate detail"),
+        ),
+        chunks[1],
+    );
+}
+
+fn candidate_phase_color(phase: crate::candidate::CandidatePhase) -> Color {
+    match phase {
+        crate::candidate::CandidatePhase::Pending => Color::Yellow,
+        crate::candidate::CandidatePhase::Landed => Color::Green,
+        crate::candidate::CandidatePhase::Superseded => Color::Blue,
+        crate::candidate::CandidatePhase::Abandoned => Color::DarkGray,
+    }
+}
+
+fn candidate_detail_lines(
+    state: &State,
+    candidate: &crate::state::CandidateRecord,
+    actor: Option<&str>,
+) -> Vec<Line<'static>> {
+    let landability = state.candidate_landability(&candidate.candidate_id, actor);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                candidate.candidate_id.clone(),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                candidate.phase.as_str().to_string(),
+                Style::default().fg(candidate_phase_color(candidate.phase)),
+            ),
+        ]),
+        Line::from(format!("issue:       {}", candidate.entity)),
+        Line::from(format!("proposer:    {}", candidate.proposer)),
+        Line::from(format!("commit:      {}", candidate.commit_oid)),
+        Line::from(format!("base:        {}", candidate.base_oid)),
+        Line::from(format!("paths:       {}", candidate.paths.join(", "))),
+        Line::from(format!("authorizer:  {}", candidate.authorizer)),
+    ];
+    let reviews = candidate
+        .reviewers
+        .iter()
+        .map(|reviewer| {
+            let verdict = candidate
+                .reviews
+                .get(reviewer)
+                .map(|review| review.verdict.as_str())
+                .unwrap_or("missing");
+            format!("{reviewer}={verdict}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(Line::from(format!("reviews:     {reviews}")));
+    let evidence = candidate
+        .evidence
+        .values()
+        .map(|receipt| {
+            format!(
+                "{}:{}={}",
+                receipt.name,
+                receipt.producer,
+                receipt.outcome.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(Line::from(format!(
+        "evidence:    {}",
+        if evidence.is_empty() {
+            "none"
+        } else {
+            evidence.as_str()
+        }
+    )));
+    let authorization = candidate
+        .authorization
+        .as_ref()
+        .map(|authorization| {
+            format!(
+                "{} [{}]",
+                authorization.status.as_str(),
+                authorization.grantees.join(",")
+            )
+        })
+        .unwrap_or_else(|| "absent".into());
+    lines.push(Line::from(format!("authorization: {authorization}")));
+    let now = ids::format_rfc3339(Timestamp::now());
+    for reservation in state.candidate_reservations(&candidate.candidate_id) {
+        lines.push(Line::from(format!(
+            "reservation: {} {} by {} — {}",
+            reservation.reservation_id,
+            state.reservation_disposition(reservation, &now).as_str(),
+            reservation.actor,
+            reservation.live_paths().join(", ")
+        )));
+    }
+    if let Some(successor) = &candidate.successor_id {
+        lines.push(Line::from(format!("successor:   {successor}")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("landability: ", Style::default().fg(Color::DarkGray)),
+        if landability.landable {
+            Span::styled("landable", Style::default().fg(Color::Green).bold())
+        } else {
+            Span::styled("blocked", Style::default().fg(Color::Red).bold())
+        },
+    ]));
+    for reason in landability.reasons {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}", reason.code),
+                Style::default().fg(Color::Red),
+            ),
+            Span::raw(format!(" — {}", reason.detail)),
+        ]));
     }
     lines
 }
@@ -1277,6 +1619,22 @@ fn post_header_spans(
             Style::default().fg(Color::Magenta),
         ));
     }
+    if post.retracted {
+        spans.push(Span::styled(
+            "  RETRACTED",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some(replacement) = post.superseded_by.as_deref() {
+        spans.push(Span::styled(
+            format!("  SUPERSEDED -> {}", truncate(replacement, 16)),
+            Style::default().fg(Color::Red),
+        ));
+    } else if !post.supersedes.is_empty() {
+        spans.push(Span::styled(
+            format!("  ACTIVE replaces {}", post.supersedes.len()),
+            Style::default().fg(Color::Green),
+        ));
+    }
     // Indentation already says "reply"; only call it out when the parent is
     // somewhere else and there is no visible nesting.
     if depth == 0 && post.reply_to.is_some() {
@@ -1497,6 +1855,164 @@ fn activity_detail_lines(e: &ActivityEntry) -> Vec<Line<'static>> {
     lines
 }
 
+fn render_agents(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
+    let as_of = Timestamp::now();
+    let statuses = crate::actor_status::actor_statuses(
+        state,
+        app.actor.as_deref(),
+        as_of,
+        crate::actor_status::DEFAULT_RECENT_WINDOW_S,
+    );
+    let horizontal = area.width >= 72;
+    let chunks = Layout::default()
+        .direction(if horizontal {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
+        .constraints(if horizontal {
+            [Constraint::Percentage(45), Constraint::Min(28)]
+        } else {
+            [Constraint::Percentage(42), Constraint::Min(5)]
+        })
+        .split(area);
+    let summary_width = chunks[0].width.saturating_sub(4) as usize;
+    let items: Vec<ListItem> = statuses
+        .iter()
+        .map(|status| ListItem::new(agent_summary(status, summary_width)))
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Agents ({})", statuses.len())),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, chunks[0], &mut app.agents_state);
+
+    let detail = app
+        .agents_state
+        .selected()
+        .and_then(|index| statuses.get(index))
+        .map(agent_detail_lines)
+        .unwrap_or_else(|| vec![Line::from("(no identified agents)")]);
+    f.render_widget(
+        Paragraph::new(detail).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Presence detail"),
+        ),
+        chunks[1],
+    );
+}
+
+fn agent_summary(status: &crate::actor_status::ActorStatus, width: usize) -> String {
+    let current = if status.current { "*" } else { " " };
+    let summary = format!(
+        "{current}{}  {} ({})  sessions={} inbox={} requests={}",
+        status.actor,
+        status.presence.state,
+        status.presence.reason,
+        status.presence.live_session_count,
+        status.attention.inbox_unacked,
+        status.attention.incoming_open_requests,
+    );
+    truncate(&summary, width.max(1))
+}
+
+fn agent_detail_lines(status: &crate::actor_status::ActorStatus) -> Vec<Line<'static>> {
+    let intents = if status.intent.states.is_empty() {
+        "-".to_string()
+    } else {
+        status.intent.states.join(",")
+    };
+    let mut lines = vec![
+        agent_field("actor:       ", status.actor.clone()),
+        agent_field("state:       ", status.presence.state.clone()),
+        agent_field("source:      ", status.presence.source.clone()),
+        agent_field("reason:      ", status.presence.reason.clone()),
+        agent_field("as-of:       ", status.as_of_ts.clone()),
+        agent_field(
+            "lease-until: ",
+            status
+                .presence
+                .latest_lease_until_ts
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+        ),
+        agent_field("intent:      ", intents),
+        agent_field(
+            "observed:    ",
+            activity_label(status.activity.last_observed.as_ref()),
+        ),
+        agent_field(
+            "work:        ",
+            activity_label(status.activity.last_work.as_ref()),
+        ),
+        agent_field(
+            "interaction: ",
+            activity_label(status.activity.last_interaction.as_ref()),
+        ),
+        agent_field(
+            "attention:   ",
+            format!(
+                "inbox={} requests={} discussion={} notifications={}",
+                status.attention.inbox_unacked,
+                status.attention.incoming_open_requests,
+                status.attention.discussion_unread,
+                status.attention.topic_notifications_unread,
+            ),
+        ),
+        agent_field(
+            "work sets:   ",
+            format!(
+                "claims={} reservations={} doing={} candidates={}",
+                status.work.active_claims.len(),
+                status.work.active_reservations.len(),
+                status.work.doing_beads.len(),
+                status.work.candidates.len(),
+            ),
+        ),
+    ];
+    if !status.sessions.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "sessions:",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )));
+        for session in &status.sessions {
+            let intent = session
+                .intent
+                .as_ref()
+                .map(|intent| intent.state.as_str())
+                .unwrap_or("-");
+            lines.push(Line::from(format!(
+                "{}  live={} lease={} intent={}",
+                session.session_id, session.live, session.lease_until_ts, intent
+            )));
+        }
+    }
+    lines
+}
+
+fn agent_field(label: &'static str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::DarkGray)),
+        Span::raw(value),
+    ])
+}
+
+fn activity_label(evidence: Option<&crate::actor_status::ActivityEvidence>) -> String {
+    evidence
+        .map(|evidence| format!("{} {}", evidence.ts, evidence.event_type))
+        .unwrap_or_else(|| "-".into())
+}
+
 fn render_help(f: &mut Frame, area: Rect) {
     let w = area.width.saturating_sub(20).min(60);
     let h = 20u16.min(area.height.saturating_sub(4));
@@ -1517,7 +2033,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from("q, Esc        quit"),
         Line::from("Tab / S-Tab   next / prev tab"),
-        Line::from("1 2 3 4       jump to tab"),
+        Line::from("1 2 3 4 5 6   jump to tab"),
         Line::from("j/k or ↑/↓    move selection"),
         Line::from("g / G         first / last item"),
         Line::from("PgUp / PgDn   page list; in Discussion, scroll posts"),
@@ -1560,7 +2076,11 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::BoardPostRecord;
+    use crate::candidate::{
+        CandidateEvidencePayload, CandidatePhase, EvidenceOutcome, EvidenceRequirement,
+        GIT_ANCESTRY_EVIDENCE, GitAncestryReceipt,
+    };
+    use crate::state::{BoardPostRecord, CandidateEvidenceRecord, CandidateRecord};
 
     fn test_app() -> App {
         App {
@@ -1572,8 +2092,10 @@ mod tests {
             show_help: false,
             store_root: ".mote".into(),
             beads_state: ListState::default(),
+            candidates_state: ListState::default(),
             topics_state: ListState::default(),
             activity_state: ListState::default(),
+            agents_state: ListState::default(),
             discussion_scroll: 0,
             discussion_scroll_max: 0,
             discussion_page_rows: 1,
@@ -1582,8 +2104,10 @@ mod tests {
             post_starts: Vec::new(),
             post_unread: Vec::new(),
             bead_ids: Vec::new(),
+            candidate_ids: Vec::new(),
             topic_names: Vec::new(),
             activity: Vec::new(),
+            actor_names: Vec::new(),
         }
     }
 
@@ -1592,6 +2116,126 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn agent_view_is_explicit_and_useful_at_narrow_widths() {
+        let as_of: Timestamp = "2026-08-29T12:00:00Z".parse().unwrap();
+        let mut status = crate::actor_status::actor_status(
+            &State::default(),
+            "alice",
+            Some("alice"),
+            as_of,
+            600,
+        );
+        for suffix in ["A", "B"] {
+            status.sessions.push(crate::actor_status::SessionStatus {
+                session_id: format!("sess-{suffix}"),
+                actor: "alice".into(),
+                label: None,
+                pid: None,
+                ttl_s: 300,
+                started_ts: "2026-08-29T11:55:00Z".into(),
+                started_op_id: format!("op-start-{suffix}"),
+                last_heartbeat_ts: "2026-08-29T11:59:00Z".into(),
+                last_heartbeat_op_id: format!("op-heartbeat-{suffix}"),
+                lease_until_ts: "2026-08-29T12:04:00Z".into(),
+                ended_ts: None,
+                ended_op_id: None,
+                live: true,
+                intent: None,
+            });
+        }
+
+        let summary = agent_summary(&status, 28);
+        assert!(summary.chars().count() <= 28);
+        assert!(summary.contains("alice"));
+        assert!(!summary.to_ascii_lowercase().contains("online"));
+
+        let detail = agent_detail_lines(&status)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(detail.contains("source:      none"));
+        assert!(detail.contains("reason:      no_presence_evidence"));
+        assert!(detail.contains("as-of:       2026-08-29T12:00:00"));
+        assert!(detail.contains("sess-A"));
+        assert!(detail.contains("sess-B"));
+    }
+
+    #[test]
+    fn candidate_detail_distinguishes_unavailable_git_evidence_from_landable() {
+        let candidate_id = "cand-01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let payload = CandidateEvidencePayload::GitAncestry(GitAncestryReceipt {
+            repository_id: "repo-test".into(),
+            object_format: "sha1".into(),
+            common_dir_hash: String::new(),
+            commit_oid: commit.clone(),
+            base_oid: "1111111111111111111111111111111111111111".into(),
+            parent_oids: vec!["1111111111111111111111111111111111111111".into()],
+            base_is_ancestor: None,
+            candidate_relations: Vec::new(),
+            covered_candidates: Vec::new(),
+            git_version: "unavailable".into(),
+            detail: Some("shallow clone".into()),
+        });
+        let mut evidence = std::collections::BTreeMap::new();
+        evidence.insert(
+            (GIT_ANCESTRY_EVIDENCE.into(), "proposer".into()),
+            CandidateEvidenceRecord {
+                producer: "proposer".into(),
+                producer_tool: "unavailable".into(),
+                evidence_id: crate::candidate::evidence_id(&payload).unwrap(),
+                name: GIT_ANCESTRY_EVIDENCE.into(),
+                evidence_kind: "git".into(),
+                candidate_oid: commit.clone(),
+                outcome: EvidenceOutcome::Unavailable,
+                payload,
+                refs: Vec::new(),
+                op_id: "op-evidence".into(),
+                ts: "2026-08-29T00:00:00Z".into(),
+            },
+        );
+        let candidate = CandidateRecord {
+            candidate_id: candidate_id.clone(),
+            entity: "bd-test".into(),
+            proposer: "proposer".into(),
+            proposal_op_id: "op-proposal".into(),
+            store_id: "st-test".into(),
+            repository_id: "repo-test".into(),
+            object_format: "sha1".into(),
+            commit_oid: commit,
+            base_oid: "1111111111111111111111111111111111111111".into(),
+            parent_oids: vec!["1111111111111111111111111111111111111111".into()],
+            paths: vec!["src/lib.rs".into()],
+            authorizer: "authorizer".into(),
+            reviewers: vec!["reviewer".into()],
+            evidence_requirements: vec![EvidenceRequirement {
+                name: GIT_ANCESTRY_EVIDENCE.into(),
+                kind: "git".into(),
+                producers: vec!["proposer".into()],
+            }],
+            evidence_refs: Vec::new(),
+            phase: CandidatePhase::Pending,
+            phase_op_id: "op-proposal".into(),
+            successor_id: None,
+            reviews: std::collections::BTreeMap::new(),
+            evidence,
+            authorization: None,
+            landed: None,
+        };
+        let mut state = State::default();
+        state.candidates.insert(candidate_id.clone(), candidate);
+        let text = candidate_detail_lines(&state, &state.candidates[&candidate_id], None)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("git_evidence_unavailable"));
+        assert!(text.contains("authorization_absent"));
+        assert!(!text.contains("landability: landable"));
     }
 
     #[test]
@@ -1747,9 +2391,19 @@ mod tests {
             topic: "planning".into(),
             body: body.into(),
             reply_to: reply_to.map(String::from),
+            answers: Vec::new(),
+            explicit_notify: Vec::new(),
+            notification_recipients: Vec::new(),
+            idempotency_key: None,
             post_kind: "post".into(),
             sticky: false,
             sticky_op_id: None,
+            superseded_by: None,
+            superseded_op_id: None,
+            supersedes: Vec::new(),
+            retracted: false,
+            retraction_reason: None,
+            retracted_op_id: None,
             route: Default::default(),
             sent_ts: "2026-05-14T09:31:07Z".into(),
             sent_op_id: format!("op-{id}"),
@@ -1758,6 +2412,29 @@ mod tests {
 
     fn rendered(state: &State, cursor: usize) -> RenderedThread {
         discussion_post_lines(state, "planning", 60, cursor, &HashSet::new(), true)
+    }
+
+    #[test]
+    fn discussion_headers_expose_superseded_and_retracted_posts() {
+        let mut state = State::default();
+        let mut old = post("post-old", "alice", "old", None);
+        old.superseded_by = Some("post-new".into());
+        state.board_posts.insert(old.post_id.clone(), old);
+        let mut withdrawn = post("post-withdrawn", "alice", "bad premise", None);
+        withdrawn.retracted = true;
+        withdrawn.retraction_reason = Some("incorrect".into());
+        withdrawn.sent_op_id = "op-z".into();
+        state
+            .board_posts
+            .insert(withdrawn.post_id.clone(), withdrawn);
+        let text = rendered(&state, 0)
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("SUPERSEDED -> post-new"), "{text}");
+        assert!(text.contains("RETRACTED"), "{text}");
     }
 
     #[test]
