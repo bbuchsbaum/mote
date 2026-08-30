@@ -1581,7 +1581,14 @@ fn ancestry_outcome(
                 relation.relation,
                 crate::candidate::GitRelationKind::Unavailable
                     | crate::candidate::GitRelationKind::Ambiguous
-            )
+            ) || matches!(
+                relation.base_relation,
+                None | Some(
+                    crate::candidate::GitRelationKind::Unavailable
+                        | crate::candidate::GitRelationKind::Ambiguous
+                )
+            ) || relation.base_relation == Some(crate::candidate::GitRelationKind::Ancestor)
+                && relation.relation == crate::candidate::GitRelationKind::NotAncestor
         })
     {
         crate::candidate::EvidenceOutcome::Ambiguous
@@ -2002,6 +2009,7 @@ fn cmd_candidate_evidence(
                             candidate_id: other.candidate_id.clone(),
                             proposal_op_id: other.proposal_op_id.clone(),
                             commit_oid: other.commit_oid.clone(),
+                            base_relation: Some(crate::candidate::GitRelationKind::Unavailable),
                             relation: crate::candidate::GitRelationKind::Unavailable,
                         });
                         covered_candidates
@@ -4018,6 +4026,12 @@ fn print_message_send_result(
                 ""
             }
         );
+        if message.recipient_presence.state != "live" {
+            eprintln!(
+                "recipient is not live; public fallback: mote discuss post --topic <topic> --notify {} --body -",
+                message.to
+            );
+        }
     }
     Ok(())
 }

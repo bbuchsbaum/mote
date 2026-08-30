@@ -830,7 +830,18 @@ fn every_named_write_route_publishes_existing_ops_under_the_header_actor() {
         }),
     );
     assert_eq!(status, 201);
-    let message_id = message.unwrap()["msg_id"].as_str().unwrap().to_string();
+    let message = message.unwrap();
+    assert_eq!(message["accepted"], true);
+    assert_eq!(message["delivery"], "queued");
+    assert_eq!(message["recipient"], "web-bob");
+    assert_eq!(message["recipient_presence"]["state"], "recent");
+    assert_eq!(message["recipient_presence"]["source"], "accepted_activity");
+    assert_eq!(
+        message["recipient_presence"]["reason"],
+        "sessionless_recent_activity"
+    );
+    assert_eq!(message["idempotent_replay"], false);
+    let message_id = message["msg_id"].as_str().unwrap().to_string();
     let before_retry = store.list_op_filenames().unwrap().len();
     let (retry_status, retry) = write_json(
         &store,
@@ -843,7 +854,10 @@ fn every_named_write_route_publishes_existing_ops_under_the_header_actor() {
         }),
     );
     assert_eq!(retry_status, 200);
-    assert_eq!(retry.unwrap()["msg_id"], message_id);
+    let retry = retry.unwrap();
+    assert_eq!(retry["msg_id"], message_id);
+    assert_eq!(retry["recipient_presence"], message["recipient_presence"]);
+    assert_eq!(retry["idempotent_replay"], true);
     assert_eq!(store.list_op_filenames().unwrap().len(), before_retry);
     assert_eq!(
         write_json(

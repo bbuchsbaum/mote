@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use mote::candidate::{
     AuthorizationStatus, CandidateEvidencePayload, EvidenceOutcome, EvidenceRequirement,
     GIT_ANCESTRY_EVIDENCE, GIT_LANDING_EVIDENCE, GitAncestryReceipt, GitCandidateRelation,
-    GitLandingReceipt, GitRelationKind, ReviewVerdict,
+    GitLandingReceipt, GitRelationKind, KnownCandidate, ReviewVerdict,
 };
 use mote::ids;
 use mote::op::{
@@ -169,6 +169,23 @@ fn authorize(candidate_id: &str, key: &str) -> Op {
     })
 }
 
+fn abandon(store: &Store, candidate_id: &str, key: &str) {
+    let state = reducer::replay_store(store).unwrap();
+    publish_checked(
+        store,
+        &Op::CandidateAbandon(CandidateAbandonOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "authorizer".into(),
+            candidate_id: candidate_id.into(),
+            expect_phase: state.candidates[candidate_id].phase_op_id.clone(),
+            reason: Some("did not govern the landing".into()),
+            idempotency_key: key.into(),
+        }),
+    );
+}
+
 #[test]
 fn happy_path_consumes_authorization_and_is_replay_deterministic() {
     let (_temp, store, issue) = setup();
@@ -327,6 +344,7 @@ fn hidden_pending_ancestor_blocks_until_superseded_by_descendant() {
                     candidate_id: old.clone(),
                     proposal_op_id: old_proposal,
                     commit_oid: COMMIT_A.into(),
+                    base_relation: Some(GitRelationKind::NotAncestor),
                     relation: GitRelationKind::Ancestor,
                 }],
             ),
@@ -365,6 +383,106 @@ fn hidden_pending_ancestor_blocks_until_superseded_by_descendant() {
         ),
         LeaseDisposition::Orphaned
     );
+}
+
+#[test]
+fn abandoned_ancestor_blocks_only_when_introduced_after_base_and_ambiguity_fails_closed() {
+    let (_temp, store, issue) = setup();
+    let old = ids::new_candidate_id();
+    let new = ids::new_candidate_id();
+    let old_proposal = publish_checked(
+        &store,
+        &proposal(&old, &issue, COMMIT_A, "propose-abandoned"),
+    );
+    abandon(&store, &old, "abandon-old");
+    publish_checked(
+        &store,
+        &proposal(&new, &issue, COMMIT_B, "propose-descendant"),
+    );
+    publish_checked(&store, &approve(&new, "review-descendant"));
+    publish_checked(&store, &authorize(&new, "authorize-descendant"));
+
+    let record_relation = |base_relation, relation, key| {
+        publish_checked(
+            &store,
+            &evidence(
+                &new,
+                ancestry_payload(
+                    &new,
+                    COMMIT_B,
+                    vec![(old.clone(), old_proposal.clone())],
+                    vec![GitCandidateRelation {
+                        candidate_id: old.clone(),
+                        proposal_op_id: old_proposal.clone(),
+                        commit_oid: COMMIT_A.into(),
+                        base_relation,
+                        relation,
+                    }],
+                ),
+                key,
+            ),
+        );
+        reducer::replay_store(&store)
+            .unwrap()
+            .candidate_landability(&new, Some("lander"))
+    };
+
+    // Court A: the abandoned commit adds nothing relative to the immutable base.
+    let already_in_base = record_relation(
+        Some(GitRelationKind::Ancestor),
+        GitRelationKind::Ancestor,
+        "already-in-base",
+    );
+    assert!(already_in_base.landable, "{already_in_base:?}");
+    assert!(
+        !already_in_base
+            .reason_codes
+            .contains(&"ancestor_abandoned".into())
+    );
+
+    // Court B: the candidate introduces the abandoned commit after its base.
+    let introduced = record_relation(
+        Some(GitRelationKind::NotAncestor),
+        GitRelationKind::Ancestor,
+        "introduced-after-base",
+    );
+    assert!(!introduced.landable);
+    assert!(
+        introduced
+            .reason_codes
+            .contains(&"ancestor_abandoned".into())
+    );
+
+    // Court C: ambiguous and legacy-missing base proof both fail closed without
+    // pretending that introduced-after-base was actually established.
+    let ambiguous = record_relation(
+        Some(GitRelationKind::Ambiguous),
+        GitRelationKind::Ancestor,
+        "ambiguous-base",
+    );
+    assert!(!ambiguous.landable);
+    assert!(
+        ambiguous
+            .reason_codes
+            .contains(&"ancestor_ambiguous".into())
+    );
+    assert!(
+        !ambiguous
+            .reason_codes
+            .contains(&"ancestor_abandoned".into())
+    );
+
+    let legacy = record_relation(None, GitRelationKind::Ancestor, "legacy-missing-base");
+    assert!(!legacy.landable);
+    assert!(legacy.reason_codes.contains(&"ancestor_ambiguous".into()));
+
+    // Court E: an abandoned commit on an unrelated branch remains irrelevant.
+    let unrelated = record_relation(
+        Some(GitRelationKind::NotAncestor),
+        GitRelationKind::NotAncestor,
+        "unrelated-branch",
+    );
+    assert!(unrelated.landable, "{unrelated:?}");
 }
 
 #[test]
@@ -727,6 +845,70 @@ fn run_mote(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn git_probe_distinguishes_already_in_base_introduced_and_unrelated_relations() {
+    let temp = TempDir::new().unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "Test"]);
+    std::fs::write(temp.path().join("work.txt"), "root\n").unwrap();
+    run_git(temp.path(), &["add", "work.txt"]);
+    run_git(temp.path(), &["commit", "-qm", "root"]);
+    let root = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(temp.path().join("work.txt"), "known\n").unwrap();
+    run_git(temp.path(), &["commit", "-qam", "known candidate"]);
+    let known_oid = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(temp.path().join("work.txt"), "descendant\n").unwrap();
+    run_git(temp.path(), &["commit", "-qam", "descendant"]);
+    let descendant = run_git(temp.path(), &["rev-parse", "HEAD"]);
+
+    let identity =
+        mote::candidate::probe_ancestry(temp.path(), &descendant, &known_oid, &[]).unwrap();
+    let known = [KnownCandidate {
+        candidate_id: "cand-known".into(),
+        proposal_op_id: "op-known".into(),
+        repository_id: identity.repository_id,
+        commit_oid: known_oid.clone(),
+    }];
+
+    let already =
+        mote::candidate::probe_ancestry(temp.path(), &descendant, &known_oid, &known).unwrap();
+    assert_eq!(
+        already.candidate_relations[0].base_relation,
+        Some(GitRelationKind::Ancestor)
+    );
+    assert_eq!(
+        already.candidate_relations[0].relation,
+        GitRelationKind::Ancestor
+    );
+
+    let introduced =
+        mote::candidate::probe_ancestry(temp.path(), &descendant, &root, &known).unwrap();
+    assert_eq!(
+        introduced.candidate_relations[0].base_relation,
+        Some(GitRelationKind::NotAncestor)
+    );
+    assert_eq!(
+        introduced.candidate_relations[0].relation,
+        GitRelationKind::Ancestor
+    );
+
+    run_git(temp.path(), &["checkout", "-qb", "unrelated", &root]);
+    std::fs::write(temp.path().join("work.txt"), "unrelated\n").unwrap();
+    run_git(temp.path(), &["commit", "-qam", "unrelated"]);
+    let unrelated_oid = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    let unrelated =
+        mote::candidate::probe_ancestry(temp.path(), &unrelated_oid, &root, &known).unwrap();
+    assert_eq!(
+        unrelated.candidate_relations[0].base_relation,
+        Some(GitRelationKind::NotAncestor)
+    );
+    assert_eq!(
+        unrelated.candidate_relations[0].relation,
+        GitRelationKind::NotAncestor
+    );
+}
+
+#[test]
 fn candidate_cli_happy_path_and_json_schema() {
     let temp = TempDir::new().unwrap();
     run_git(temp.path(), &["init", "-q"]);
@@ -1012,4 +1194,200 @@ fn candidate_cli_happy_path_and_json_schema() {
             .iter()
             .all(|event| event["type"] != "candidate.proposed")
     );
+}
+
+#[test]
+fn evidence_refresh_clears_abandoned_commit_already_in_base_without_rewriting_history() {
+    let temp = TempDir::new().unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "Test"]);
+    std::fs::write(temp.path().join("work.txt"), "root\n").unwrap();
+    run_git(temp.path(), &["add", "work.txt"]);
+    run_git(temp.path(), &["commit", "-qm", "root"]);
+    let root = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(temp.path().join("work.txt"), "landed\n").unwrap();
+    run_git(
+        temp.path(),
+        &["commit", "-qam", "landed outside candidate flow"],
+    );
+    let landed = run_git(temp.path(), &["rev-parse", "HEAD"]);
+
+    let store = Store::init(temp.path()).unwrap();
+    let issue = ids::new_bead_id();
+    publish::publish_op(
+        &store,
+        &make_create(
+            "proposer".into(),
+            issue.clone(),
+            ScalarSet {
+                title: Some("Base-relative refresh".into()),
+                ..Default::default()
+            },
+            Timestamp::now(),
+        ),
+    )
+    .unwrap();
+
+    let old = run_mote(
+        temp.path(),
+        &[
+            "--json",
+            "--actor",
+            "proposer",
+            "candidate",
+            "propose",
+            "--issue",
+            &issue,
+            "--commit",
+            &landed,
+            "--base",
+            &root,
+            "--path",
+            "work.txt",
+            "--authorizer",
+            "authorizer",
+            "--reviewer",
+            "reviewer",
+            "--idempotency-key",
+            "old-candidate",
+        ],
+    );
+    assert!(
+        old.status.success(),
+        "{}",
+        String::from_utf8_lossy(&old.stderr)
+    );
+    let old: serde_json::Value = serde_json::from_slice(&old.stdout).unwrap();
+    let old_id = old["candidate_id"].as_str().unwrap().to_string();
+    abandon(&store, &old_id, "honest-abandon-after-landing");
+
+    std::fs::write(temp.path().join("work.txt"), "descendant\n").unwrap();
+    run_git(temp.path(), &["commit", "-qam", "later candidate"]);
+    let new = run_mote(
+        temp.path(),
+        &[
+            "--json",
+            "--actor",
+            "proposer",
+            "candidate",
+            "propose",
+            "--issue",
+            &issue,
+            "--base",
+            &landed,
+            "--path",
+            "work.txt",
+            "--authorizer",
+            "authorizer",
+            "--reviewer",
+            "reviewer",
+            "--idempotency-key",
+            "new-candidate",
+        ],
+    );
+    assert!(
+        new.status.success(),
+        "{}",
+        String::from_utf8_lossy(&new.stderr)
+    );
+    let new: serde_json::Value = serde_json::from_slice(&new.stdout).unwrap();
+    let new_id = new["candidate_id"].as_str().unwrap().to_string();
+    publish_checked(&store, &approve(&new_id, "review-refreshed"));
+    publish_checked(&store, &authorize(&new_id, "authorize-refreshed"));
+    assert!(
+        reducer::replay_store(&store)
+            .unwrap()
+            .candidate_landability(&new_id, Some("lander"))
+            .landable
+    );
+
+    // Simulate the accepted legacy receipt that knew the old commit reached
+    // the tip but did not record its relation to the immutable base.
+    let state = reducer::replay_store(&store).unwrap();
+    let current = state.candidates[&new_id]
+        .evidence
+        .values()
+        .find(|record| record.name == GIT_ANCESTRY_EVIDENCE)
+        .unwrap();
+    let mut legacy_payload = current.payload.clone();
+    let CandidateEvidencePayload::GitAncestry(legacy) = &mut legacy_payload else {
+        panic!("expected ancestry receipt")
+    };
+    let old_relation = legacy
+        .candidate_relations
+        .iter_mut()
+        .find(|relation| relation.candidate_id == old_id)
+        .unwrap();
+    assert_eq!(old_relation.base_relation, Some(GitRelationKind::Ancestor));
+    assert_eq!(old_relation.relation, GitRelationKind::Ancestor);
+    old_relation.base_relation = None;
+    publish_checked(
+        &store,
+        &Op::CandidateEvidence(CandidateEvidenceOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "proposer".into(),
+            candidate_id: new_id.clone(),
+            candidate_oid: state.candidates[&new_id].commit_oid.clone(),
+            evidence_id: mote::candidate::evidence_id(&legacy_payload).unwrap(),
+            name: GIT_ANCESTRY_EVIDENCE.into(),
+            evidence_kind: "git".into(),
+            producer_tool: "legacy git probe".into(),
+            outcome: EvidenceOutcome::Pass,
+            payload: legacy_payload,
+            refs: Vec::new(),
+            idempotency_key: "legacy-receipt".into(),
+        }),
+    );
+    let blocked = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_landability(&new_id, Some("lander"));
+    assert!(!blocked.landable);
+    assert!(blocked.reason_codes.contains(&"ancestor_ambiguous".into()));
+
+    let before_refresh = store.list_op_filenames().unwrap().len();
+    let refreshed = run_mote(
+        temp.path(),
+        &[
+            "--json",
+            "--actor",
+            "proposer",
+            "candidate",
+            "evidence",
+            "refresh",
+            &new_id,
+            "--idempotency-key",
+            "refresh-base-relative-proof",
+        ],
+    );
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    assert_eq!(store.list_op_filenames().unwrap().len(), before_refresh + 1);
+    let state = reducer::replay_store(&store).unwrap();
+    assert_eq!(state.candidates[&old_id].phase.as_str(), "abandoned");
+    assert!(
+        state
+            .candidate_landability(&new_id, Some("lander"))
+            .landable
+    );
+    let refreshed = state.candidates[&new_id]
+        .evidence
+        .values()
+        .find(|record| record.name == GIT_ANCESTRY_EVIDENCE)
+        .unwrap();
+    let CandidateEvidencePayload::GitAncestry(refreshed) = &refreshed.payload else {
+        panic!("expected ancestry receipt")
+    };
+    let relation = refreshed
+        .candidate_relations
+        .iter()
+        .find(|relation| relation.candidate_id == old_id)
+        .unwrap();
+    assert_eq!(relation.base_relation, Some(GitRelationKind::Ancestor));
+    assert_eq!(relation.relation, GitRelationKind::Ancestor);
 }

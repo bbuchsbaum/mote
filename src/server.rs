@@ -21,7 +21,7 @@ use crate::op::{self, Op, ScalarSet, Status};
 use crate::publish;
 use crate::reducer;
 use crate::repo::Store;
-use crate::state::State;
+use crate::state::{MsgRecord, State};
 
 const MAX_REQUEST_LINE: usize = 8 * 1024;
 const MAX_HEADERS: usize = 32 * 1024;
@@ -1975,10 +1975,7 @@ fn send_message(request: &Request, context: &ServerContext) -> Result<HttpRespon
                 && existing.answers == input.answers
                 && existing.require_live == input.require_live
             {
-                return HttpResponse::json(
-                    200,
-                    json!({"msg_id": existing.msg_id, "idempotent_replay": true}),
-                );
+                return HttpResponse::json(200, message_send_json(existing, true));
             }
             return Err(ApiError::message(
                 422,
@@ -2004,7 +2001,26 @@ fn send_message(request: &Request, context: &ServerContext) -> Result<HttpRespon
         jiff::Timestamp::now(),
     );
     publish_and_verify(context, &[operation], None)?;
-    HttpResponse::json(201, json!({"msg_id": msg_id}))
+    let fresh = reducer::replay_store(&context.store).map_err(ApiError::internal)?;
+    let message = fresh
+        .messages
+        .get(&msg_id)
+        .ok_or_else(|| ApiError::internal("accepted send did not produce a message record"))?;
+    HttpResponse::json(201, message_send_json(message, false))
+}
+
+fn message_send_json(message: &MsgRecord, idempotent_replay: bool) -> Value {
+    json!({
+        "accepted": true,
+        "msg_id": message.msg_id,
+        "delivery": "queued",
+        "addressed": true,
+        "private": false,
+        "require_live": message.require_live,
+        "idempotent_replay": idempotent_replay,
+        "recipient": message.to,
+        "recipient_presence": message.recipient_presence,
+    })
 }
 
 fn ack_message(

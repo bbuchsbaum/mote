@@ -1,6 +1,7 @@
 import type {
   Actor, Board, BeadDetail, BeadQuery, BeadRow, HistoryEntry, Message,
-  MoteEvent, NewBeadInput, NoteKind, Post, ScalarField, Topic, Unrouted,
+  DiscussionPostOptions, MessageSendResult, MoteEvent, NewBeadInput, NoteKind,
+  Post, ScalarField, Topic, Unrouted,
 } from "./types";
 
 /**
@@ -55,7 +56,12 @@ export interface MoteClient {
 
   // discussion writes
   createTopic(topic: string, title: string, body?: string): Promise<void>;
-  post(topic: string, body: string, replyTo?: string | null): Promise<{ post_id: string }>;
+  post(
+    topic: string,
+    body: string,
+    replyTo?: string | null,
+    options?: DiscussionPostOptions,
+  ): Promise<{ post_id: string }>;
   setSticky(postId: string, sticky: boolean): Promise<void>;
   promote(postId: string, title: string, body: string, priority?: number, tags?: string[]): Promise<{ id: string }>;
   route(postId: string, issue: string): Promise<void>;
@@ -64,7 +70,13 @@ export interface MoteClient {
   markRead(topic?: string): Promise<void>;
 
   // message writes
-  sendMessage(to: string, body: string, kind: string, entity?: string | null): Promise<void>;
+  sendMessage(
+    to: string,
+    body: string,
+    kind: string,
+    entity?: string | null,
+    idempotencyKey?: string,
+  ): Promise<MessageSendResult>;
   ackMessage(msgId: string): Promise<void>;
   replyMessage(msgId: string, body: string, kind: "response" | "decline"): Promise<void>;
   resolveRequest(msgId: string): Promise<void>;
@@ -147,8 +159,13 @@ export class HttpClient implements MoteClient {
   createTopic(topic: string, title: string, body?: string) {
     return this.req<void>("POST", "/topics", { topic, title, body });
   }
-  post(topic: string, body: string, replyTo?: string | null) {
-    return this.req<{ post_id: string }>("POST", `/topics/${encodeURIComponent(topic)}/posts`, { body, reply_to: replyTo ?? null });
+  post(topic: string, body: string, replyTo?: string | null, options: DiscussionPostOptions = {}) {
+    return this.req<{ post_id: string }>("POST", `/topics/${encodeURIComponent(topic)}/posts`, {
+      body,
+      reply_to: replyTo ?? null,
+      notify: options.notify ?? [],
+      idempotency_key: options.idempotencyKey ?? null,
+    });
   }
   setSticky(postId: string, sticky: boolean) {
     return this.req<void>("POST", `/posts/${encodeURIComponent(postId)}/sticky`, { sticky });
@@ -163,10 +180,10 @@ export class HttpClient implements MoteClient {
   resolvePost(postId: string) { return this.req<void>("POST", `/posts/${encodeURIComponent(postId)}/resolve`); }
   markRead(topic?: string) { return this.req<void>("POST", "/discussion/read", { topic: topic ?? null }); }
 
-  sendMessage(to: string, body: string, kind: string, entity?: string | null) {
-    return this.req<void>("POST", "/messages", {
+  sendMessage(to: string, body: string, kind: string, entity?: string | null, idempotencyKey?: string) {
+    return this.req<MessageSendResult>("POST", "/messages", {
       to, body, kind, entity: entity ?? null,
-      idempotency_key: `console-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      idempotency_key: idempotencyKey ?? `console-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     });
   }
   ackMessage(msgId: string) { return this.req<void>("POST", `/messages/${encodeURIComponent(msgId)}/ack`); }

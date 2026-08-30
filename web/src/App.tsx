@@ -58,7 +58,7 @@ function useActor(fallback: string): [string, (a: string) => void] {
 
 export function App({ client: makeClient }: { client: (getActor: () => string) => MoteClient }) {
   const [route, go] = useHashRoute();
-  const [actor, setActor] = useActor("alice");
+  const [actor, setActor] = useActor("admin");
   const [switching, setSwitching] = useState(false);
 
   // The client reads the actor lazily, so switching identity needs no rebuild.
@@ -93,13 +93,13 @@ export function App({ client: makeClient }: { client: (getActor: () => string) =
         <RailItem label="Triage" shortcut="g t" count={triageCount} amber on={route.view === "triage"} onClick={() => go("triage")} />
 
         <div className="rail-foot">
-          <button className="actor-pick" onClick={() => setSwitching(true)} aria-label="Switch actor">
+          <button className="actor-pick" onClick={() => setSwitching(true)} aria-label={`Switch actor. Acting as ${actor}`}>
             <Avatar actor={actor} />
-            <span className="who">{actor}</span>
+            <span className="who"><span className="who-label">Acting as</span>{actor}</span>
             <span className="caret">▾</span>
           </button>
           <div className={`rail-hint ${connected ? "" : "off"}`}>
-            {connected ? "acting as · live" : "acting as · stream offline"}
+            {connected ? "connected · live" : "stream offline"}
           </div>
         </div>
       </nav>

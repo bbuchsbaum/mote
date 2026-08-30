@@ -124,6 +124,10 @@ export interface Post {
   sticky_op_id: string | null;
   route_state: RouteState;
   issues: string[];
+  answers: string[];
+  explicit_notify: string[];
+  notification_recipients: string[];
+  idempotency_key: string | null;
   /** Present on `thread` only. */
   depth?: number;
 }
@@ -140,8 +144,24 @@ export interface Actor {
   orphaned_reservations: number;
   inbox_unacked: number;
   incoming_open_requests: number;
+  status: ActorStatusSummary;
   /** Composed server-side from conversation_between; not a CLI field. */
   last_message?: { body: string; ts: string; direction: "in" | "out" } | null;
+}
+
+export interface PresenceEvidence {
+  state: "live" | "recent" | "expired" | "untracked";
+  source: string;
+  reason: string;
+  as_of_ts: string;
+}
+
+export interface ActorStatusSummary {
+  as_of_ts: string;
+  presence: Omit<PresenceEvidence, "as_of_ts"> & {
+    live_session_count: number;
+    latest_lease_until_ts: string | null;
+  };
 }
 
 /** `mote --json msg thread <peer>` */
@@ -165,6 +185,23 @@ export interface Message {
   sent_ts: string;
   ack_ts: string | null;
   direction: "in" | "out";
+}
+
+export interface MessageSendResult {
+  accepted: true;
+  msg_id: string;
+  delivery: "queued";
+  addressed: true;
+  private: false;
+  require_live: boolean;
+  idempotent_replay: boolean;
+  recipient: string;
+  recipient_presence: PresenceEvidence;
+}
+
+export interface DiscussionPostOptions {
+  notify?: string[];
+  idempotencyKey?: string;
 }
 
 export type EventCategory =

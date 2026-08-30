@@ -62,7 +62,8 @@ console.log("\nmount");
 check("stylesheet is non-trivial", css.length > 8000);
 await eventually("rail renders the four views", () =>
   ["Issues", "Discussion", "Messages", "Triage"].every((v) => text().includes(v)));
-await eventually("acting-as control shows the default actor", () => text().includes("alice"));
+await eventually("acting-as control shows the explicit admin default", () =>
+  !!window.document.querySelector('[aria-label="Switch actor. Acting as admin"]'));
 await eventually("seeded beads render", () => text().includes("Surface reservation expiry warnings"));
 await eventually("a lease countdown is shown", () => /\d+m left/.test(text()));
 await eventually("priority stripes are painted", () => all(".pri").length > 0);
@@ -178,6 +179,38 @@ check("a message this actor SENT is shown", text().includes("Taking it. Reservin
 check("request lifecycle strip is present", text().includes("awaiting response"));
 check("ack and response are distinguished", text().includes("acked"));
 check("bead chip on the request", all(".beadref").length > 0);
+
+console.log("\nmessages: queued-recipient recovery");
+byText(".peer", "parser-session").click();
+await eventually("expired recipient is visibly identified", () =>
+  byText(".peer.on .presence", "expired"));
+const messageComposer = window.document.querySelector(".composer textarea");
+setValue(messageComposer, "READ THIS BEFORE YOU EDIT hsmm.scala.");
+byText(".composer-foot button", "Send").click();
+await eventually("queued non-live delivery opens recovery", () =>
+  text().includes("Message queued; recipient is not live"));
+check("delivery evidence is shown", text().includes("source=session_history, reason=ttl_elapsed"));
+check("public and live-actor recovery are explicit",
+  ["Post publicly", "Send to live actor"].every((label) => !!byText(".modal-foot button", label)));
+setSelect(window.document.querySelector(".modal select"), "planning");
+byText(".modal-foot button", "Post publicly").click();
+await waitFor("public fallback modal closes", () => !text().includes("Message queued; recipient is not live"));
+const planningPosts = await window.__MOTE_FIXTURE__.posts("planning");
+const publicFallback = planningPosts.at(-1);
+check("public fallback preserves the original message", publicFallback.body.includes("READ THIS BEFORE YOU EDIT hsmm.scala."));
+check("public fallback carries delivery provenance", publicFallback.body.includes("delivery=queued"));
+check("public fallback explicitly notifies the original recipient",
+  publicFallback.notification_recipients.includes("parser-session"));
+
+setValue(messageComposer, "Please route around the expired session.");
+byText(".composer-foot button", "Send").click();
+await eventually("second queued message offers rerouting", () =>
+  text().includes("Message queued; recipient is not live"));
+byText(".modal-foot button", "Send to live actor").click();
+await waitFor("reroute modal closes", () => !text().includes("Message queued; recipient is not live"));
+await eventually("reroute moves to the selected live actor", () =>
+  byText(".pane-title", "codex-b") && text().includes("Rerouted from queued DM"));
+check("reroute preserves the original body", text().includes("Please route around the expired session."));
 
 console.log(`\n${failures === 0 ? "PASS" : `FAIL (${failures})`}`);
 process.exit(failures === 0 ? 0 : 1);

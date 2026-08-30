@@ -36,6 +36,18 @@ programmatic clients. Append `?live` to the dev URL to point the dev server's
 `--port <port>` to avoid a collision or `--port 0` to let the OS select an
 available port. The launch message always prints the actual address.
 
+A fresh browser acts as `admin`. The lower-left **Acting as** control changes
+the browser identity without writing `.mote/local/actor`; unread discussion,
+inbox state, and every operation follow the selected identity.
+
+Direct messages remain durably queued when their recipient is not live. After
+such a send, the console shows the reducer-recorded presence source and reason
+and offers two explicit recoveries: publish the original body and delivery
+provenance to a selected discussion topic (with an explicit notification), or
+reroute it to an actor the store currently proves live. Mote never guesses an
+alternative actor from a similar name, and neither recovery marks the original
+message acknowledged.
+
 ## Build output
 
 `vite.config.ts` pins three fixed filenames with no hashing and no code
@@ -55,7 +67,8 @@ embedded index; launch-specific values do not belong in the committed artifact.
 `scripts/smoke.mjs` mounts the **built** bundle in jsdom and drives it: the four
 views render, a bead is created by hand, a post and a threaded reply are made, a
 `needs bead` post is promoted through triage, a two-sided DM thread shows a
-message this actor sent, and a staged concurrent write raises the conflict
+message this actor sent, a queued DM is published publicly and rerouted to a
+live actor with provenance, and a staged concurrent write raises the conflict
 dialog and is then resolved. It needs no browser and no server.
 
 ## Visual regression tests

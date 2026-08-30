@@ -7,7 +7,8 @@ const VISUAL_STABILIZERS = `
   .tl-item .t,
   .beadref,
   .src,
-  .conflict code { color: transparent !important; }
+  .conflict code,
+  .delivery-recovery code { color: transparent !important; }
 `;
 
 async function settle(page) {
@@ -59,6 +60,16 @@ test("messages retain their intended layout", async ({ page }) => {
   await page.getByText("Please take the parser work", { exact: false }).waitFor();
   await settle(page);
   await expect(page).toHaveScreenshot("messages-light.png");
+});
+
+test("queued message recovery keeps its choices and provenance legible", async ({ page }) => {
+  await page.locator(".rail-item").filter({ hasText: "Messages" }).click();
+  await page.locator(".peer").filter({ hasText: "parser-session" }).click();
+  await page.getByLabel("Message body").fill("READ THIS BEFORE YOU EDIT hsmm.scala.");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.getByRole("dialog", { name: "Message queued; recipient is not live" }).waitFor();
+  await settle(page);
+  await expect(page).toHaveScreenshot("message-delivery-recovery-light.png");
 });
 
 test("triage retains its intended layout", async ({ page }) => {

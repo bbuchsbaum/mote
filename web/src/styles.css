@@ -86,7 +86,14 @@ code { font-family:var(--mono); font-size:.9em; }
   display:flex; align-items:center; gap:8px; width:100%; padding:6px 9px;
   border:1px solid var(--rule-2); border-radius:6px; background:var(--surface); cursor:pointer;
 }
-.actor-pick .who { font-weight:600; font-size:12px; }
+.actor-pick .who {
+  min-width:0; display:flex; flex-direction:column; align-items:flex-start;
+  font-weight:600; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.actor-pick .who-label {
+  font-family:var(--mono); font-size:8px; line-height:1.15; font-weight:400;
+  text-transform:uppercase; letter-spacing:.06em; color:var(--ink-3);
+}
 .actor-pick .caret { margin-left:auto; color:var(--ink-3); font-size:10px; }
 .avatar {
   width:19px; height:19px; border-radius:50%; background:var(--accent); color:var(--on-accent);
@@ -227,6 +234,13 @@ code { font-family:var(--mono); font-size:.9em; }
 .peer-txt { min-width:0; flex:1; }
 .peer-n { font-weight:600; font-size:12px; display:flex; align-items:center; gap:7px; }
 .peer-p { font-size:10.5px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.presence {
+  font-family:var(--mono); font-size:8px; font-weight:500; text-transform:uppercase;
+  padding:1px 5px; border-radius:7px; background:var(--surface-3); color:var(--ink-3);
+}
+.presence.live { background:var(--accent-soft); color:var(--accent); }
+.presence.expired { background:var(--crit-soft); color:var(--crit); }
+.presence.recent { background:var(--warn-soft); color:var(--warn); }
 .convo { padding:16px 20px; display:flex; flex-direction:column; gap:12px; }
 .bub { max-width:76%; border-radius:10px; padding:9px 12px; border:1px solid var(--rule); background:var(--surface-2); }
 .bub.out { align-self:flex-end; background:var(--accent-soft); border-color:var(--accent-line); }
@@ -255,6 +269,12 @@ code { font-family:var(--mono); font-size:.9em; }
   border:1px solid var(--rule-2); border-radius:6px; background:var(--surface-2); padding:7px 10px; font-size:12.5px; width:100%;
 }
 .formrow textarea { font-family:var(--serif); font-size:13px; min-height:88px; resize:vertical; }
+.formhint { color:var(--ink-3); font-size:10.5px; line-height:1.4; }
+.delivery-recovery {
+  padding:11px 13px; border:1px solid var(--warn); border-radius:6px;
+  background:var(--warn-soft); color:var(--ink-2); font-size:12px; line-height:1.45;
+}
+.delivery-recovery-title { color:var(--warn); font-weight:700; margin-bottom:4px; }
 .two { display:grid; grid-template-columns:1fr 1fr; gap:13px; }
 
 .conflict { border:1px solid var(--crit); background:var(--crit-soft); border-radius:7px; padding:11px 13px; }

@@ -253,6 +253,11 @@ fn cli_reports_delivery_evidence_and_preserves_idempotent_retries() {
             .contains("recipient unseen: untracked source=none reason=no_presence_evidence as-of=")
     );
     assert!(diagnostic.contains("delivery=queued"));
+    assert!(
+        diagnostic.contains(
+            "public fallback: mote discuss post --topic <topic> --notify unseen --body -"
+        )
+    );
 
     let rejected = output(
         &temp,

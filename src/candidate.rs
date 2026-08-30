@@ -144,6 +144,11 @@ pub struct GitCandidateRelation {
     pub candidate_id: String,
     pub proposal_op_id: String,
     pub commit_oid: String,
+    /// Relation of the known candidate commit to this candidate's immutable base.
+    /// Missing on legacy receipts, which consumers must treat as ambiguous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_relation: Option<GitRelationKind>,
+    /// Relation of the known candidate commit to this candidate's tip.
     pub relation: GitRelationKind,
 }
 
@@ -369,6 +374,7 @@ pub fn probe_ancestry(
             candidate_id: candidate.candidate_id.clone(),
             proposal_op_id: candidate.proposal_op_id.clone(),
             commit_oid: candidate.commit_oid.clone(),
+            base_relation: Some(ancestor_relation(cwd, &candidate.commit_oid, &base_oid)),
             relation: ancestor_relation(cwd, &candidate.commit_oid, &commit_oid),
         });
         covered_candidates.push((

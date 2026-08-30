@@ -781,19 +781,36 @@ impl State {
                         ));
                     }
                     for relation in &git.candidate_relations {
-                        if relation.relation == GitRelationKind::Ambiguous
-                            || relation.relation == GitRelationKind::Unavailable
-                        {
+                        let tip_ambiguous = matches!(
+                            relation.relation,
+                            GitRelationKind::Ambiguous | GitRelationKind::Unavailable
+                        );
+                        let base_ambiguous = matches!(
+                            relation.base_relation,
+                            None | Some(GitRelationKind::Ambiguous | GitRelationKind::Unavailable)
+                        );
+                        let inconsistent = relation.base_relation
+                            == Some(GitRelationKind::Ancestor)
+                            && relation.relation == GitRelationKind::NotAncestor;
+                        if tip_ambiguous || base_ambiguous || inconsistent {
+                            let base = relation
+                                .base_relation
+                                .map(GitRelationKind::as_str)
+                                .unwrap_or("missing");
                             reasons.push(candidate_reason(
                                 "ancestor_ambiguous",
                                 Some(&relation.candidate_id),
-                                format!("relation is {}", relation.relation.as_str()),
+                                format!(
+                                    "base relation is {base}; tip relation is {}",
+                                    relation.relation.as_str()
+                                ),
                             ));
                         }
                         if relation.relation == GitRelationKind::Ancestor {
                             self.check_ancestor_candidate(
                                 candidate,
                                 &relation.candidate_id,
+                                relation.base_relation,
                                 &mut reasons,
                             );
                         }
@@ -886,6 +903,7 @@ impl State {
         &self,
         candidate: &CandidateRecord,
         ancestor_id: &str,
+        base_relation: Option<GitRelationKind>,
         reasons: &mut Vec<LandabilityReason>,
     ) {
         let Some(ancestor) = self.candidates.get(ancestor_id) else {
@@ -965,11 +983,18 @@ impl State {
                     "an ancestor candidate is not safely resolved",
                 ));
             }
-            CandidatePhase::Abandoned => reasons.push(candidate_reason(
-                "ancestor_abandoned",
-                Some(ancestor_id),
-                "an ancestor candidate was abandoned",
-            )),
+            CandidatePhase::Abandoned => match base_relation {
+                Some(GitRelationKind::Ancestor) => {}
+                Some(GitRelationKind::NotAncestor) => reasons.push(candidate_reason(
+                    "ancestor_abandoned",
+                    Some(ancestor_id),
+                    "an abandoned candidate was introduced after the immutable base",
+                )),
+                Some(GitRelationKind::Unavailable | GitRelationKind::Ambiguous) | None => {
+                    // The caller records ancestor_ambiguous. Do not misclassify an
+                    // unproven base relation as introduced-after-base.
+                }
+            },
         }
     }
 

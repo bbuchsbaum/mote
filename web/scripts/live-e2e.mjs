@@ -56,6 +56,11 @@ async function waitForLaunch() {
 
 try {
   run(["init"]);
+  const expiredStart = run(["session", "start", "--as", "expired-peer", "--ttl", "5m"]);
+  const expiredSession = expiredStart.match(/MOTE_SESSION='([^']+)'/)?.[1];
+  assert.ok(expiredSession, `could not parse expired session id: ${expiredStart}`);
+  run(["--actor", "expired-peer", "session", "end", expiredSession]);
+  run(["session", "start", "--as", "live-peer", "--ttl", "30m"]);
   server = spawn(binary, ["serve", "--port", "0"], {
     cwd: store,
     stdio: ["ignore", "ignore", "pipe"],
@@ -64,7 +69,7 @@ try {
   server.stderr.on("data", (chunk) => { serverStderr += chunk; });
   const { token, baseUrl } = await waitForLaunch();
 
-  async function api(method, path, body, actor = "alice") {
+  async function api(method, path, body, actor = "admin") {
     const response = await fetch(`${baseUrl}/api${path}`, {
       method,
       headers: {
@@ -94,7 +99,7 @@ try {
   assert.equal(posts.length, 1);
   await api("POST", `/posts/${posts[0].post_id}/needs-bead`, {});
   await api("POST", "/messages", {
-    to: "alice",
+    to: "admin",
     body: "Please review the live console boundary.",
     kind: "request",
     idempotency_key: "live-e2e-request",
@@ -118,7 +123,8 @@ try {
     waitUntil: "domcontentloaded",
   });
   await page.getByText("Live console seed issue", { exact: true }).waitFor();
-  await page.getByText("acting as · live", { exact: true }).waitFor();
+  await page.getByText("connected · live", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Switch actor. Acting as admin", exact: true }).waitFor();
   await page.waitForFunction(() => !new URL(location.href).searchParams.has("t"));
   assert.equal(new URL(page.url()).searchParams.has("t"), false, "bootstrap must strip the token from browser history");
   const cookie = (await context.cookies()).find((candidate) => candidate.name === "mote_console_token");
@@ -196,6 +202,29 @@ try {
   await page.getByText("bob", { exact: true }).first().waitFor();
   await page.getByText("Please review the live console boundary.", { exact: true }).waitFor();
 
+  await page.locator(".peer").filter({ hasText: "expired-peer" }).click();
+  await page.getByLabel("Message body").fill("Use the public fallback if this session is gone.");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const recovery = page.getByRole("dialog", { name: "Message queued; recipient is not live" });
+  await recovery.waitFor();
+  await recovery.getByText("source=session_history, reason=ended", { exact: false }).waitFor();
+  await recovery.getByRole("button", { name: "Send to live actor", exact: true }).waitFor();
+  await recovery.getByRole("button", { name: "Post publicly", exact: true }).click();
+  await recovery.waitFor({ state: "detached" });
+  const publicPosts = await api("GET", "/topics/planning/posts");
+  const publicFallback = publicPosts.at(-1);
+  assert.match(publicFallback.body, /Use the public fallback if this session is gone/);
+  assert.match(publicFallback.body, /delivery=queued/);
+  assert.deepEqual(publicFallback.notification_recipients, ["expired-peer"]);
+
+  await page.getByLabel("Message body").fill("Reroute this explicitly.");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await recovery.waitFor();
+  await recovery.getByRole("button", { name: "Send to live actor", exact: true }).click();
+  await recovery.waitFor({ state: "detached" });
+  await page.getByText("live-peer", { exact: true }).first().waitFor();
+  await page.locator(".bub-txt").filter({ hasText: "Rerouted from queued DM" }).waitFor();
+
   await page.locator(".rail-item").filter({ hasText: "Triage" }).click();
   await page.getByText("Live discussion needs a tracked outcome.", { exact: true }).waitFor();
   await page.getByText("Promote to bead", { exact: true }).waitFor();
@@ -222,7 +251,7 @@ try {
   assert.match(serverStderr, /mote console listening on http:\/\/127\.0\.0\.1:\d+\/\?t=/);
   server.kill("SIGKILL");
   await new Promise((resolveExit) => server.once("exit", resolveExit));
-  await page.getByText("acting as · stream offline", { exact: true }).waitFor();
+  await page.getByText("stream offline", { exact: true }).waitFor();
   console.log("PASS live browser: embedded assets, four views, SSE slices, concurrent 409, offline rail");
 } finally {
   if (releaseRefresh) releaseRefresh();

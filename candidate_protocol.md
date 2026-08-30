@@ -146,8 +146,9 @@ payload records:
 - object format, repository id inputs, and repository id;
 - candidate, base, and direct-parent object ids as observed from Git objects;
 - whether base is an ancestor of candidate;
-- one relation for every other known candidate in the same store and
-  repository: `ancestor`, `not_ancestor`, `unavailable`, or `ambiguous`;
+- one relation from every other known candidate commit to the immutable base,
+  and one to the candidate tip: `ancestor`, `not_ancestor`, `unavailable`, or
+  `ambiguous`;
 - the sorted candidate ids and proposal op ids covered by the observation;
 - the Git command/tool version and object-database identity used by the probe.
 
@@ -158,7 +159,9 @@ name an older ancestor commit.
 
 The recorded candidate, base, and parents must exactly match the immutable
 proposal. Base ancestry must be `true`. Missing objects, shallow-history gaps,
-repository mismatch, or an incomplete candidate set are ambiguous and block.
+repository mismatch, an incomplete candidate set, or a legacy receipt without
+the base-relative relation are ambiguous and block. A later evidence refresh
+can replace that receipt without changing any historical candidate operation.
 
 ## 5. Review model
 
@@ -277,9 +280,11 @@ A candidate is landable only when all of these are true:
 3. Base is a proven ancestor of the candidate.
 4. Every known candidate proven to be an ancestor is either:
    - `landed`; or
-   - `superseded` by this candidate through a complete supersession chain.
-5. No ancestor is pending, blocked by review, abandoned, authorization-revoked,
-   or ambiguous.
+   - `superseded` by this candidate through a complete supersession chain; or
+   - `abandoned`, with its commit proven to be in both this candidate's
+     immutable base and tip.
+5. No ancestor is pending, blocked by review, authorization-revoked, ambiguous,
+   or abandoned and introduced after the immutable base.
 6. Every required reviewer currently approves.
 7. Every declared evidence requirement currently passes.
 8. Authorization is currently granted or conditional.
@@ -287,7 +292,9 @@ A candidate is landable only when all of these are true:
 10. The prospective landing actor is in the grant's grantee set when checking
     permission for `candidate landed`.
 
-An unknown relationship is not `not_ancestor`. It is ambiguity and blocks.
+An unknown relationship is not `not_ancestor`. It is ambiguity and blocks. In
+particular, an abandoned commit that reaches the tip but has missing,
+unavailable, or ambiguous base-relative proof remains fail-closed.
 
 Required reason codes include:
 

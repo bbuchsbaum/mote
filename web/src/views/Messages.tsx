@@ -1,10 +1,18 @@
 import { useState } from "react";
-import type { Message } from "../api/types";
+import type { Actor, Message, MessageSendResult, Topic } from "../api/types";
 import type { MoteClient } from "../api/client";
 import { relativeTime, shortId, useResource, useWrite } from "../store";
-import { Avatar, BeadPicker, Empty, Modal } from "../components/ui";
+import { Avatar, BeadPicker, Empty, Modal, Toast } from "../components/ui";
 
 const KINDS = ["note", "request", "handoff", "blocked", "fyi"] as const;
+
+interface QueuedRecovery {
+  to: string;
+  body: string;
+  kind: string;
+  entity: string | null;
+  result: MessageSendResult;
+}
 
 export function MessagesView({
   client, actor, peer, onSelectPeer, onOpenBead,
@@ -21,17 +29,68 @@ export function MessagesView({
   const [attaching, setAttaching] = useState(false);
   const [composingTo, setComposingTo] = useState(false);
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  const [recovery, setRecovery] = useState<QueuedRecovery | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const { data: actors } = useResource("actors", actor, () => client.actors());
   const active = peer ?? actors?.[0]?.actor ?? null;
   const { data: convo } = useResource("dm", `${actor}:${active ?? "-"}`, () =>
     active ? client.dm(active) : Promise.resolve([]));
   const { data: beads } = useResource("beads", "picker", () => client.beads());
+  const { data: topics } = useResource("topics", actor, () => client.topics());
 
   const send = async () => {
     if (!draft.trim() || !active) return;
-    const ok = await run(() => client.sendMessage(active, draft, kind, attached), ["dm", "actors", "board"]);
-    if (ok) { setDraft(""); setAttached(null); setKind("note"); }
+    const queued = { to: active, body: draft, kind, entity: attached };
+    const sent: { current: MessageSendResult | null } = { current: null };
+    setError(null);
+    const ok = await run(async () => { sent.current = await client.sendMessage(active, draft, kind, attached); }, ["dm", "actors", "board"]);
+    const result = sent.current;
+    if (ok && result) {
+      setDraft(""); setAttached(null); setKind("note");
+      if (result.recipient_presence.state !== "live") setRecovery({ ...queued, result });
+      else setNotice(`Message queued for live actor ${active}.`);
+    }
+  };
+
+  const publishFallback = async (topic: string, body: string) => {
+    if (!recovery) return;
+    setError(null);
+    const ok = await run(
+      () => client.post(topic, body, null, {
+        notify: [recovery.to],
+        idempotencyKey: `console-dm-public-${recovery.result.msg_id}`,
+      }),
+      ["topics", "posts", "thread", "unrouted", "board"],
+    );
+    if (ok) {
+      setNotice(`Published the queued DM fallback to ${topic}.`);
+      setRecovery(null);
+    }
+  };
+
+  const reroute = async (to: string, body: string) => {
+    if (!recovery) return;
+    const sent: { current: MessageSendResult | null } = { current: null };
+    setError(null);
+    const ok = await run(async () => {
+      sent.current = await client.sendMessage(
+        to,
+        body,
+        recovery.kind,
+        recovery.entity,
+        `console-dm-reroute-${recovery.result.msg_id}`,
+      );
+    }, ["dm", "actors", "board"]);
+    const result = sent.current;
+    if (!ok || !result) return;
+    if (result.recipient_presence.state !== "live") {
+      setRecovery({ to, body, kind: recovery.kind, entity: recovery.entity, result });
+      return;
+    }
+    setNotice(`Rerouted to live actor ${to}.`);
+    setRecovery(null);
+    onSelectPeer(to);
   };
 
   return (
@@ -46,11 +105,12 @@ export function MessagesView({
           {(actors ?? []).length === 0 && <Empty title="No other actors" />}
           {(actors ?? []).map((a) => (
             <button key={a.actor} data-nav-item className={`peer ${active === a.actor ? "on" : ""}`} onClick={() => onSelectPeer(a.actor)}>
-              <Avatar actor={a.actor} muted={a.active_claims === 0} />
+              <Avatar actor={a.actor} muted={a.status.presence.state !== "live"} />
               <span className="peer-txt">
                 <span className="peer-n">
                   {a.actor}
                   {a.inbox_unacked > 0 && <span className="badge hot">{a.inbox_unacked}</span>}
+                  <span className={`presence ${a.status.presence.state}`}>{a.status.presence.state}</span>
                 </span>
                 <span className="peer-p">{a.last_message?.body ?? "no messages yet"}</span>
               </span>
@@ -129,6 +189,20 @@ export function MessagesView({
           }}
         />
       )}
+
+      {recovery && (
+        <DeliveryRecoveryModal
+          queued={recovery}
+          topics={topics ?? []}
+          actors={actors ?? []}
+          busy={busy}
+          onClose={() => setRecovery(null)}
+          onPublish={(topic, body) => void publishFallback(topic, body)}
+          onReroute={(to, body) => void reroute(to, body)}
+        />
+      )}
+
+      <Toast message={notice} />
     </div>
   );
 }
@@ -174,6 +248,87 @@ function MessageBubble({
         </div>
       )}
     </>
+  );
+}
+
+function DeliveryRecoveryModal({
+  queued, topics, actors, busy, onClose, onPublish, onReroute,
+}: {
+  queued: QueuedRecovery;
+  topics: Topic[];
+  actors: Actor[];
+  busy: boolean;
+  onClose: () => void;
+  onPublish: (topic: string, body: string) => void;
+  onReroute: (actor: string, body: string) => void;
+}) {
+  const evidence = queued.result.recipient_presence;
+  const liveActors = actors.filter((actor) =>
+    actor.actor !== queued.to && actor.status.presence.state === "live");
+  const [topic, setTopic] = useState(topics[0]?.topic ?? "");
+  const [rerouteTo, setRerouteTo] = useState(liveActors[0]?.actor ?? "");
+  const selectedTopic = topic || topics[0]?.topic || "";
+  const selectedReroute = rerouteTo || liveActors[0]?.actor || "";
+  const provenance = [
+    `Public fallback for queued DM ${queued.result.msg_id} to ${queued.to}.`,
+    `Recipient presence: ${evidence.state} source=${evidence.source} reason=${evidence.reason}; delivery=${queued.result.delivery}.`,
+    "",
+    queued.body,
+  ].join("\n");
+  const [publicBody, setPublicBody] = useState(provenance);
+  const rerouteBody = [
+    `Rerouted from queued DM ${queued.result.msg_id}, originally addressed to ${queued.to}.`,
+    `Original recipient presence: ${evidence.state} source=${evidence.source} reason=${evidence.reason}.`,
+    "",
+    queued.body,
+  ].join("\n");
+
+  return (
+    <Modal
+      title="Message queued; recipient is not live"
+      onClose={onClose}
+      footer={
+        <>
+          <button className="btn" onClick={onClose}>Keep queued only</button>
+          <button className="btn" disabled={busy || !selectedReroute} onClick={() => onReroute(selectedReroute, rerouteBody)}>
+            Send to live actor
+          </button>
+          <button className="btn primary" disabled={busy || !selectedTopic || !publicBody.trim()} onClick={() => onPublish(selectedTopic, publicBody)}>
+            Post publicly
+          </button>
+        </>
+      }
+    >
+      <div className="delivery-recovery">
+        <div className="delivery-recovery-title">Queued, not lost</div>
+        <div>
+          <b>{queued.to}</b> is <b>{evidence.state}</b>: source={evidence.source}, reason={evidence.reason}.
+          The addressed DM remains queued as <code>{shortId(queued.result.msg_id)}</code>.
+        </div>
+      </div>
+
+      <div className="formrow">
+        <label>Public fallback topic</label>
+        <select value={selectedTopic} onChange={(event) => setTopic(event.target.value)}>
+          {topics.length === 0 && <option value="">No discussion topics</option>}
+          {topics.map((candidate) => <option key={candidate.topic} value={candidate.topic}>{candidate.title}</option>)}
+        </select>
+      </div>
+      <div className="formrow">
+        <label>Public message with delivery provenance</label>
+        <textarea value={publicBody} onChange={(event) => setPublicBody(event.target.value)} />
+        <span className="formhint">The post explicitly notifies {queued.to}; it does not pretend the DM was acknowledged.</span>
+      </div>
+
+      <div className="formrow">
+        <label>Or explicitly reroute to a live actor</label>
+        <select value={selectedReroute} onChange={(event) => setRerouteTo(event.target.value)}>
+          {liveActors.length === 0 && <option value="">No live actors</option>}
+          {liveActors.map((candidate) => <option key={candidate.actor} value={candidate.actor}>{candidate.actor}</option>)}
+        </select>
+        <span className="formhint">Mote never guesses that a similarly named actor is the intended replacement.</span>
+      </div>
+    </Modal>
   );
 }
 

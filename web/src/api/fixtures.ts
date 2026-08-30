@@ -1,6 +1,7 @@
 import type {
-  Actor, Board, BeadDetail, BeadQuery, BeadRow, HistoryEntry, Message, MoteEvent,
-  NewBeadInput, NoteKind, Post, RouteState, ScalarField, Status, Topic, Unrouted,
+  Actor, Board, BeadDetail, BeadQuery, BeadRow, DiscussionPostOptions, HistoryEntry,
+  Message, MessageSendResult, MoteEvent, NewBeadInput, NoteKind, Post,
+  PresenceEvidence, RouteState, ScalarField, Status, Topic, Unrouted,
 } from "./types";
 import { ConflictError, ValidationError, type MoteClient } from "./client";
 
@@ -135,15 +136,15 @@ export class FixtureClient implements MoteClient {
     void decision; void orphan;
 
     this.messages = [
-      this.mkMsg("codex-b", "alice", "request", "Please take the parser work — I'm blocked on the lexer refactor and won't get to it today.", 60, {
+      this.mkMsg("codex-b", "admin", "request", "Please take the parser work — I'm blocked on the lexer refactor and won't get to it today.", 60, {
         entity: parser.id, request_state: "open", ack_ts: ago(58),
       }),
-      this.mkMsg("alice", "codex-b", "fyi", "Taking it. Reserving src/parser.rs for the next hour.", 55, {}),
-      this.mkMsg("codex-b", "alice", "note", "Thanks. I'll pick up tests behind you.", 54, {}),
-      this.mkMsg("parser-session", "alice", "blocked", "Cannot reserve src/watch.rs — reviewer holds it until 15:10.", 8, {}),
+      this.mkMsg("admin", "codex-b", "fyi", "Taking it. Reserving src/parser.rs for the next hour.", 55, {}),
+      this.mkMsg("codex-b", "admin", "note", "Thanks. I'll pick up tests behind you.", 54, {}),
+      this.mkMsg("parser-session", "admin", "blocked", "Cannot reserve src/watch.rs — reviewer holds it until 15:10.", 8, {}),
     ];
 
-    this.readCursor.set("alice", reply2.post_id);
+    this.readCursor.set("admin", reply2.post_id);
   }
 
   private mkTopic(topic: string, title: string, body: string, by: string, minutesAgo: number): Topic {
@@ -159,7 +160,8 @@ export class FixtureClient implements MoteClient {
     const post: Post = {
       post_id: ulid("post"), topic, from, body, post_kind: "post",
       reply_to: replyTo, sent_ts: ago(minutesAgo), sticky: false, sticky_op_id: null,
-      route_state: "open", issues: [],
+      route_state: "open", issues: [], answers: [], explicit_notify: [],
+      notification_recipients: [], idempotency_key: null,
     };
     this.allPosts.push(post);
     const t = this.allTopics.find((x) => x.topic === topic);
@@ -312,6 +314,31 @@ export class FixtureClient implements MoteClient {
     };
   }
 
+  private presence(actor: string): PresenceEvidence {
+    const evidence = actor === "codex-b"
+      ? { state: "live" as const, source: "session_lease", reason: "lease_valid" }
+      : actor === "parser-session"
+        ? { state: "expired" as const, source: "session_history", reason: "ttl_elapsed" }
+        : actor === "reviewer"
+          ? { state: "recent" as const, source: "accepted_activity", reason: "sessionless_recent_activity" }
+          : { state: "untracked" as const, source: "none", reason: "no_presence_evidence" };
+    return { ...evidence, as_of_ts: now() };
+  }
+
+  private actorStatus(actor: string): Actor["status"] {
+    const evidence = this.presence(actor);
+    return {
+      as_of_ts: evidence.as_of_ts,
+      presence: {
+        state: evidence.state,
+        source: evidence.source,
+        reason: evidence.reason,
+        live_session_count: evidence.state === "live" ? 1 : 0,
+        latest_lease_until_ts: evidence.state === "live" ? plus(15 * 60) : null,
+      },
+    };
+  }
+
   async actors(): Promise<Actor[]> {
     const me = this.getActor();
     const names = new Set<string>(["alice", "codex-b", "parser-session", "reviewer"]);
@@ -329,6 +356,7 @@ export class FixtureClient implements MoteClient {
         active_reservations: 0, orphaned_claims: 0, orphaned_reservations: 0,
         inbox_unacked: this.messages.filter((m) => m.to === me && m.from === actor && !m.ack_ts).length,
         incoming_open_requests: this.messages.filter((m) => m.to === me && m.from === actor && m.request_state === "open").length,
+        status: this.actorStatus(actor),
         last_message: last ? { body: last.body, ts: last.sent_ts, direction: (last.from === me ? "out" : "in") as "in" | "out" } : null,
       };
     }).sort((a, b) => (b.last_activity_ts ?? "").localeCompare(a.last_activity_ts ?? ""));
@@ -433,9 +461,21 @@ export class FixtureClient implements MoteClient {
     this.emit("discussion", "discussion.topic_created", { topic: slug });
   }
 
-  async post(topic: string, body: string, replyTo?: string | null): Promise<{ post_id: string }> {
+  async post(
+    topic: string,
+    body: string,
+    replyTo?: string | null,
+    options: DiscussionPostOptions = {},
+  ): Promise<{ post_id: string }> {
     if (!body.trim()) throw new ValidationError("post body is required");
+    const existing = options.idempotencyKey
+      ? this.allPosts.find((post) => post.idempotency_key === options.idempotencyKey)
+      : null;
+    if (existing) return { post_id: existing.post_id };
     const p = this.mkPost(topic, this.getActor(), 0, body, replyTo ?? null);
+    p.explicit_notify = [...new Set(options.notify ?? [])].filter((actor) => actor !== this.getActor());
+    p.notification_recipients = [...p.explicit_notify];
+    p.idempotency_key = options.idempotencyKey ?? null;
     this.emit("discussion", "discussion.posted", { topic, post_id: p.post_id });
     return { post_id: p.post_id };
   }
@@ -492,12 +532,40 @@ export class FixtureClient implements MoteClient {
     this.emit("discussion", "discussion.read", { topic: topic ?? null });
   }
 
-  async sendMessage(to: string, body: string, kind: string, entity?: string | null): Promise<void> {
+  async sendMessage(
+    to: string,
+    body: string,
+    kind: string,
+    entity?: string | null,
+    idempotencyKey?: string,
+  ): Promise<MessageSendResult> {
     if (!body.trim()) throw new ValidationError("message body is required");
-    const m = this.mkMsg(this.getActor(), to, kind, body, 0, { entity: entity ?? null });
+    const existing = idempotencyKey
+      ? this.messages.find((message) => message.from === this.getActor() && message.idempotency_key === idempotencyKey)
+      : null;
+    if (existing && (existing.to !== to || existing.body !== body || existing.msg_kind !== kind)) {
+      throw new ValidationError("idempotency key is already used by a different message");
+    }
+    const m = existing ?? this.mkMsg(this.getActor(), to, kind, body, 0, {
+      entity: entity ?? null,
+      idempotency_key: idempotencyKey ?? null,
+    });
     if (kind === "request") m.request_state = "open";
-    this.messages.push(m);
-    this.emit("message", "message.sent", { msg_id: m.msg_id, to });
+    if (!existing) {
+      this.messages.push(m);
+      this.emit("message", "message.sent", { msg_id: m.msg_id, to });
+    }
+    return {
+      accepted: true,
+      msg_id: m.msg_id,
+      delivery: "queued",
+      addressed: true,
+      private: false,
+      require_live: false,
+      idempotent_replay: existing !== null,
+      recipient: to,
+      recipient_presence: this.presence(to),
+    };
   }
 
   async ackMessage(msgId: string): Promise<void> {
