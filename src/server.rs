@@ -2422,7 +2422,12 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 fn create_launch_token(store: &Store) -> MoteResult<String> {
     let mut random = [0_u8; 16];
     rand::thread_rng().fill_bytes(&mut random);
-    let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(random.len() * 2);
+    for byte in random {
+        token.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        token.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+    }
     let path = store.local_dir().join(TOKEN_FILE);
 
     #[cfg(unix)]

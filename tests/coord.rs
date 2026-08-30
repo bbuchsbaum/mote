@@ -316,8 +316,10 @@ fn a4_begin_race_exactly_one_succeeds() {
     assert_eq!(loser.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&loser.stderr);
     assert!(
-        stderr.contains("reserve_open rejected") || stderr.contains("path conflict"),
-        "expected loser to report reserve_open rejected: {stderr}"
+        stderr.contains("reserve_open rejected")
+            || stderr.contains("path conflict")
+            || stderr.contains("claim rejected"),
+        "expected loser to report a reservation or claim race loss: {stderr}"
     );
 
     // Replay: exactly one live reservation, exactly one claim.

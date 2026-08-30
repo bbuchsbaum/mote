@@ -477,7 +477,7 @@ pub enum CandidateCmd {
         authorizer: String,
         #[arg(long = "reviewer", num_args = 1..)]
         reviewers: Vec<String>,
-        /// Additional requirement as name:kind:producer[,producer]
+        /// Additional requirement as `name:kind:producer[,producer]`
         #[arg(long = "require")]
         requirements: Vec<String>,
         #[arg(long = "evidence-ref")]
