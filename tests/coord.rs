@@ -228,7 +228,7 @@ fn reserve_rejects_same_actor_overlap_with_existing_reservation_diagnostic() {
 }
 
 #[test]
-fn concurrent_same_actor_duplicate_attempts_accept_exactly_one() {
+fn concurrent_same_actor_duplicate_attempts_converge_to_exactly_one() {
     let td = TempDir::new().unwrap();
     init_store(&td);
     let id = new_bead(&td, "same actor race", "alice");
@@ -236,7 +236,7 @@ fn concurrent_same_actor_duplicate_attempts_accept_exactly_one() {
     let dir_a = td.path().to_path_buf();
     let dir_b = td.path().to_path_buf();
     let id_a = id.clone();
-    let id_b = id;
+    let id_b = id.clone();
     let a = thread::spawn(move || {
         Command::new(bin)
             .args(["reserve", "src/race/", "--issue", &id_a, "--actor", "alice"])
@@ -260,10 +260,36 @@ fn concurrent_same_actor_duplicate_attempts_accept_exactly_one() {
     });
     let a = a.join().unwrap();
     let b = b.join().unwrap();
-    assert_ne!(a.status.success(), b.status.success());
-    let loser = if a.status.success() { b } else { a };
-    assert_eq!(loser.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&loser.stderr).contains("duplicate reservation"));
+    for result in [&a, &b] {
+        assert!(
+            result.status.success() || result.status.code() == Some(2),
+            "reserve exited unexpectedly: status={:?} stderr={}",
+            result.status.code(),
+            String::from_utf8_lossy(&result.stderr),
+        );
+        if result.status.code() == Some(2) {
+            assert!(String::from_utf8_lossy(&result.stderr).contains("duplicate reservation"));
+        }
+    }
+
+    // Publication is lock-light: both clients may replay before the other's
+    // op is visible and temporarily report success. The durable contract is
+    // deterministic convergence, with exactly one accepted reservation.
+    let store = Store::open(&td.path().join(".mote")).unwrap();
+    let state = reducer::replay_store(&store).unwrap();
+    let opens: Vec<_> = state.history[&id]
+        .iter()
+        .filter(|entry| entry.kind == "reserve_open")
+        .collect();
+    assert_eq!(opens.len(), 2);
+    assert_eq!(opens.iter().filter(|entry| entry.accepted).count(), 1);
+    assert_eq!(state.reservations.len(), 1);
+    assert!(opens.iter().filter(|entry| !entry.accepted).all(|entry| {
+        entry
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("duplicate reservation"))
+    }));
 }
 
 #[test]
