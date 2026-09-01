@@ -322,8 +322,10 @@ phase and authorization op ids. Every mutation needs an actor-scoped
 idempotency key; use a new key for a genuinely new observation or transition.
 Portable and explicitly rebound candidates additionally require a current
 target-scope observation before Git changes; refresh it whenever the intended
-target advances. The final landing record rejects a target whose exact
-preimage no longer matches that observation.
+target advances. The target must be one mutable, reflog-enabled ref. Scope uses
+the prospective merge tree so target-side rename destinations enter policy;
+the final landing record requires the immediately previous reflog entry and
+actual target-to-result paths to match that observation.
 
 ## Finish Or Hand Off
 

@@ -628,8 +628,10 @@ fn happy_path_consumes_authorization_and_is_replay_deterministic() {
         object_format: "sha1".into(),
         candidate_oid: COMMIT_A.into(),
         target_ref: "refs/heads/main".into(),
+        target_ref_full_name: None,
         before_tip: Some(BASE.into()),
         after_tip: COMMIT_A.into(),
+        landing_effect_paths: Vec::new(),
         candidate_reachable: Some(true),
         authorization_op_id: authorization_op.clone(),
         basis_op_ids: Vec::new(),
@@ -838,8 +840,10 @@ fn out_of_band_reconciliation_preserves_policy_and_resolves_descendants() {
         object_format: "sha1".into(),
         candidate_oid: COMMIT_A.into(),
         target_ref: "refs/heads/main".into(),
+        target_ref_full_name: None,
         before_tip: Some(BASE.into()),
         after_tip: COMMIT_A.into(),
+        landing_effect_paths: Vec::new(),
         candidate_reachable: Some(true),
         authorization_op_id: authorization_op.clone(),
         basis_op_ids: Vec::new(),
@@ -4644,6 +4648,7 @@ fn evidence_refresh_clears_abandoned_commit_already_in_base_without_rewriting_hi
         &["commit", "-qam", "landed outside candidate flow"],
     );
     let landed = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    run_git(temp.path(), &["branch", "landing-target", &landed]);
 
     let store = Store::init(temp.path()).unwrap();
     let issue = ids::new_bead_id();
@@ -4735,7 +4740,7 @@ fn evidence_refresh_clears_abandoned_commit_already_in_base_without_rewriting_hi
             "target-scope",
             &new_id,
             "--target",
-            &landed,
+            "landing-target",
             "--idempotency-key",
             "new-target-scope",
         ],

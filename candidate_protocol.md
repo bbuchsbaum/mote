@@ -303,28 +303,41 @@ never opens the repository or silently fetches an object.
 A portable or explicitly rebound candidate must publish `git-target-scope`
 before it can become landable. The command observes an explicit target ref in
 the repository backing the shared store and records the derived repository id,
-current landing-repository binding op, exact target OID, candidate and base
-OIDs, proof that the candidate was not already reachable from that target,
-every merge base, and a sorted conservative effective-path set. The
-repository identity and OIDs come from Git; they are not caller-selected
-labels.
+current landing-repository binding op, canonical mutable full ref, exact target
+OID, candidate and base OIDs, proof that the candidate was not already
+reachable from that target, every merge base, and the prospective merge-tree
+OID. Repository identity, ref identity, and OIDs come from Git; they are not
+caller-selected labels. A detached `HEAD`, raw object id, missing ref, or
+conflicted/unavailable prospective merge fails closed.
 
-The path set is the union of `merge-base..candidate` for every merge base.
-Rename inference is disabled, deliberately representing a rename as its source
-deletion and destination addition. Every effective path must overlap an
-immutable declared candidate path. A missing observation yields
+The conservative path set is the union of two independently retained sets:
+
+- `merge-base..candidate` for every merge base, which prevents a divergent
+  recorded proposal base from hiding candidate-side paths; and
+- `target..prospective-merge-tree`, which captures the paths the actual target
+  would experience under Git's merge and rename mapping.
+
+Both diffs disable rename inference. Thus a candidate-side rename retains its
+source deletion and destination addition, while a target-side `old -> new`
+rename followed by a candidate modification of `old` contributes `new` from
+the prospective target effect. Every effective path must overlap an immutable
+declared candidate path. A missing observation yields
 `target_scope_evidence_missing`; a receipt bound to another repository,
 repository-binding clock, target, or candidate anchor yields
 `target_scope_evidence_stale`; an effective path outside policy yields
 `target_scope_uncovered`. All three block.
 
 The target ref is mutable, so reducer replay claims only the exact recorded OID.
-The final landing receipt names the current target-scope evidence and operation
-ids. A fast-forward must move from that target OID to the candidate; a merge
-must name that OID as the resulting commit's first parent. This exact-preimage
-check rejects target advancement between scope observation and landing rather
-than treating an older ancestor as current. Refreshing target scope publishes a
-new immutable evidence operation; it never rewrites candidate policy.
+The final landing probe resolves the same canonical full ref and requires two
+exact reflog entries: the current entry must be the observed result and the
+immediately previous entry must equal the target-scope OID. A mere ancestry
+relation is insufficient. A merge must additionally name that preimage as its
+first parent. The receipt retains the reflog-proved preimage and the actual
+no-rename `preimage..result` path set, which must exactly match the prospective
+target-effect paths. Missing reflog proof, linear or divergent target
+advancement, a changed ref identity, or a different result path set fails
+closed. Refreshing target scope publishes a new immutable evidence operation;
+it never rewrites candidate policy.
 An already-reachable candidate cannot obtain target-scope evidence: that state
 uses the explicit `candidate reconcile` path and remains visibly
 `landed_out_of_band`, rather than laundering ambient reachability into a
@@ -673,14 +686,16 @@ or authorization subject and full detail.
 
 `candidate landed` requires a fresh built-in `git-landing` receipt. For a
 portable or rebound candidate it also requires a current `git-target-scope`
-receipt for the exact target ref before Git is changed. The landing receipt records
-the target ref, target tip before and after landing, the candidate object id,
-the current authorization op id, the current review and evidence basis op ids,
-the exact target-scope evidence/op ids, and proof that the candidate commit is
-reachable from the after-tip. The target-scope OID must be the exact
-fast-forward preimage or the first parent of the resulting merge. The
-receipt must be from the bound landing repository and object format, regardless
-of which repository supplied proposal ancestry.
+receipt for the exact target ref before Git is changed. The landing receipt
+records the caller-facing and canonical full target refs, the reflog-proved tip
+immediately before landing, the tip after landing, the actual target-to-result
+paths, the candidate object id, the current authorization op id, the current
+review and evidence basis op ids, the exact target-scope evidence/op ids, and
+proof that the candidate commit is reachable from the after-tip. Its immediate
+preimage and actual path set must equal the scope receipt; a merge must also
+carry that preimage as first parent. The receipt must be from the bound landing
+repository and object format, regardless of which repository supplied proposal
+ancestry.
 
 Mote records the landing after an external Git action; it does not perform the
 action. Failure to publish the landed op leaves the candidate pending and the

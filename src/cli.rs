@@ -758,7 +758,7 @@ pub enum CandidateEvidenceCmd {
         #[arg(long)]
         idempotency_key: String,
     },
-    /// Observe the conservative candidate-side path effect for one exact landing target
+    /// Observe the conservative prospective path effect for one exact landing target
     TargetScope {
         candidate_id: String,
         /// Exact Git ref intended as the landing target

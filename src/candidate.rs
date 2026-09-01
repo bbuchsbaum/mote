@@ -399,9 +399,16 @@ pub struct GitLandingReceipt {
     pub object_format: String,
     pub candidate_oid: String,
     pub target_ref: String,
+    /// Canonical mutable Git ref whose reflog proved the immediate preimage.
+    /// Optional only so historical landing receipts remain replayable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ref_full_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_tip: Option<String>,
     pub after_tip: String,
+    /// Exact no-rename diff from the proved immediate preimage to `after_tip`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub landing_effect_paths: Vec<String>,
     pub candidate_reachable: Option<bool>,
     pub authorization_op_id: String,
     pub basis_op_ids: Vec<String>,
@@ -448,14 +455,15 @@ pub struct GitObjectAvailabilityReceipt {
     pub detail: Option<String>,
 }
 
-/// Exact, replayable observation of the candidate-side paths that can affect
-/// one named landing target. The CLI derives repository and object identities
-/// from Git; callers choose only the ref to observe.
+/// Exact, replayable observation of the paths that can affect one named
+/// landing target. The CLI derives repository and object identities from Git;
+/// callers choose only the ref to observe.
 ///
-/// `effective_paths` is the sorted union of `merge-base..candidate` diffs for
-/// every merge base. Diffs run with rename detection disabled, so a rename is
-/// conservatively represented by both its source deletion and destination
-/// addition.
+/// `effective_paths` is the sorted union of the candidate-side
+/// `merge-base..candidate` diffs and the prospective target-to-merge-result
+/// diff. Diffs run with rename detection disabled, so candidate renames retain
+/// both endpoints while target-side rename mapping contributes the actual
+/// destination that the merge would modify.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitTargetScopeReceipt {
     pub scope_schema: u32,
@@ -465,10 +473,14 @@ pub struct GitTargetScopeReceipt {
     pub candidate_oid: String,
     pub candidate_base_oid: String,
     pub target_ref: String,
+    pub target_ref_full_name: String,
     pub observed_target_oid: String,
     pub candidate_is_ancestor_of_target: Option<bool>,
     pub base_is_ancestor_of_target: Option<bool>,
     pub merge_base_oids: Vec<String>,
+    pub prospective_merge_tree_oid: String,
+    pub candidate_side_paths: Vec<String>,
+    pub prospective_target_effect_paths: Vec<String>,
     pub effective_paths: Vec<String>,
     pub git_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1053,7 +1065,7 @@ fn merge_bases(cwd: &Path, left: &str, right: &str) -> Result<Vec<String>, Strin
 fn changed_paths_without_rename_inference(
     cwd: &Path,
     base_oid: &str,
-    candidate_oid: &str,
+    right_oid: &str,
 ) -> Result<Vec<String>, String> {
     let output = git_output(
         cwd,
@@ -1063,7 +1075,7 @@ fn changed_paths_without_rename_inference(
             "-z",
             "--no-renames",
             base_oid,
-            candidate_oid,
+            right_oid,
             "--",
         ],
     )?;
@@ -1073,7 +1085,7 @@ fn changed_paths_without_rename_inference(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    output
+    let mut paths = output
         .stdout
         .split(|byte| *byte == 0)
         .filter(|raw| !raw.is_empty())
@@ -1083,7 +1095,101 @@ fn changed_paths_without_rename_inference(
             crate::paths::normalize(path)
                 .map_err(|error| format!("Git returned a non-canonical repository path: {error}"))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn resolve_mutable_ref(cwd: &Path, target_ref: &str) -> Result<String, String> {
+    let full_name = git_text(cwd, &["rev-parse", "--symbolic-full-name", target_ref])?;
+    if !full_name.starts_with("refs/") || full_name.lines().count() != 1 {
+        return Err(format!(
+            "landing target `{target_ref}` does not resolve to one mutable full ref"
+        ));
+    }
+    Ok(full_name)
+}
+
+fn prospective_merge_tree(
+    cwd: &Path,
+    object_format: &str,
+    target_oid: &str,
+    candidate_oid: &str,
+) -> Result<String, String> {
+    let output = git_output(
+        cwd,
+        &["merge-tree", "--write-tree", target_oid, candidate_oid],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "prospective target merge is unavailable or conflicted: {}{}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("git merge-tree returned non-UTF-8 output: {error}"))?;
+    let tree_oid = stdout
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .ok_or_else(|| "git merge-tree returned no prospective tree".to_string())?;
+    if !validate_full_oid(object_format, tree_oid)
+        || git_text(cwd, &["cat-file", "-t", tree_oid])? != "tree"
+    {
+        return Err("git merge-tree did not return a full tree object id".into());
+    }
+    Ok(tree_oid.to_string())
+}
+
+fn canonical_sorted_paths(paths: &[String]) -> bool {
+    paths
+        .iter()
+        .all(|path| crate::paths::normalize(path).is_ok_and(|normalized| normalized == *path))
+        && paths.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn immediate_ref_preimage(
+    cwd: &Path,
+    object_format: &str,
+    target_ref_full_name: &str,
+    after_tip: &str,
+) -> Result<String, String> {
+    let output = git_output(
+        cwd,
+        &[
+            "reflog",
+            "show",
+            "--format=%H",
+            "-n",
+            "2",
+            target_ref_full_name,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot prove immediate target preimage from reflog: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("target reflog returned non-UTF-8 output: {error}"))?;
+    let entries = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if entries.len() != 2
+        || entries[0] != after_tip
+        || !entries
+            .iter()
+            .all(|oid| validate_full_oid(object_format, oid))
+    {
+        return Err("cannot prove immediate target preimage from two exact reflog entries".into());
+    }
+    Ok(entries[1].to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1111,7 +1217,8 @@ pub fn probe_target_scope(
     {
         return Err("target-scope candidate anchors do not resolve exactly".into());
     }
-    let observed_target_oid = resolve_commit(cwd, target_ref)?;
+    let target_ref_full_name = resolve_mutable_ref(cwd, target_ref)?;
+    let observed_target_oid = resolve_commit(cwd, &target_ref_full_name)?;
     let candidate_is_ancestor_of_target = match ancestor_relation(
         cwd,
         candidate_oid,
@@ -1136,14 +1243,29 @@ pub fn probe_target_scope(
     {
         return Err("target-scope merge base is not a full object id".into());
     }
-    let mut effective_paths = std::collections::BTreeSet::new();
+    let mut candidate_side_paths = std::collections::BTreeSet::new();
     for merge_base_oid in &merge_base_oids {
-        effective_paths.extend(changed_paths_without_rename_inference(
+        candidate_side_paths.extend(changed_paths_without_rename_inference(
             cwd,
             merge_base_oid,
             candidate_oid,
         )?);
     }
+    let prospective_merge_tree_oid =
+        prospective_merge_tree(cwd, object_format, &observed_target_oid, candidate_oid)?;
+    let prospective_target_effect_paths = changed_paths_without_rename_inference(
+        cwd,
+        &observed_target_oid,
+        &prospective_merge_tree_oid,
+    )?;
+    let candidate_side_paths = candidate_side_paths.into_iter().collect::<Vec<_>>();
+    let effective_paths = candidate_side_paths
+        .iter()
+        .chain(prospective_target_effect_paths.iter())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let base_is_ancestor_of_target =
         match ancestor_relation(cwd, candidate_base_oid, &observed_target_oid) {
             GitRelationKind::Ancestor => Some(true),
@@ -1161,11 +1283,15 @@ pub fn probe_target_scope(
         candidate_oid: candidate_oid.to_string(),
         candidate_base_oid: candidate_base_oid.to_string(),
         target_ref: target_ref.to_string(),
+        target_ref_full_name,
         observed_target_oid,
         candidate_is_ancestor_of_target,
         base_is_ancestor_of_target,
         merge_base_oids,
-        effective_paths: effective_paths.into_iter().collect(),
+        prospective_merge_tree_oid,
+        candidate_side_paths,
+        prospective_target_effect_paths,
+        effective_paths,
         git_version: git_version(cwd),
         detail: None,
     })
@@ -1179,6 +1305,7 @@ pub fn target_scope_shape_is_valid(receipt: &GitTargetScopeReceipt) -> bool {
         && validate_full_oid(&receipt.object_format, &receipt.candidate_oid)
         && validate_full_oid(&receipt.object_format, &receipt.candidate_base_oid)
         && !receipt.target_ref.trim().is_empty()
+        && receipt.target_ref_full_name.starts_with("refs/")
         && validate_full_oid(&receipt.object_format, &receipt.observed_target_oid)
         && receipt.candidate_is_ancestor_of_target == Some(false)
         && receipt.base_is_ancestor_of_target.is_some()
@@ -1191,14 +1318,19 @@ pub fn target_scope_shape_is_valid(receipt: &GitTargetScopeReceipt) -> bool {
             .merge_base_oids
             .windows(2)
             .all(|pair| pair[0] < pair[1])
-        && receipt
-            .effective_paths
-            .iter()
-            .all(|path| crate::paths::normalize(path).is_ok_and(|normalized| normalized == *path))
-        && receipt
-            .effective_paths
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
+        && validate_full_oid(&receipt.object_format, &receipt.prospective_merge_tree_oid)
+        && canonical_sorted_paths(&receipt.candidate_side_paths)
+        && canonical_sorted_paths(&receipt.prospective_target_effect_paths)
+        && canonical_sorted_paths(&receipt.effective_paths)
+        && receipt.effective_paths
+            == receipt
+                .candidate_side_paths
+                .iter()
+                .chain(receipt.prospective_target_effect_paths.iter())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
 }
 
 pub fn uncovered_target_scope_paths(
@@ -1238,39 +1370,66 @@ pub fn probe_landing(
     let caller_before_tip = before_tip
         .map(|reference| resolve_commit(cwd, reference))
         .transpose()?;
-    let (effective_before_tip, target_scope_evidence_id, target_scope_op_id) =
-        match (target_scope, target_scope_evidence_id, target_scope_op_id) {
-            (Some(target_scope), Some(target_scope_evidence_id), Some(target_scope_op_id))
-                if target_scope_shape_is_valid(target_scope)
-                    && target_scope.repository_id == repository_id
-                    && target_scope.object_format == object_format
-                    && target_scope.candidate_oid == candidate_oid
-                    && target_scope.target_ref == target_ref
-                    && !target_scope_evidence_id.trim().is_empty()
-                    && !target_scope_op_id.trim().is_empty() =>
+    let (
+        effective_before_tip,
+        target_ref_full_name,
+        landing_effect_paths,
+        target_scope_evidence_id,
+        target_scope_op_id,
+    ) = match (target_scope, target_scope_evidence_id, target_scope_op_id) {
+        (Some(target_scope), Some(target_scope_evidence_id), Some(target_scope_op_id))
+            if target_scope_shape_is_valid(target_scope)
+                && target_scope.repository_id == repository_id
+                && target_scope.object_format == object_format
+                && target_scope.candidate_oid == candidate_oid
+                && target_scope.target_ref == target_ref
+                && !target_scope_evidence_id.trim().is_empty()
+                && !target_scope_op_id.trim().is_empty() =>
+        {
+            let target_ref_full_name = resolve_mutable_ref(cwd, target_ref)?;
+            if target_ref_full_name != target_scope.target_ref_full_name
+                || resolve_commit(cwd, &target_ref_full_name)? != after_tip
             {
-                if caller_before_tip
-                    .as_ref()
-                    .is_some_and(|before| before != &target_scope.observed_target_oid)
-                {
-                    return Err(
-                        "--before does not match the recorded target-scope observation".into(),
-                    );
-                }
-                (
-                    Some(target_scope.observed_target_oid.clone()),
-                    Some(target_scope_evidence_id.to_string()),
-                    Some(target_scope_op_id.to_string()),
-                )
+                return Err("target-scope evidence is stale: target ref identity changed".into());
             }
-            (None, None, None) => (caller_before_tip, None, None),
-            _ => {
+            let immediate_before_tip =
+                immediate_ref_preimage(cwd, object_format, &target_ref_full_name, &after_tip)?;
+            if immediate_before_tip != target_scope.observed_target_oid {
                 return Err(
-                    "landing target-scope evidence does not match candidate and target anchors"
-                        .into(),
+                        "target-scope evidence is stale: immediate target preimage does not match target-scope evidence"
+                            .into(),
+                    );
+            }
+            if caller_before_tip
+                .as_ref()
+                .is_some_and(|before| before != &immediate_before_tip)
+            {
+                return Err(
+                    "--before does not match the reflog-proved immediate target preimage".into(),
                 );
             }
-        };
+            let landing_effect_paths =
+                changed_paths_without_rename_inference(cwd, &immediate_before_tip, &after_tip)?;
+            if landing_effect_paths != target_scope.prospective_target_effect_paths {
+                return Err(
+                    "actual target-to-result paths do not match target-scope evidence".into(),
+                );
+            }
+            (
+                Some(immediate_before_tip),
+                Some(target_ref_full_name),
+                landing_effect_paths,
+                Some(target_scope_evidence_id.to_string()),
+                Some(target_scope_op_id.to_string()),
+            )
+        }
+        (None, None, None) => (caller_before_tip, None, Vec::new(), None, None),
+        _ => {
+            return Err(
+                "landing target-scope evidence does not match candidate and target anchors".into(),
+            );
+        }
+    };
     let relation = ancestor_relation(cwd, candidate_oid, &after_tip);
     let candidate_reachable = match relation {
         GitRelationKind::Ancestor => Some(true),
@@ -1298,8 +1457,10 @@ pub fn probe_landing(
         object_format: observed_format,
         candidate_oid: candidate_oid.to_string(),
         target_ref: target_ref.to_string(),
+        target_ref_full_name,
         before_tip: effective_before_tip,
         after_tip,
+        landing_effect_paths,
         candidate_reachable,
         authorization_op_id: authorization_op_id.to_string(),
         basis_op_ids,

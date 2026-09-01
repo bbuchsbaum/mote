@@ -207,8 +207,17 @@ fn direct_target_is_blocked_until_exact_scope_then_becomes_landable() {
     assert_eq!(scoped["landability"]["landable"], true);
     let receipt = target_scope_receipt(&scoped);
     assert_eq!(receipt["observed_target_oid"], fixture.root_commit);
+    assert_eq!(receipt["target_ref_full_name"], "refs/heads/main");
     assert_eq!(receipt["candidate_is_ancestor_of_target"], false);
     assert_eq!(receipt["base_is_ancestor_of_target"], true);
+    assert_eq!(
+        receipt["candidate_side_paths"],
+        serde_json::json!(["work.txt"])
+    );
+    assert_eq!(
+        receipt["prospective_target_effect_paths"],
+        serde_json::json!(["work.txt"])
+    );
     assert_eq!(receipt["effective_paths"], serde_json::json!(["work.txt"]));
 }
 
@@ -327,6 +336,57 @@ fn rename_scope_conservatively_contains_source_and_destination() {
 }
 
 #[test]
+fn target_side_rename_expands_scope_to_the_actual_destination() {
+    let fixture = fixture(&[("old.txt", "root\n")]);
+    run_git(&fixture.root, &["switch", "-qc", "candidate"]);
+    std::fs::write(fixture.root.join("old.txt"), "candidate\n").unwrap();
+    run_git(&fixture.root, &["commit", "-qam", "modify source"]);
+
+    run_git(&fixture.root, &["switch", "main"]);
+    run_git(&fixture.root, &["mv", "old.txt", "new.txt"]);
+    run_git(&fixture.root, &["commit", "-qm", "rename on target"]);
+    run_git(&fixture.root, &["switch", "candidate"]);
+
+    let proposed = propose(
+        &fixture,
+        &fixture.root_commit,
+        &["old.txt"],
+        "propose-target-rename",
+    );
+    let candidate_id = proposed["candidate_id"].as_str().unwrap();
+    let scoped = record_target_scope(&fixture, candidate_id, "main", "scope-target-rename");
+    let receipt = target_scope_receipt(&scoped);
+    assert_eq!(
+        receipt["prospective_target_effect_paths"],
+        serde_json::json!(["new.txt"])
+    );
+    assert_eq!(
+        receipt["effective_paths"],
+        serde_json::json!(["new.txt", "old.txt"])
+    );
+    assert!(
+        scoped["landability"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| {
+                reason["code"] == "target_scope_uncovered"
+                    && reason["detail"].as_str().unwrap().contains("new.txt")
+            })
+    );
+
+    run_git(&fixture.root, &["switch", "main"]);
+    run_git(
+        &fixture.root,
+        &["merge", "--no-ff", "-qm", "merge candidate", "candidate"],
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("new.txt")).unwrap(),
+        "candidate\n"
+    );
+}
+
+#[test]
 fn target_advancement_invalidates_the_recorded_landing_preimage() {
     let fixture = fixture(&[("root.txt", "root\n")]);
     run_git(&fixture.root, &["switch", "-qc", "candidate"]);
@@ -376,6 +436,130 @@ fn target_advancement_invalidates_the_recorded_landing_preimage() {
     );
     assert!(!landed.status.success());
     assert!(String::from_utf8_lossy(&landed.stderr).contains("target-scope evidence is stale"));
+    let state = reducer::replay_store(&fixture.store).unwrap();
+    assert_eq!(state.candidates[candidate_id].phase.as_str(), "pending");
+}
+
+#[test]
+fn linear_target_advancement_cannot_reuse_an_older_scope_preimage() {
+    let fixture = fixture(&[("root.txt", "root\n")]);
+    run_git(&fixture.root, &["switch", "-qc", "candidate"]);
+    std::fs::write(fixture.root.join("advance.txt"), "advance\n").unwrap();
+    run_git(&fixture.root, &["add", "advance.txt"]);
+    run_git(&fixture.root, &["commit", "-qm", "linear advance"]);
+    let advanced_target_oid = run_git(&fixture.root, &["rev-parse", "HEAD"]);
+    std::fs::write(fixture.root.join("candidate.txt"), "candidate\n").unwrap();
+    run_git(&fixture.root, &["add", "candidate.txt"]);
+    run_git(&fixture.root, &["commit", "-qm", "candidate tip"]);
+    let candidate_oid = run_git(&fixture.root, &["rev-parse", "HEAD"]);
+
+    let proposed = propose(
+        &fixture,
+        &fixture.root_commit,
+        &["advance.txt", "candidate.txt"],
+        "propose-linear-advance",
+    );
+    let candidate_id = proposed["candidate_id"].as_str().unwrap();
+    let phase_op = proposed["phase"]["op_id"].as_str().unwrap();
+    record_target_scope(
+        &fixture,
+        candidate_id,
+        "main",
+        "scope-before-linear-advance",
+    );
+    let authorized = review_and_authorize(&fixture, candidate_id);
+    assert_eq!(authorized["landability"]["landable"], true);
+    let authorization_op = authorized["authorization"]["op_id"].as_str().unwrap();
+
+    run_git(
+        &fixture.root,
+        &["branch", "-f", "main", &advanced_target_oid],
+    );
+    run_git(&fixture.root, &["branch", "-f", "main", &candidate_oid]);
+
+    let landed = run_mote(
+        &fixture.root,
+        "lander",
+        &[
+            "candidate",
+            "landed",
+            candidate_id,
+            "--target",
+            "main",
+            "--expect-phase",
+            phase_op,
+            "--expect-authorization",
+            authorization_op,
+            "--idempotency-key",
+            "land-after-linear-advance",
+        ],
+    );
+    assert!(!landed.status.success());
+    assert!(
+        String::from_utf8_lossy(&landed.stderr)
+            .contains("immediate target preimage does not match target-scope evidence")
+    );
+    let state = reducer::replay_store(&fixture.store).unwrap();
+    assert_eq!(state.candidates[candidate_id].phase.as_str(), "pending");
+}
+
+#[test]
+fn landing_result_with_an_unscoped_actual_effect_is_rejected() {
+    let fixture = fixture(&[("root.txt", "root\n")]);
+    run_git(&fixture.root, &["switch", "-qc", "candidate"]);
+    std::fs::write(fixture.root.join("candidate.txt"), "candidate\n").unwrap();
+    run_git(&fixture.root, &["add", "candidate.txt"]);
+    run_git(&fixture.root, &["commit", "-qm", "candidate"]);
+
+    let proposed = propose(
+        &fixture,
+        &fixture.root_commit,
+        &["candidate.txt"],
+        "propose-tampered-result",
+    );
+    let candidate_id = proposed["candidate_id"].as_str().unwrap();
+    let phase_op = proposed["phase"]["op_id"].as_str().unwrap();
+    record_target_scope(
+        &fixture,
+        candidate_id,
+        "main",
+        "scope-before-tampered-result",
+    );
+    let authorized = review_and_authorize(&fixture, candidate_id);
+    assert_eq!(authorized["landability"]["landable"], true);
+    let authorization_op = authorized["authorization"]["op_id"].as_str().unwrap();
+
+    run_git(&fixture.root, &["switch", "main"]);
+    run_git(
+        &fixture.root,
+        &["merge", "--no-ff", "--no-commit", "candidate"],
+    );
+    std::fs::write(fixture.root.join("extra.txt"), "not scoped\n").unwrap();
+    run_git(&fixture.root, &["add", "extra.txt"]);
+    run_git(&fixture.root, &["commit", "-qm", "tampered merge result"]);
+
+    let landed = run_mote(
+        &fixture.root,
+        "lander",
+        &[
+            "candidate",
+            "landed",
+            candidate_id,
+            "--target",
+            "main",
+            "--expect-phase",
+            phase_op,
+            "--expect-authorization",
+            authorization_op,
+            "--idempotency-key",
+            "land-tampered-result",
+        ],
+    );
+    assert!(!landed.status.success());
+    assert!(
+        String::from_utf8_lossy(&landed.stderr)
+            .contains("actual target-to-result paths do not match target-scope evidence")
+    );
     let state = reducer::replay_store(&fixture.store).unwrap();
     assert_eq!(state.candidates[candidate_id].phase.as_str(), "pending");
 }

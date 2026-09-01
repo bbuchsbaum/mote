@@ -349,6 +349,19 @@ fn standalone_proposal_blocks_until_shared_repository_has_object_then_lands() {
     );
     let landed: serde_json::Value = serde_json::from_slice(&landed.stdout).unwrap();
     assert_eq!(landed["phase"]["value"], "landed");
+    let landing_receipt = landed["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|evidence| evidence["name"] == "git-landing")
+        .map(|evidence| &evidence["payload"])
+        .unwrap();
+    assert_eq!(landing_receipt["target_ref_full_name"], "refs/heads/main");
+    assert_eq!(landing_receipt["before_tip"], repositories.base);
+    assert_eq!(
+        landing_receipt["landing_effect_paths"],
+        serde_json::json!(["work.txt"])
+    );
 }
 
 #[test]

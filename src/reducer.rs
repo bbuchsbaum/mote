@@ -5942,8 +5942,12 @@ fn apply_candidate_landed(
                                         && scope.candidate_oid == candidate.commit_oid
                                         && scope.candidate_base_oid == candidate.base_oid
                                         && scope.target_ref == o.target_ref
+                                        && git.target_ref_full_name.as_deref()
+                                            == Some(scope.target_ref_full_name.as_str())
                                         && git.before_tip.as_deref()
                                             == Some(scope.observed_target_oid.as_str())
+                                        && git.landing_effect_paths
+                                            == scope.prospective_target_effect_paths
                                         && crate::candidate::uncovered_target_scope_paths(
                                             &candidate.paths,
                                             &scope.effective_paths,
