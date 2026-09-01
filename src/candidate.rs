@@ -24,6 +24,10 @@ fn legacy_git_relation_schema() -> u32 {
     1
 }
 
+fn is_legacy_git_relation_schema(value: &u32) -> bool {
+    *value == legacy_git_relation_schema()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidatePhase {
@@ -321,7 +325,10 @@ pub struct CandidateSnapshotProvenance {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitAncestryReceipt {
-    #[serde(default = "legacy_git_relation_schema")]
+    #[serde(
+        default = "legacy_git_relation_schema",
+        skip_serializing_if = "is_legacy_git_relation_schema"
+    )]
     pub relation_schema: u32,
     pub repository_id: String,
     pub object_format: String,

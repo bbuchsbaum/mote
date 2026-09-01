@@ -8,7 +8,7 @@ use mote::candidate::{
     CandidateSupersessionAuthority, EvidenceOutcome, EvidenceRequirement, GIT_ANCESTRY_EVIDENCE,
     GIT_LANDING_EVIDENCE, GIT_REACHABILITY_EVIDENCE, GIT_RELATION_SCHEMA_V2, GitAncestryReceipt,
     GitCandidateRelation, GitLandingReceipt, GitReachabilityReceipt, GitRelationKind,
-    KnownCandidate, ReviewVerdict,
+    KnownCandidate, ReviewVerdict, evidence_id,
 };
 use mote::ids;
 use mote::op::{
@@ -318,7 +318,7 @@ fn containment_recovery(
 
 #[test]
 fn legacy_git_ancestry_payload_defaults_to_one_directional_schema() {
-    let payload: CandidateEvidencePayload = serde_json::from_value(serde_json::json!({
+    let legacy_json = serde_json::json!({
         "kind": "git_ancestry",
         "repository_id": REPO,
         "object_format": "sha1",
@@ -336,9 +336,21 @@ fn legacy_git_ancestry_payload_defaults_to_one_directional_schema() {
         }],
         "covered_candidates": [["cand-legacy", "op-legacy"]],
         "git_version": "git version legacy"
-    }))
-    .unwrap();
-    let CandidateEvidencePayload::GitAncestry(receipt) = payload else {
+    });
+    let payload: CandidateEvidencePayload = serde_json::from_value(legacy_json.clone()).unwrap();
+
+    assert_eq!(
+        evidence_id(&payload).unwrap(),
+        evidence_id(&legacy_json).unwrap(),
+        "materializing the legacy schema default must not change evidence identity"
+    );
+    let serialized = serde_json::to_value(&payload).unwrap();
+    assert!(
+        serialized.get("relation_schema").is_none(),
+        "schema 1 must retain its historical omitted-field representation"
+    );
+
+    let CandidateEvidencePayload::GitAncestry(receipt) = &payload else {
         unreachable!();
     };
     assert_eq!(receipt.relation_schema, 1);
@@ -353,6 +365,13 @@ fn legacy_git_ancestry_payload_defaults_to_one_directional_schema() {
         receipt.candidate_relations[0]
             .subject_to_known_tip
             .is_none()
+    );
+
+    let current = v2_ancestry_payload(COMMIT_A, Vec::new(), Vec::new(), "current-snapshot");
+    assert_eq!(
+        serde_json::to_value(current).unwrap()["relation_schema"],
+        GIT_RELATION_SCHEMA_V2,
+        "schema 2 remains explicit and identity-bearing"
     );
 }
 
