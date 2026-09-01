@@ -758,6 +758,15 @@ pub enum CandidateEvidenceCmd {
         #[arg(long)]
         idempotency_key: String,
     },
+    /// Observe the conservative candidate-side path effect for one exact landing target
+    TargetScope {
+        candidate_id: String,
+        /// Exact Git ref intended as the landing target
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
     /// Record external evidence with a caller-provided content digest
     Record {
         candidate_id: String,
@@ -3067,6 +3076,54 @@ fn cmd_candidate(
                 .candidates
                 .get(&candidate_id)
                 .ok_or_else(|| MoteError::Invalid("candidate does not exist".into()))?;
+            let target_scope = if candidate.object_availability_required {
+                let target_scope_record = candidate
+                    .evidence
+                    .values()
+                    .filter(|evidence| {
+                        evidence.name == crate::candidate::GIT_TARGET_SCOPE_EVIDENCE
+                    })
+                    .max_by(|left, right| left.op_id.cmp(&right.op_id))
+                    .ok_or_else(|| {
+                        MoteError::Rejected(
+                            "candidate has no target-scope evidence; run `mote candidate evidence target-scope` for the exact landing target before changing Git"
+                                .into(),
+                        )
+                    })?;
+                match &target_scope_record.payload {
+                    crate::candidate::CandidateEvidencePayload::GitTargetScope(scope)
+                        if target_scope_record.outcome
+                            == crate::candidate::EvidenceOutcome::Pass
+                            && crate::candidate::target_scope_shape_is_valid(scope)
+                            && scope.repository_id == candidate.landing_repository_id
+                            && scope.landing_repository_op_id
+                                == candidate.landing_repository_op_id
+                            && scope.object_format == candidate.object_format
+                            && scope.candidate_oid == candidate.commit_oid
+                            && scope.candidate_base_oid == candidate.base_oid
+                            && scope.target_ref == target
+                            && crate::candidate::uncovered_target_scope_paths(
+                                &candidate.paths,
+                                &scope.effective_paths,
+                            )
+                            .is_empty() =>
+                    {
+                        Some((
+                            scope.clone(),
+                            target_scope_record.evidence_id.clone(),
+                            target_scope_record.op_id.clone(),
+                        ))
+                    }
+                    _ => {
+                        return Err(MoteError::Rejected(
+                            "latest target-scope evidence is stale, targets another ref, or exposes paths outside the immutable candidate policy"
+                                .into(),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
             let mut basis: Vec<String> = candidate
                 .reviews
                 .values()
@@ -3089,6 +3146,11 @@ fn cmd_candidate(
                 before.as_deref(),
                 &expect_authorization,
                 basis,
+                target_scope.as_ref().map(|(scope, _, _)| scope),
+                target_scope
+                    .as_ref()
+                    .map(|(_, evidence_id, _)| evidence_id.as_str()),
+                target_scope.as_ref().map(|(_, _, op_id)| op_id.as_str()),
             )
             .map_err(crate::candidate::git_probe_error)?;
             let outcome = match receipt.candidate_reachable {
@@ -3400,6 +3462,7 @@ fn cmd_candidate_evidence(
     let candidate_id = match &cmd {
         CandidateEvidenceCmd::Refresh { candidate_id, .. }
         | CandidateEvidenceCmd::Availability { candidate_id, .. }
+        | CandidateEvidenceCmd::TargetScope { candidate_id, .. }
         | CandidateEvidenceCmd::Record { candidate_id, .. } => candidate_id.clone(),
     };
     let candidate = state
@@ -3468,13 +3531,18 @@ fn cmd_candidate_evidence(
             }
             None
         }
-        CandidateEvidenceCmd::Availability { .. } | CandidateEvidenceCmd::Record { .. } => None,
+        CandidateEvidenceCmd::Availability { .. }
+        | CandidateEvidenceCmd::TargetScope { .. }
+        | CandidateEvidenceCmd::Record { .. } => None,
     };
 
     if let CandidateEvidenceCmd::Refresh {
         idempotency_key, ..
     }
     | CandidateEvidenceCmd::Availability {
+        idempotency_key, ..
+    }
+    | CandidateEvidenceCmd::TargetScope {
         idempotency_key, ..
     } = &cmd
     {
@@ -3526,6 +3594,19 @@ fn cmd_candidate_evidence(
                             && matches!(
                                 &evidence.payload,
                                 crate::candidate::CandidateEvidencePayload::GitObjectAvailability(_)
+                            )
+                ),
+                CandidateEvidenceCmd::TargetScope { target, .. } => matches!(
+                    previous_op,
+                    op::Op::CandidateEvidence(ref evidence)
+                        if evidence.actor == actor
+                            && evidence.candidate_id == candidate_id
+                            && evidence.name == crate::candidate::GIT_TARGET_SCOPE_EVIDENCE
+                            && evidence.evidence_kind == "git"
+                            && matches!(
+                                &evidence.payload,
+                                crate::candidate::CandidateEvidencePayload::GitTargetScope(scope)
+                                    if scope.target_ref == *target
                             )
                 ),
                 CandidateEvidenceCmd::Record { .. } => false,
@@ -3741,6 +3822,41 @@ fn cmd_candidate_evidence(
                 );
             }
             operation
+        }
+        CandidateEvidenceCmd::TargetScope {
+            candidate_id,
+            target,
+            idempotency_key,
+        } => {
+            let repository_cwd = store_repository_cwd(store)?;
+            let receipt = crate::candidate::probe_target_scope(
+                &repository_cwd,
+                &candidate.landing_repository_id,
+                &candidate.landing_repository_op_id,
+                &candidate.object_format,
+                &candidate.commit_oid,
+                &candidate.base_oid,
+                &target,
+            )
+            .map_err(crate::candidate::git_probe_error)?;
+            let producer_tool = receipt.git_version.clone();
+            let payload = crate::candidate::CandidateEvidencePayload::GitTargetScope(receipt);
+            op::Op::CandidateEvidence(op::CandidateEvidenceOp {
+                v: 1,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id,
+                candidate_oid: candidate.commit_oid.clone(),
+                evidence_id: crate::candidate::evidence_id(&payload)?,
+                name: crate::candidate::GIT_TARGET_SCOPE_EVIDENCE.into(),
+                evidence_kind: "git".into(),
+                producer_tool,
+                outcome: crate::candidate::EvidenceOutcome::Pass,
+                payload,
+                refs: Vec::new(),
+                idempotency_key,
+            })
         }
         CandidateEvidenceCmd::Record {
             candidate_id,

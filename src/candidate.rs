@@ -20,6 +20,8 @@ pub const GIT_LANDING_EVIDENCE: &str = "git-landing";
 pub const GIT_REACHABILITY_EVIDENCE: &str = "git-reachability";
 pub const GIT_RECONCILIATION_REACHABILITY_EVIDENCE: &str = "git-reconciliation-reachability";
 pub const GIT_OBJECT_AVAILABILITY_EVIDENCE: &str = "git-object-availability";
+pub const GIT_TARGET_SCOPE_EVIDENCE: &str = "git-target-scope";
+pub const GIT_TARGET_SCOPE_SCHEMA_V1: u32 = 1;
 
 fn legacy_git_relation_schema() -> u32 {
     1
@@ -403,6 +405,12 @@ pub struct GitLandingReceipt {
     pub candidate_reachable: Option<bool>,
     pub authorization_op_id: String,
     pub basis_op_ids: Vec<String>,
+    /// Exact target-scope observation used as the pre-landing target CAS.
+    /// Optional only so historical landing receipts remain replayable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_scope_evidence_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_scope_op_id: Option<String>,
     pub git_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -440,6 +448,33 @@ pub struct GitObjectAvailabilityReceipt {
     pub detail: Option<String>,
 }
 
+/// Exact, replayable observation of the candidate-side paths that can affect
+/// one named landing target. The CLI derives repository and object identities
+/// from Git; callers choose only the ref to observe.
+///
+/// `effective_paths` is the sorted union of `merge-base..candidate` diffs for
+/// every merge base. Diffs run with rename detection disabled, so a rename is
+/// conservatively represented by both its source deletion and destination
+/// addition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitTargetScopeReceipt {
+    pub scope_schema: u32,
+    pub repository_id: String,
+    pub landing_repository_op_id: String,
+    pub object_format: String,
+    pub candidate_oid: String,
+    pub candidate_base_oid: String,
+    pub target_ref: String,
+    pub observed_target_oid: String,
+    pub candidate_is_ancestor_of_target: Option<bool>,
+    pub base_is_ancestor_of_target: Option<bool>,
+    pub merge_base_oids: Vec<String>,
+    pub effective_paths: Vec<String>,
+    pub git_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CandidateEvidencePayload {
@@ -451,6 +486,7 @@ pub enum CandidateEvidencePayload {
     GitLanding(GitLandingReceipt),
     GitReachability(GitReachabilityReceipt),
     GitObjectAvailability(GitObjectAvailabilityReceipt),
+    GitTargetScope(GitTargetScopeReceipt),
     External {
         digest: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -533,6 +569,9 @@ pub enum LandabilityReasonCode {
     ObjectUnreachable,
     ObjectAvailabilityUnavailable,
     ObjectAvailabilityMissing,
+    TargetScopeEvidenceMissing,
+    TargetScopeEvidenceStale,
+    TargetScopeUncovered,
     ActorNotGrantee,
     ConditionUnsatisfied,
     AuthorizationRevoked,
@@ -547,7 +586,7 @@ pub enum LandabilityReasonCode {
 }
 
 impl LandabilityReasonCode {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 36] = [
         Self::CandidateMissing,
         Self::PhaseNotPending,
         Self::ReviewBlocking,
@@ -570,6 +609,9 @@ impl LandabilityReasonCode {
         Self::ObjectUnreachable,
         Self::ObjectAvailabilityUnavailable,
         Self::ObjectAvailabilityMissing,
+        Self::TargetScopeEvidenceMissing,
+        Self::TargetScopeEvidenceStale,
+        Self::TargetScopeUncovered,
         Self::ActorNotGrantee,
         Self::ConditionUnsatisfied,
         Self::AuthorizationRevoked,
@@ -607,6 +649,9 @@ impl LandabilityReasonCode {
             Self::ObjectUnreachable => "object_unreachable",
             Self::ObjectAvailabilityUnavailable => "object_availability_unavailable",
             Self::ObjectAvailabilityMissing => "object_availability_missing",
+            Self::TargetScopeEvidenceMissing => "target_scope_evidence_missing",
+            Self::TargetScopeEvidenceStale => "target_scope_evidence_stale",
+            Self::TargetScopeUncovered => "target_scope_uncovered",
             Self::ActorNotGrantee => "actor_not_grantee",
             Self::ConditionUnsatisfied => "condition_unsatisfied",
             Self::AuthorizationRevoked => "authorization_revoked",
@@ -638,6 +683,7 @@ impl LandabilityReasonCode {
             | Self::ObjectUnreachable
             | Self::ObjectAvailabilityUnavailable
             | Self::ObjectAvailabilityMissing
+            | Self::TargetScopeEvidenceMissing
             | Self::ActorNotGrantee
             | Self::ConditionUnsatisfied
             | Self::AuthorizationRevoked
@@ -651,11 +697,13 @@ impl LandabilityReasonCode {
             | Self::AncestorMissing
             | Self::RepositoryMismatch
             | Self::ProposalAnchorMismatch
+            | Self::TargetScopeEvidenceStale
             | Self::SupersessionCycle
             | Self::SupersessionBroken
             | Self::AncestorSupersessionUnresolved
             | Self::AncestorPending
             | Self::AncestorAbandoned => LandabilityReasonClass::Bookkeeping,
+            Self::TargetScopeUncovered => LandabilityReasonClass::Substantive,
         }
     }
 
@@ -978,6 +1026,196 @@ fn probe_ancestry_in_landing_repository(
     })
 }
 
+fn merge_bases(cwd: &Path, left: &str, right: &str) -> Result<Vec<String>, String> {
+    let output = git_output(cwd, &["merge-base", "--all", left, right])?;
+    if !output.status.success() {
+        return Err(format!(
+            "git merge-base --all failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("git merge-base --all returned non-UTF-8 output: {error}"))?;
+    let mut bases = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    bases.sort();
+    bases.dedup();
+    if bases.is_empty() {
+        return Err("candidate and landing target have no merge base".into());
+    }
+    Ok(bases)
+}
+
+fn changed_paths_without_rename_inference(
+    cwd: &Path,
+    base_oid: &str,
+    candidate_oid: &str,
+) -> Result<Vec<String>, String> {
+    let output = git_output(
+        cwd,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            base_oid,
+            candidate_oid,
+            "--",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git diff --name-only failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| {
+            let path = std::str::from_utf8(raw)
+                .map_err(|error| format!("Git path is not UTF-8: {error}"))?;
+            crate::paths::normalize(path)
+                .map_err(|error| format!("Git returned a non-canonical repository path: {error}"))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn probe_target_scope(
+    cwd: &Path,
+    repository_id: &str,
+    landing_repository_op_id: &str,
+    object_format: &str,
+    candidate_oid: &str,
+    candidate_base_oid: &str,
+    target_ref: &str,
+) -> Result<GitTargetScopeReceipt, String> {
+    let (observed_repository, observed_format, _) = repository_identity(cwd)?;
+    if observed_repository != repository_id || observed_format != object_format {
+        return Err(
+            "target-scope repository identity does not match candidate landing repository".into(),
+        );
+    }
+    if landing_repository_op_id.trim().is_empty() {
+        return Err("target-scope evidence requires the current landing-repository binding".into());
+    }
+    let observed_candidate_oid = resolve_commit(cwd, candidate_oid)?;
+    let observed_candidate_base_oid = resolve_commit(cwd, candidate_base_oid)?;
+    if observed_candidate_oid != candidate_oid || observed_candidate_base_oid != candidate_base_oid
+    {
+        return Err("target-scope candidate anchors do not resolve exactly".into());
+    }
+    let observed_target_oid = resolve_commit(cwd, target_ref)?;
+    let candidate_is_ancestor_of_target = match ancestor_relation(
+        cwd,
+        candidate_oid,
+        &observed_target_oid,
+    ) {
+        GitRelationKind::Ancestor => {
+            return Err(
+                    "landing target already contains the candidate; use out-of-band reconciliation instead"
+                        .into(),
+                );
+        }
+        GitRelationKind::NotAncestor => Some(false),
+        GitRelationKind::Unavailable | GitRelationKind::Ambiguous => None,
+    };
+    if candidate_is_ancestor_of_target.is_none() {
+        return Err("candidate relation to landing target is unavailable or ambiguous".into());
+    }
+    let merge_base_oids = merge_bases(cwd, &observed_target_oid, candidate_oid)?;
+    if !merge_base_oids
+        .iter()
+        .all(|oid| validate_full_oid(object_format, oid))
+    {
+        return Err("target-scope merge base is not a full object id".into());
+    }
+    let mut effective_paths = std::collections::BTreeSet::new();
+    for merge_base_oid in &merge_base_oids {
+        effective_paths.extend(changed_paths_without_rename_inference(
+            cwd,
+            merge_base_oid,
+            candidate_oid,
+        )?);
+    }
+    let base_is_ancestor_of_target =
+        match ancestor_relation(cwd, candidate_base_oid, &observed_target_oid) {
+            GitRelationKind::Ancestor => Some(true),
+            GitRelationKind::NotAncestor => Some(false),
+            GitRelationKind::Unavailable | GitRelationKind::Ambiguous => None,
+        };
+    if base_is_ancestor_of_target.is_none() {
+        return Err("candidate base relation to landing target is unavailable or ambiguous".into());
+    }
+    Ok(GitTargetScopeReceipt {
+        scope_schema: GIT_TARGET_SCOPE_SCHEMA_V1,
+        repository_id: observed_repository,
+        landing_repository_op_id: landing_repository_op_id.to_string(),
+        object_format: observed_format,
+        candidate_oid: candidate_oid.to_string(),
+        candidate_base_oid: candidate_base_oid.to_string(),
+        target_ref: target_ref.to_string(),
+        observed_target_oid,
+        candidate_is_ancestor_of_target,
+        base_is_ancestor_of_target,
+        merge_base_oids,
+        effective_paths: effective_paths.into_iter().collect(),
+        git_version: git_version(cwd),
+        detail: None,
+    })
+}
+
+pub fn target_scope_shape_is_valid(receipt: &GitTargetScopeReceipt) -> bool {
+    receipt.scope_schema == GIT_TARGET_SCOPE_SCHEMA_V1
+        && !receipt.repository_id.trim().is_empty()
+        && !receipt.landing_repository_op_id.trim().is_empty()
+        && matches!(receipt.object_format.as_str(), "sha1" | "sha256")
+        && validate_full_oid(&receipt.object_format, &receipt.candidate_oid)
+        && validate_full_oid(&receipt.object_format, &receipt.candidate_base_oid)
+        && !receipt.target_ref.trim().is_empty()
+        && validate_full_oid(&receipt.object_format, &receipt.observed_target_oid)
+        && receipt.candidate_is_ancestor_of_target == Some(false)
+        && receipt.base_is_ancestor_of_target.is_some()
+        && !receipt.merge_base_oids.is_empty()
+        && receipt
+            .merge_base_oids
+            .iter()
+            .all(|oid| validate_full_oid(&receipt.object_format, oid))
+        && receipt
+            .merge_base_oids
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+        && receipt
+            .effective_paths
+            .iter()
+            .all(|path| crate::paths::normalize(path).is_ok_and(|normalized| normalized == *path))
+        && receipt
+            .effective_paths
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+}
+
+pub fn uncovered_target_scope_paths(
+    declared_paths: &[String],
+    effective_paths: &[String],
+) -> Vec<String> {
+    effective_paths
+        .iter()
+        .filter(|effective| {
+            !declared_paths
+                .iter()
+                .any(|declared| crate::paths::overlap(declared, effective))
+        })
+        .cloned()
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn probe_landing(
     cwd: &Path,
@@ -988,31 +1226,85 @@ pub fn probe_landing(
     before_tip: Option<&str>,
     authorization_op_id: &str,
     basis_op_ids: Vec<String>,
+    target_scope: Option<&GitTargetScopeReceipt>,
+    target_scope_evidence_id: Option<&str>,
+    target_scope_op_id: Option<&str>,
 ) -> Result<GitLandingReceipt, String> {
     let (observed_repository, observed_format, _) = repository_identity(cwd)?;
     if observed_repository != repository_id || observed_format != object_format {
         return Err("landing repository identity does not match candidate".into());
     }
     let after_tip = resolve_commit(cwd, target_ref)?;
-    let before_tip = before_tip
+    let caller_before_tip = before_tip
         .map(|reference| resolve_commit(cwd, reference))
         .transpose()?;
+    let (effective_before_tip, target_scope_evidence_id, target_scope_op_id) =
+        match (target_scope, target_scope_evidence_id, target_scope_op_id) {
+            (Some(target_scope), Some(target_scope_evidence_id), Some(target_scope_op_id))
+                if target_scope_shape_is_valid(target_scope)
+                    && target_scope.repository_id == repository_id
+                    && target_scope.object_format == object_format
+                    && target_scope.candidate_oid == candidate_oid
+                    && target_scope.target_ref == target_ref
+                    && !target_scope_evidence_id.trim().is_empty()
+                    && !target_scope_op_id.trim().is_empty() =>
+            {
+                if caller_before_tip
+                    .as_ref()
+                    .is_some_and(|before| before != &target_scope.observed_target_oid)
+                {
+                    return Err(
+                        "--before does not match the recorded target-scope observation".into(),
+                    );
+                }
+                (
+                    Some(target_scope.observed_target_oid.clone()),
+                    Some(target_scope_evidence_id.to_string()),
+                    Some(target_scope_op_id.to_string()),
+                )
+            }
+            (None, None, None) => (caller_before_tip, None, None),
+            _ => {
+                return Err(
+                    "landing target-scope evidence does not match candidate and target anchors"
+                        .into(),
+                );
+            }
+        };
     let relation = ancestor_relation(cwd, candidate_oid, &after_tip);
     let candidate_reachable = match relation {
         GitRelationKind::Ancestor => Some(true),
         GitRelationKind::NotAncestor => Some(false),
         GitRelationKind::Unavailable | GitRelationKind::Ambiguous => None,
     };
+    if let (Some(true), Some(target_scope)) = (candidate_reachable, target_scope) {
+        let exact_transition = if after_tip == candidate_oid {
+            ancestor_relation(cwd, &target_scope.observed_target_oid, candidate_oid)
+                == GitRelationKind::Ancestor
+        } else {
+            commit_parents(cwd, &after_tip)?
+                .first()
+                .is_some_and(|parent| parent == &target_scope.observed_target_oid)
+        };
+        if !exact_transition {
+            return Err(
+                "target-scope evidence is stale: the observed target is not the exact landing preimage"
+                    .into(),
+            );
+        }
+    }
     Ok(GitLandingReceipt {
         repository_id: observed_repository,
         object_format: observed_format,
         candidate_oid: candidate_oid.to_string(),
         target_ref: target_ref.to_string(),
-        before_tip,
+        before_tip: effective_before_tip,
         after_tip,
         candidate_reachable,
         authorization_op_id: authorization_op_id.to_string(),
         basis_op_ids,
+        target_scope_evidence_id,
+        target_scope_op_id,
         git_version: git_version(cwd),
         detail: None,
     })
@@ -1143,6 +1435,7 @@ mod landability_reason_tests {
             LandabilityReasonCode::ReviewRoleBlocking,
             LandabilityReasonCode::EvidenceFailed,
             LandabilityReasonCode::AncestorBlocked,
+            LandabilityReasonCode::TargetScopeUncovered,
         ];
         assert!(
             substantive
@@ -1162,6 +1455,7 @@ mod landability_reason_tests {
             LandabilityReasonCode::ObjectUnreachable,
             LandabilityReasonCode::ObjectAvailabilityUnavailable,
             LandabilityReasonCode::ObjectAvailabilityMissing,
+            LandabilityReasonCode::TargetScopeEvidenceMissing,
             LandabilityReasonCode::ActorNotGrantee,
             LandabilityReasonCode::ConditionUnsatisfied,
             LandabilityReasonCode::AuthorizationRevoked,

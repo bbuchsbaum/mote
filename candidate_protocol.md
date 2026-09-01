@@ -298,7 +298,39 @@ claim that mutable Git storage can never later be pruned. The final landing and
 reconciliation commands probe exact target reachability again. Reducer replay
 never opens the repository or silently fetches an object.
 
-### 4.7 Immutable-producer ancestry recovery
+### 4.7 Landing-target scope
+
+A portable or explicitly rebound candidate must publish `git-target-scope`
+before it can become landable. The command observes an explicit target ref in
+the repository backing the shared store and records the derived repository id,
+current landing-repository binding op, exact target OID, candidate and base
+OIDs, proof that the candidate was not already reachable from that target,
+every merge base, and a sorted conservative effective-path set. The
+repository identity and OIDs come from Git; they are not caller-selected
+labels.
+
+The path set is the union of `merge-base..candidate` for every merge base.
+Rename inference is disabled, deliberately representing a rename as its source
+deletion and destination addition. Every effective path must overlap an
+immutable declared candidate path. A missing observation yields
+`target_scope_evidence_missing`; a receipt bound to another repository,
+repository-binding clock, target, or candidate anchor yields
+`target_scope_evidence_stale`; an effective path outside policy yields
+`target_scope_uncovered`. All three block.
+
+The target ref is mutable, so reducer replay claims only the exact recorded OID.
+The final landing receipt names the current target-scope evidence and operation
+ids. A fast-forward must move from that target OID to the candidate; a merge
+must name that OID as the resulting commit's first parent. This exact-preimage
+check rejects target advancement between scope observation and landing rather
+than treating an older ancestor as current. Refreshing target scope publishes a
+new immutable evidence operation; it never rewrites candidate policy.
+An already-reachable candidate cannot obtain target-scope evidence: that state
+uses the explicit `candidate reconcile` path and remains visibly
+`landed_out_of_band`, rather than laundering ambient reachability into a
+governed landing.
+
+### 4.8 Immutable-producer ancestry recovery
 
 Ordinary `candidate evidence refresh` remains owned by a producer named in the
 immutable evidence requirement. When every named Git-ancestry producer is
@@ -326,7 +358,7 @@ records and audits them, but does not dereference them or treat them as a
 machine-rooted grant of authority. Every accepted use emits
 `candidate_ancestry_operator_override_recorded`.
 
-### 4.8 Containment-backed supersession recovery
+### 4.9 Containment-backed supersession recovery
 
 Ordinary supersession remains owned by the predecessor's proposer or immutable
 authorizer. A second, explicit recovery mode exists for the case where neither
@@ -352,7 +384,7 @@ candidates, infer patch equivalence, or turn containment into a governed landing
 claim. The supersession record retains actor, authority, evidence ids, op id,
 and timestamp, and `mote audit` surfaces recovery use for review.
 
-### 4.9 Out-of-band reachability reconciliation
+### 4.10 Out-of-band reachability reconciliation
 
 When a pending candidate is already reachable from an explicit Git target but
 the formal landing transition was never recorded, the proposal's immutable
@@ -601,9 +633,12 @@ A candidate is landable only when all of these are true:
 8. Every declared evidence requirement currently passes.
 9. A current typed receipt proves the exact candidate object is readable from
    the bound landing repository.
-10. Authorization is currently granted or conditional.
-11. Every condition named by a conditional grant passes.
-12. The prospective landing actor is in the grant's grantee set when checking
+10. For portable or rebound candidates, a current target-scope receipt is bound
+    to the landing repository and binding clock, and every conservative
+    effective path is covered by immutable policy.
+11. Authorization is currently granted or conditional.
+12. Every condition named by a conditional grant passes.
+13. The prospective landing actor is in the grant's grantee set when checking
     permission for `candidate landed`.
 
 An unknown relationship is not `not_ancestor`. It is ambiguity and blocks. In
@@ -613,18 +648,20 @@ unavailable, or ambiguous base-relative proof remains fail-closed.
 The closed reason vocabulary is classified as follows:
 
 - Substantive: `review_blocking`, `review_role_blocking`, `evidence_failed`,
-  `ancestor_blocked`.
+  `ancestor_blocked`, `target_scope_uncovered`.
 - Process: `review_missing`, `review_role_unavailable`,
   `review_role_approval_ineligible`, `review_role_quorum_missing`,
   `evidence_unavailable`, `evidence_missing`, `git_evidence_unavailable`,
   `git_evidence_missing`, `object_unreachable`,
   `object_availability_unavailable`, `object_availability_missing`,
+  `target_scope_evidence_missing`,
   `actor_not_grantee`, `condition_unsatisfied`,
   `authorization_revoked`, `authorization_absent`,
   `ancestor_authorization_revoked`.
 - Bookkeeping: `candidate_missing`, `phase_not_pending`, `base_not_ancestor`,
   `git_evidence_stale`, `ancestor_ambiguous`, `ancestor_missing`,
-  `repository_mismatch`, `proposal_anchor_mismatch`, `supersession_cycle`,
+  `repository_mismatch`, `proposal_anchor_mismatch`,
+  `target_scope_evidence_stale`, `supersession_cycle`,
   `supersession_broken`, `ancestor_supersession_unresolved`,
   `ancestor_pending`, `ancestor_abandoned`.
 
@@ -634,10 +671,14 @@ or authorization subject and full detail.
 
 ## 9. Landing evidence
 
-`candidate landed` requires a fresh built-in `git-landing` receipt. It records
+`candidate landed` requires a fresh built-in `git-landing` receipt. For a
+portable or rebound candidate it also requires a current `git-target-scope`
+receipt for the exact target ref before Git is changed. The landing receipt records
 the target ref, target tip before and after landing, the candidate object id,
 the current authorization op id, the current review and evidence basis op ids,
-and proof that the candidate commit is reachable from the after-tip. The
+the exact target-scope evidence/op ids, and proof that the candidate commit is
+reachable from the after-tip. The target-scope OID must be the exact
+fast-forward preimage or the first parent of the resulting merge. The
 receipt must be from the bound landing repository and object format, regardless
 of which repository supplied proposal ancestry.
 
@@ -834,6 +875,7 @@ mote candidate evidence refresh
 mote candidate evidence refresh CANDIDATE --operator-override \
   --expect-phase OP_ID --reason TEXT --authority-ref REF
 mote candidate evidence availability CANDIDATE
+mote candidate evidence target-scope CANDIDATE --target REF
 mote candidate review CANDIDATE approve
 mote candidate review CANDIDATE approve --from-role reviewer
 mote candidate amend-reviewers CANDIDATE --reviewer ACTOR \
@@ -920,6 +962,12 @@ optional `subject`, and `detail`.
   reducers reject a v3 proposal rather than silently dropping its portability
   contract; all candidate participants must be upgraded before portable
   candidates are written.
+- Target-scope evidence is mandatory for every portable v3 candidate and every
+  legacy candidate after explicit landing-repository binding. Legacy candidates
+  that remain repository-bound retain their prior landing behavior. The new
+  evidence payload and landing receipt fields are additive, but older reducers
+  do not enforce them; all candidate landability readers and landing writers
+  must be upgraded together.
 - Out-of-band reconciliation adds the `git_reachability` evidence payload,
   `candidate_reconcile` op, and `landed_out_of_band` phase. Older binaries may
   reject these additive variants and must be upgraded before writing candidate

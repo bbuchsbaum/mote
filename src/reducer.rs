@@ -4799,7 +4799,8 @@ fn apply_candidate_evidence(
         || (o.name == crate::candidate::GIT_REACHABILITY_EVIDENCE
             || o.name == crate::candidate::GIT_RECONCILIATION_REACHABILITY_EVIDENCE)
             && o.evidence_kind == "git"
-        || o.name == crate::candidate::GIT_OBJECT_AVAILABILITY_EVIDENCE
+        || (o.name == crate::candidate::GIT_OBJECT_AVAILABILITY_EVIDENCE
+            || o.name == crate::candidate::GIT_TARGET_SCOPE_EVIDENCE)
             && o.evidence_kind == "git"
             && (candidate.proposer == actor
                 || candidate.authorizer == actor
@@ -4950,6 +4951,48 @@ fn apply_candidate_evidence(
             ts,
             "git-object-availability payload requires the built-in git evidence name and kind"
                 .into(),
+        );
+        return;
+    }
+    if o.name == crate::candidate::GIT_TARGET_SCOPE_EVIDENCE {
+        match &o.payload {
+            crate::candidate::CandidateEvidencePayload::GitTargetScope(git)
+                if o.evidence_kind == "git"
+                    && o.outcome == crate::candidate::EvidenceOutcome::Pass
+                    && crate::candidate::target_scope_shape_is_valid(git)
+                    && git.repository_id == candidate.landing_repository_id
+                    && git.landing_repository_op_id == candidate.landing_repository_op_id
+                    && git.object_format == candidate.object_format
+                    && git.candidate_oid == candidate.commit_oid
+                    && git.candidate_base_oid == candidate.base_oid => {}
+            _ => {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "git-target-scope receipt does not match the current landing repository, binding, and immutable candidate anchors"
+                        .into(),
+                );
+                return;
+            }
+        }
+    }
+    if matches!(
+        &o.payload,
+        crate::candidate::CandidateEvidencePayload::GitTargetScope(_)
+    ) && (o.name != crate::candidate::GIT_TARGET_SCOPE_EVIDENCE || o.evidence_kind != "git")
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "git-target-scope payload requires the built-in git evidence name and kind".into(),
         );
         return;
     }
@@ -5864,17 +5907,56 @@ fn apply_candidate_landed(
         );
         return;
     };
+    let target_scope = candidate
+        .evidence
+        .values()
+        .filter(|evidence| evidence.name == crate::candidate::GIT_TARGET_SCOPE_EVIDENCE)
+        .max_by(|left, right| left.op_id.cmp(&right.op_id));
     let valid_receipt = receipt.outcome == crate::candidate::EvidenceOutcome::Pass
         && receipt.name == crate::candidate::GIT_LANDING_EVIDENCE
-        && matches!(
-            &receipt.payload,
+        && match &receipt.payload {
             crate::candidate::CandidateEvidencePayload::GitLanding(git)
                 if git.repository_id == candidate.landing_repository_id
+                    && git.object_format == candidate.object_format
                     && git.candidate_oid == candidate.commit_oid
                     && git.target_ref == o.target_ref
                     && git.authorization_op_id == o.expect_authorization
-                    && git.candidate_reachable == Some(true)
-        );
+                    && git.candidate_reachable == Some(true) =>
+            {
+                if candidate.object_availability_required {
+                    target_scope.is_some_and(|scope_record| {
+                        scope_record.outcome == crate::candidate::EvidenceOutcome::Pass
+                            && git.target_scope_evidence_id.as_deref()
+                                == Some(scope_record.evidence_id.as_str())
+                            && git.target_scope_op_id.as_deref()
+                                == Some(scope_record.op_id.as_str())
+                            && matches!(
+                                &scope_record.payload,
+                                crate::candidate::CandidateEvidencePayload::GitTargetScope(scope)
+                                    if crate::candidate::target_scope_shape_is_valid(scope)
+                                        && scope.repository_id
+                                            == candidate.landing_repository_id
+                                        && scope.landing_repository_op_id
+                                            == candidate.landing_repository_op_id
+                                        && scope.object_format == candidate.object_format
+                                        && scope.candidate_oid == candidate.commit_oid
+                                        && scope.candidate_base_oid == candidate.base_oid
+                                        && scope.target_ref == o.target_ref
+                                        && git.before_tip.as_deref()
+                                            == Some(scope.observed_target_oid.as_str())
+                                        && crate::candidate::uncovered_target_scope_paths(
+                                            &candidate.paths,
+                                            &scope.effective_paths,
+                                        )
+                                        .is_empty()
+                            )
+                    })
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
     if !valid_receipt {
         reject(
             state,
@@ -5883,7 +5965,7 @@ fn apply_candidate_landed(
             kind,
             actor,
             ts,
-            "landing receipt is not a passing exact-reachability receipt for this authorization"
+            "landing receipt is not a passing exact-reachability receipt bound to the current authorization and target-scope observation"
                 .into(),
         );
         return;
@@ -5904,6 +5986,13 @@ fn apply_candidate_landed(
         );
         return;
     }
+    let (target_scope_evidence_id, target_scope_op_id) = match &receipt.payload {
+        crate::candidate::CandidateEvidencePayload::GitLanding(git) => (
+            git.target_scope_evidence_id.clone(),
+            git.target_scope_op_id.clone(),
+        ),
+        _ => (None, None),
+    };
     let candidate = state
         .candidates
         .get_mut(&candidate_id)
@@ -5920,6 +6009,8 @@ fn apply_candidate_landed(
         evidence_id: o.evidence_id,
         authorization_op_id: o.expect_authorization,
         target_ref: o.target_ref,
+        target_scope_evidence_id,
+        target_scope_op_id,
         op_id: op_id.to_string(),
         ts: ts.to_string(),
     });

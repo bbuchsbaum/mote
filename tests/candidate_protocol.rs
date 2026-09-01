@@ -633,6 +633,8 @@ fn happy_path_consumes_authorization_and_is_replay_deterministic() {
         candidate_reachable: Some(true),
         authorization_op_id: authorization_op.clone(),
         basis_op_ids: Vec::new(),
+        target_scope_evidence_id: None,
+        target_scope_op_id: None,
         git_version: "git version test".into(),
         detail: None,
     });
@@ -841,6 +843,8 @@ fn out_of_band_reconciliation_preserves_policy_and_resolves_descendants() {
         candidate_reachable: Some(true),
         authorization_op_id: authorization_op.clone(),
         basis_op_ids: Vec::new(),
+        target_scope_evidence_id: None,
+        target_scope_op_id: None,
         git_version: "git version test".into(),
         detail: None,
     });
@@ -3579,6 +3583,7 @@ fn candidate_cli_happy_path_and_json_schema() {
     run_git(temp.path(), &["add", "work.txt"]);
     run_git(temp.path(), &["commit", "-qm", "base"]);
     let base = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    run_git(temp.path(), &["branch", "landing-target", &base]);
     std::fs::write(temp.path().join("work.txt"), "candidate\n").unwrap();
     run_git(temp.path(), &["commit", "-qam", "candidate"]);
 
@@ -3640,6 +3645,11 @@ fn candidate_cli_happy_path_and_json_schema() {
             .iter()
             .any(|reason| { reason["code"] == "review_missing" && reason["class"] == "process" })
     );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason["code"] == "target_scope_evidence_missing")
+    );
     let human = run_mote(temp.path(), &["candidate", "show", candidate_id]);
     assert!(human.status.success());
     let human = String::from_utf8(human.stdout).unwrap();
@@ -3691,6 +3701,27 @@ fn candidate_cli_happy_path_and_json_schema() {
         store.list_op_filenames().unwrap().len(),
         op_count_after_refresh,
         "an idempotent refresh retry must not publish a snapshot with a changed digest"
+    );
+    let target_scope = run_mote(
+        temp.path(),
+        &[
+            "--json",
+            "--actor",
+            "proposer",
+            "candidate",
+            "evidence",
+            "target-scope",
+            candidate_id,
+            "--target",
+            "landing-target",
+            "--idempotency-key",
+            "cli-target-scope",
+        ],
+    );
+    assert!(
+        target_scope.status.success(),
+        "{}",
+        String::from_utf8_lossy(&target_scope.stderr)
     );
 
     let reserved = run_mote(
@@ -3802,6 +3833,8 @@ fn candidate_cli_happy_path_and_json_schema() {
     let authorization_op = authorized["authorization"]["op_id"].as_str().unwrap();
     assert_eq!(authorized["landability"]["landable"], true);
 
+    run_git(temp.path(), &["branch", "-f", "landing-target", "HEAD"]);
+
     let landed = run_mote(
         temp.path(),
         &[
@@ -3812,7 +3845,7 @@ fn candidate_cli_happy_path_and_json_schema() {
             "landed",
             candidate_id,
             "--target",
-            "HEAD",
+            "landing-target",
             "--expect-phase",
             phase_op,
             "--expect-authorization",
@@ -4692,6 +4725,26 @@ fn evidence_refresh_clears_abandoned_commit_already_in_base_without_rewriting_hi
     );
     let new: serde_json::Value = serde_json::from_slice(&new.stdout).unwrap();
     let new_id = new["candidate_id"].as_str().unwrap().to_string();
+    let target_scope = run_mote(
+        temp.path(),
+        &[
+            "--actor",
+            "proposer",
+            "candidate",
+            "evidence",
+            "target-scope",
+            &new_id,
+            "--target",
+            &landed,
+            "--idempotency-key",
+            "new-target-scope",
+        ],
+    );
+    assert!(
+        target_scope.status.success(),
+        "{}",
+        String::from_utf8_lossy(&target_scope.stderr)
+    );
     publish_checked(&store, &approve(&new_id, "review-refreshed"));
     publish_checked(&store, &authorize(&new_id, "authorize-refreshed"));
     assert!(
