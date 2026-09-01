@@ -6,10 +6,14 @@ use tempfile::TempDir;
 
 use mote::candidate::CandidateObjectSource;
 use mote::candidate::{
-    CandidateEvidencePayload, EvidenceOutcome, GIT_TARGET_SCOPE_EVIDENCE, GitTargetScopeReceipt,
+    CandidateEvidencePayload, EvidenceOutcome, GIT_LANDING_EVIDENCE, GIT_TARGET_SCOPE_EVIDENCE,
+    GitTargetScopeReceipt,
 };
 use mote::ids;
-use mote::op::{CandidateEvidenceOp, CandidateLandingRepositoryBindOp, Op, ScalarSet, make_create};
+use mote::op::{
+    CandidateEvidenceOp, CandidateLandedOp, CandidateLandingRepositoryBindOp, Op, ScalarSet,
+    make_create,
+};
 use mote::{publish, reducer, repo::Store};
 
 fn run_git(cwd: &Path, args: &[&str]) -> String {
@@ -562,6 +566,181 @@ fn landing_result_with_an_unscoped_actual_effect_is_rejected() {
     );
     let state = reducer::replay_store(&fixture.store).unwrap();
     assert_eq!(state.candidates[candidate_id].phase.as_str(), "pending");
+}
+
+#[test]
+fn landing_result_with_same_path_content_substitution_is_rejected() {
+    let fixture = fixture(&[("root.txt", "root\n")]);
+    run_git(&fixture.root, &["switch", "-qc", "candidate"]);
+    std::fs::write(fixture.root.join("candidate.txt"), "candidate\n").unwrap();
+    run_git(&fixture.root, &["add", "candidate.txt"]);
+    run_git(&fixture.root, &["commit", "-qm", "candidate"]);
+
+    let proposed = propose(
+        &fixture,
+        &fixture.root_commit,
+        &["candidate.txt"],
+        "propose-substituted-result",
+    );
+    let candidate_id = proposed["candidate_id"].as_str().unwrap();
+    let phase_op = proposed["phase"]["op_id"].as_str().unwrap();
+    record_target_scope(
+        &fixture,
+        candidate_id,
+        "main",
+        "scope-before-substituted-result",
+    );
+    let authorized = review_and_authorize(&fixture, candidate_id);
+    assert_eq!(authorized["landability"]["landable"], true);
+    let authorization_op = authorized["authorization"]["op_id"].as_str().unwrap();
+
+    run_git(&fixture.root, &["switch", "main"]);
+    run_git(
+        &fixture.root,
+        &["merge", "--no-ff", "--no-commit", "candidate"],
+    );
+    std::fs::write(fixture.root.join("candidate.txt"), "substituted\n").unwrap();
+    run_git(&fixture.root, &["add", "candidate.txt"]);
+    run_git(
+        &fixture.root,
+        &["commit", "-qm", "substituted merge result"],
+    );
+
+    let landed = run_mote(
+        &fixture.root,
+        "lander",
+        &[
+            "candidate",
+            "landed",
+            candidate_id,
+            "--target",
+            "main",
+            "--expect-phase",
+            phase_op,
+            "--expect-authorization",
+            authorization_op,
+            "--idempotency-key",
+            "land-substituted-result",
+        ],
+    );
+    assert!(!landed.status.success());
+    assert!(
+        String::from_utf8_lossy(&landed.stderr)
+            .contains("actual landing tree does not match target-scope evidence")
+    );
+    let state = reducer::replay_store(&fixture.store).unwrap();
+    assert_eq!(state.candidates[candidate_id].phase.as_str(), "pending");
+}
+
+#[test]
+fn reducer_rejects_a_landing_tree_that_disagrees_with_scope() {
+    let fixture = fixture(&[("root.txt", "root\n")]);
+    run_git(&fixture.root, &["switch", "-qc", "candidate"]);
+    std::fs::write(fixture.root.join("candidate.txt"), "candidate\n").unwrap();
+    run_git(&fixture.root, &["add", "candidate.txt"]);
+    run_git(&fixture.root, &["commit", "-qm", "candidate"]);
+
+    let proposed = propose(
+        &fixture,
+        &fixture.root_commit,
+        &["candidate.txt"],
+        "propose-reducer-tree",
+    );
+    let candidate_id = proposed["candidate_id"].as_str().unwrap();
+    let phase_op = proposed["phase"]["op_id"].as_str().unwrap().to_string();
+    record_target_scope(&fixture, candidate_id, "main", "scope-reducer-tree");
+    let authorized = review_and_authorize(&fixture, candidate_id);
+    let authorization_op = authorized["authorization"]["op_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let state = reducer::replay_store(&fixture.store).unwrap();
+    let candidate = &state.candidates[candidate_id];
+    let scope_record = candidate
+        .evidence
+        .values()
+        .find(|evidence| evidence.name == GIT_TARGET_SCOPE_EVIDENCE)
+        .unwrap();
+    let scope = match &scope_record.payload {
+        CandidateEvidencePayload::GitTargetScope(scope) => scope.clone(),
+        _ => unreachable!(),
+    };
+    let scope_evidence_id = scope_record.evidence_id.clone();
+    let scope_op_id = scope_record.op_id.clone();
+    let landing_repository_id = candidate.landing_repository_id.clone();
+    let object_format = candidate.object_format.clone();
+    let candidate_oid = candidate.commit_oid.clone();
+
+    run_git(&fixture.root, &["switch", "main"]);
+    run_git(&fixture.root, &["merge", "--ff-only", "candidate"]);
+    let mut receipt = mote::candidate::probe_landing(
+        &fixture.root,
+        &landing_repository_id,
+        &object_format,
+        &candidate_oid,
+        "main",
+        None,
+        &authorization_op,
+        Vec::new(),
+        Some(&scope),
+        Some(&scope_evidence_id),
+        Some(&scope_op_id),
+    )
+    .unwrap();
+    let root_tree_expression = format!("{}^{{tree}}", fixture.root_commit);
+    receipt.after_tree_oid = Some(run_git(
+        &fixture.root,
+        &["rev-parse", &root_tree_expression],
+    ));
+    assert_ne!(
+        receipt.after_tree_oid.as_deref(),
+        Some(scope.prospective_merge_tree_oid.as_str())
+    );
+
+    let payload = CandidateEvidencePayload::GitLanding(receipt);
+    let evidence_id = mote::candidate::evidence_id(&payload).unwrap();
+    let evidence_op = publish::publish_op(
+        &fixture.store,
+        &Op::CandidateEvidence(CandidateEvidenceOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "lander".into(),
+            candidate_id: candidate_id.into(),
+            candidate_oid,
+            evidence_id: evidence_id.clone(),
+            name: GIT_LANDING_EVIDENCE.into(),
+            evidence_kind: "git".into(),
+            producer_tool: "git version test".into(),
+            outcome: EvidenceOutcome::Pass,
+            payload,
+            refs: Vec::new(),
+            idempotency_key: "forged-landing-tree-evidence".into(),
+        }),
+    )
+    .unwrap();
+    let landed_op = publish::publish_op(
+        &fixture.store,
+        &Op::CandidateLanded(CandidateLandedOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "lander".into(),
+            candidate_id: candidate_id.into(),
+            evidence_id,
+            expect_phase: phase_op,
+            expect_authorization: authorization_op,
+            target_ref: "main".into(),
+            idempotency_key: "land-with-forged-tree".into(),
+        }),
+    )
+    .unwrap();
+
+    let replayed = reducer::replay_store(&fixture.store).unwrap();
+    assert!(replayed.was_accepted(evidence_op.as_str()));
+    assert!(!replayed.was_accepted(landed_op.as_str()));
+    assert_eq!(replayed.candidates[candidate_id].phase.as_str(), "pending");
 }
 
 #[test]

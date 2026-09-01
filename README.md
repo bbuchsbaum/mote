@@ -296,7 +296,8 @@ mote candidate show cand-...
 mote candidate supersede cand-OLD cand-NEW --expect-phase OP_ID \
   --containment-recovery --idempotency-key recover-old-1
 # After an external Git operation updates that same reflog-enabled ref directly
-# from the target-scope OID (or creates a merge with that OID first-parent):
+# from the target-scope OID (or creates a merge with that OID first-parent) and
+# produces exactly the target-scope prospective tree:
 mote candidate landed cand-... --target origin/main \
   --expect-phase OP_ID --expect-authorization OP_ID \
   --idempotency-key landed-1

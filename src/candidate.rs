@@ -406,6 +406,9 @@ pub struct GitLandingReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_tip: Option<String>,
     pub after_tip: String,
+    /// Tree derived from `after_tip`; optional only for historical replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_tree_oid: Option<String>,
     /// Exact no-rename diff from the proved immediate preimage to `after_tip`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub landing_effect_paths: Vec<String>,
@@ -1144,6 +1147,17 @@ fn prospective_merge_tree(
     Ok(tree_oid.to_string())
 }
 
+fn commit_tree(cwd: &Path, object_format: &str, commit_oid: &str) -> Result<String, String> {
+    let tree_expression = format!("{commit_oid}^{{tree}}");
+    let tree_oid = git_text(cwd, &["rev-parse", &tree_expression])?;
+    if !validate_full_oid(object_format, &tree_oid)
+        || git_text(cwd, &["cat-file", "-t", &tree_oid])? != "tree"
+    {
+        return Err("landing result did not resolve to a full tree object id".into());
+    }
+    Ok(tree_oid)
+}
+
 fn canonical_sorted_paths(paths: &[String]) -> bool {
     paths
         .iter()
@@ -1367,6 +1381,7 @@ pub fn probe_landing(
         return Err("landing repository identity does not match candidate".into());
     }
     let after_tip = resolve_commit(cwd, target_ref)?;
+    let after_tree_oid = commit_tree(cwd, object_format, &after_tip)?;
     let caller_before_tip = before_tip
         .map(|reference| resolve_commit(cwd, reference))
         .transpose()?;
@@ -1415,6 +1430,9 @@ pub fn probe_landing(
                     "actual target-to-result paths do not match target-scope evidence".into(),
                 );
             }
+            if after_tree_oid != target_scope.prospective_merge_tree_oid {
+                return Err("actual landing tree does not match target-scope evidence".into());
+            }
             (
                 Some(immediate_before_tip),
                 Some(target_ref_full_name),
@@ -1460,6 +1478,7 @@ pub fn probe_landing(
         target_ref_full_name,
         before_tip: effective_before_tip,
         after_tip,
+        after_tree_oid: Some(after_tree_oid),
         landing_effect_paths,
         candidate_reachable,
         authorization_op_id: authorization_op_id.to_string(),

@@ -325,7 +325,7 @@ target-scope observation before Git changes; refresh it whenever the intended
 target advances. The target must be one mutable, reflog-enabled ref. Scope uses
 the prospective merge tree so target-side rename destinations enter policy;
 the final landing record requires the immediately previous reflog entry and
-actual target-to-result paths to match that observation.
+actual target-to-result paths and result tree to match that observation.
 
 ## Finish Or Hand Off
 

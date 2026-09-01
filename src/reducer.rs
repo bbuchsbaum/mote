@@ -5946,6 +5946,8 @@ fn apply_candidate_landed(
                                             == Some(scope.target_ref_full_name.as_str())
                                         && git.before_tip.as_deref()
                                             == Some(scope.observed_target_oid.as_str())
+                                        && git.after_tree_oid.as_deref()
+                                            == Some(scope.prospective_merge_tree_oid.as_str())
                                         && git.landing_effect_paths
                                             == scope.prospective_target_effect_paths
                                         && crate::candidate::uncovered_target_scope_paths(

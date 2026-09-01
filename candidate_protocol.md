@@ -333,11 +333,12 @@ exact reflog entries: the current entry must be the observed result and the
 immediately previous entry must equal the target-scope OID. A mere ancestry
 relation is insufficient. A merge must additionally name that preimage as its
 first parent. The receipt retains the reflog-proved preimage and the actual
-no-rename `preimage..result` path set, which must exactly match the prospective
-target-effect paths. Missing reflog proof, linear or divergent target
-advancement, a changed ref identity, or a different result path set fails
-closed. Refreshing target scope publishes a new immutable evidence operation;
-it never rewrites candidate policy.
+result tree plus no-rename `preimage..result` path set. The result tree must
+equal the prospective merge tree, and the path set must exactly match the
+prospective target-effect paths. Missing reflog proof, linear or divergent
+target advancement, a changed ref identity, a same-path content substitution,
+or a different result path set fails closed. Refreshing target scope publishes
+a new immutable evidence operation; it never rewrites candidate policy.
 An already-reachable candidate cannot obtain target-scope evidence: that state
 uses the explicit `candidate reconcile` path and remains visibly
 `landed_out_of_band`, rather than laundering ambient reachability into a
@@ -688,13 +689,14 @@ or authorization subject and full detail.
 portable or rebound candidate it also requires a current `git-target-scope`
 receipt for the exact target ref before Git is changed. The landing receipt
 records the caller-facing and canonical full target refs, the reflog-proved tip
-immediately before landing, the tip after landing, the actual target-to-result
-paths, the candidate object id, the current authorization op id, the current
-review and evidence basis op ids, the exact target-scope evidence/op ids, and
-proof that the candidate commit is reachable from the after-tip. Its immediate
-preimage and actual path set must equal the scope receipt; a merge must also
-carry that preimage as first parent. The receipt must be from the bound landing
-repository and object format, regardless of which repository supplied proposal
+immediately before landing, the tip and derived tree after landing, the actual
+target-to-result paths, the candidate object id, the current authorization op
+id, the current review and evidence basis op ids, the exact target-scope
+evidence/op ids, and proof that the candidate commit is reachable from the
+after-tip. Its immediate preimage, result tree, and actual path set must equal
+the scope receipt; a merge must also carry that preimage as first parent. The
+receipt must be from the bound landing repository and object format, regardless
+of which repository supplied proposal
 ancestry.
 
 Mote records the landing after an external Git action; it does not perform the
