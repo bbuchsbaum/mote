@@ -1156,6 +1156,124 @@ fn explicit_operator_override_is_audited_and_does_not_impersonate_the_authorizer
 }
 
 #[test]
+fn explicit_operator_override_requires_complete_clocks_without_breaking_legacy_authorizer_replay() {
+    let (_temp, store, issue) = setup();
+    let candidate_id = ids::new_candidate_id();
+    let proposal_op = publish_checked(
+        &store,
+        &proposal(
+            &candidate_id,
+            &issue,
+            COMMIT_A,
+            "operator-clock-cas-proposal",
+        ),
+    );
+    let (reachability, evidence_id) = reachability_evidence(
+        &candidate_id,
+        "recovery-operator",
+        EvidenceOutcome::Pass,
+        Some(true),
+        REPO,
+        "operator-clock-cas-reachability",
+    );
+    publish_checked(&store, &reachability);
+    let complete_snapshot = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_policy_snapshot(&candidate_id)
+        .unwrap();
+
+    for (key, snapshot) in [
+        (
+            "operator-clock-cas-missing-review-policy",
+            CandidatePolicySnapshot {
+                review_policy_op_id: None,
+                ..complete_snapshot.clone()
+            },
+        ),
+        (
+            "operator-clock-cas-missing-landing-repository",
+            CandidatePolicySnapshot {
+                landing_repository_op_id: None,
+                ..complete_snapshot.clone()
+            },
+        ),
+        (
+            "operator-clock-cas-missing-both",
+            CandidatePolicySnapshot {
+                review_policy_op_id: None,
+                landing_repository_op_id: None,
+                ..complete_snapshot.clone()
+            },
+        ),
+    ] {
+        publish_rejected(
+            &store,
+            &override_reconcile(
+                &candidate_id,
+                "recovery-operator",
+                &evidence_id,
+                &proposal_op,
+                "authorizer",
+                vec!["appointment-record"],
+                snapshot,
+                key,
+            ),
+            "complete review-policy and landing-repository clock CAS values",
+        );
+    }
+    assert_eq!(
+        reducer::replay_store(&store).unwrap().candidates[&candidate_id]
+            .phase
+            .as_str(),
+        "pending"
+    );
+
+    let (_legacy_temp, legacy_store, legacy_issue) = setup();
+    let legacy_candidate_id = ids::new_candidate_id();
+    let legacy_proposal_op = publish_checked(
+        &legacy_store,
+        &proposal(
+            &legacy_candidate_id,
+            &legacy_issue,
+            COMMIT_A,
+            "legacy-authorizer-clock-proposal",
+        ),
+    );
+    let (legacy_reachability, legacy_evidence_id) = reachability_evidence(
+        &legacy_candidate_id,
+        "authorizer",
+        EvidenceOutcome::Pass,
+        Some(true),
+        REPO,
+        "legacy-authorizer-clock-reachability",
+    );
+    publish_checked(&legacy_store, &legacy_reachability);
+    let mut legacy_snapshot = reducer::replay_store(&legacy_store)
+        .unwrap()
+        .candidate_policy_snapshot(&legacy_candidate_id)
+        .unwrap();
+    legacy_snapshot.review_policy_op_id = None;
+    legacy_snapshot.landing_repository_op_id = None;
+    publish_checked(
+        &legacy_store,
+        &reconcile(
+            &legacy_candidate_id,
+            "authorizer",
+            &legacy_evidence_id,
+            &legacy_proposal_op,
+            legacy_snapshot,
+            "legacy-authorizer-clock-reconciliation",
+        ),
+    );
+    assert_eq!(
+        reducer::replay_store(&legacy_store).unwrap().candidates[&legacy_candidate_id]
+            .phase
+            .as_str(),
+        "landed_out_of_band"
+    );
+}
+
+#[test]
 fn abandoned_reconciliation_requires_an_exact_audited_override_and_preserves_history() {
     let (_temp, store, issue) = setup();
     let candidate_id = ids::new_candidate_id();

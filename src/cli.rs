@@ -3243,6 +3243,18 @@ fn cmd_candidate(
                 return Ok(0);
             }
 
+            if authority
+                == crate::candidate::CandidateReconciliationAuthority::ExplicitOperatorOverride
+                && !initial
+                    .candidate_policy_snapshot(&candidate_id)
+                    .is_some_and(|snapshot| snapshot.has_complete_reconciliation_clocks())
+            {
+                return Err(MoteError::Rejected(
+                    "explicit operator reconciliation requires complete review-policy and landing-repository clock CAS values"
+                        .into(),
+                ));
+            }
+
             let reconcilable_phase = candidate.phase == crate::candidate::CandidatePhase::Pending
                 || (candidate.phase == crate::candidate::CandidatePhase::Abandoned
                     && authority

@@ -5996,6 +5996,22 @@ fn apply_candidate_reconcile(
         }
     };
 
+    if o.authority == crate::candidate::CandidateReconciliationAuthority::ExplicitOperatorOverride
+        && !o.policy_snapshot.has_complete_reconciliation_clocks()
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "explicit operator reconciliation requires complete review-policy and landing-repository clock CAS values"
+                .into(),
+        );
+        return;
+    }
+
     let mut current_policy = state
         .candidate_policy_snapshot_at(&candidate_id, ts)
         .expect("candidate checked above");

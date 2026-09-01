@@ -760,6 +760,18 @@ pub struct CandidatePolicySnapshot {
     pub pre_transition_landability: Landability,
 }
 
+impl CandidatePolicySnapshot {
+    pub(crate) fn has_complete_reconciliation_clocks(&self) -> bool {
+        self.review_policy_op_id
+            .as_deref()
+            .is_some_and(|op_id| !op_id.trim().is_empty())
+            && self
+                .landing_repository_op_id
+                .as_deref()
+                .is_some_and(|op_id| !op_id.trim().is_empty())
+    }
+}
+
 impl Landability {
     pub fn from_reasons(mut reasons: Vec<LandabilityReason>) -> Self {
         reasons.sort_by(|a, b| {

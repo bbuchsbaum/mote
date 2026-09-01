@@ -397,6 +397,13 @@ references are durable attestations, not a machine-validated grant; Mote stores
 them so an independent reviewer can assess the recovery basis and emits
 `candidate_reconciliation_operator_override_recorded`.
 
+Legacy proposal-authorizer reconciliation operations may omit the additive
+review-policy and landing-repository clock fields in their serialized policy
+snapshot. That replay compatibility does not extend to the newer explicit
+operator override: both clocks must be present and non-empty before the reducer
+applies legacy normalization, and the command refuses an incomplete clock
+snapshot before probing Git or publishing recovery evidence.
+
 Operator recovery probes the Git repository backing the store. If that
 repository differs from the candidate's recorded landing repository, the
 operation carries a typed repository bridge: the exact current landing-binding
