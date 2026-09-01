@@ -85,7 +85,17 @@ pub struct WorkStatus {
     pub active_reservations: Vec<String>,
     pub orphaned_reservations: Vec<String>,
     pub doing_beads: Vec<String>,
+    pub role_assignments: Vec<RoleWork>,
     pub candidates: Vec<CandidateWork>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RoleWork {
+    pub role_id: String,
+    pub role_name: String,
+    pub assignment_id: String,
+    pub session_id: String,
+    pub lease_until_ts: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +157,16 @@ pub fn known_actor_names(state: &State) -> BTreeSet<String> {
         actors.extend(candidate.reviewers.iter().cloned());
         if let Some(authorization) = &candidate.authorization {
             actors.extend(authorization.grantees.iter().cloned());
+        }
+    }
+    for role in state.roles.values() {
+        actors.extend(role.assignment_authorities.iter().cloned());
+    }
+    for assignment in state.role_assignments.values() {
+        actors.insert(assignment.holder_actor.clone());
+        actors.insert(assignment.assigned_by.clone());
+        if let Some(released_by) = &assignment.released_by {
+            actors.insert(released_by.clone());
         }
     }
     actors
@@ -333,6 +353,18 @@ fn actor_known_at(state: &State, actor: &str, current: Option<&str>, as_of_ts: &
                             .iter()
                             .any(|grantee| grantee == actor)
                     }))
+    }) || state.roles.values().any(|role| {
+        op_visible_at(state, &role.definition_op_id, as_of_ts)
+            && (role.defined_by == actor
+                || role
+                    .assignment_authorities
+                    .iter()
+                    .any(|authority| authority == actor))
+    }) || state.role_assignments.values().any(|assignment| {
+        assignment.assigned_ts.as_str() <= as_of_ts
+            && (assignment.holder_actor == actor
+                || assignment.assigned_by == actor
+                || assignment.released_by.as_deref() == Some(actor))
     })
 }
 
@@ -492,6 +524,12 @@ fn activity_classes(kind: &str) -> ActivityClasses {
             | "candidate_supersede"
             | "candidate_abandon"
             | "candidate_landed"
+            | "candidate_reconcile"
+            | "role_define"
+            | "role_assign"
+            | "role_renew"
+            | "role_release"
+            | "role_retire"
             | "board_route"
     );
     let interaction = matches!(
@@ -500,6 +538,8 @@ fn activity_classes(kind: &str) -> ActivityClasses {
             | "msg_ack"
             | "msg_resolve"
             | "board_post"
+            | "board_decision"
+            | "board_question"
             | "board_read"
             | "board_watch"
             | "board_topic"
@@ -574,6 +614,19 @@ fn event_type(state: &State, entry: &HistoryEntry) -> String {
                 _ => "discussion.posted",
             })
             .unwrap_or("discussion.posted"),
+        "board_decision" => "discussion.decided",
+        "board_question" => state
+            .board_questions
+            .values()
+            .flat_map(|question| question.transitions.iter())
+            .find(|transition| transition.op_id == entry.op_id)
+            .map(|transition| match transition.action {
+                crate::op::DecisionQuestionAction::Answer => "discussion.question_answered",
+                crate::op::DecisionQuestionAction::Defer => "discussion.question_deferred",
+                crate::op::DecisionQuestionAction::Supersede => "discussion.question_superseded",
+                crate::op::DecisionQuestionAction::Close => "discussion.question_closed",
+            })
+            .unwrap_or("discussion.question_changed"),
         "board_read" => "discussion.read",
         "board_watch" => "discussion.watch_changed",
         "board_topic" => "discussion.topic_created",
@@ -606,6 +659,12 @@ fn event_type(state: &State, entry: &HistoryEntry) -> String {
         "candidate_supersede" => "candidate.superseded",
         "candidate_abandon" => "candidate.abandoned",
         "candidate_landed" => "candidate.landed",
+        "candidate_reconcile" => "candidate.landed_out_of_band",
+        "role_define" => "role.defined",
+        "role_assign" => "role.assigned",
+        "role_renew" => "role.renewed",
+        "role_release" => "role.released",
+        "role_retire" => "role.retired",
         _ => "unknown",
     }
     .into()
@@ -668,6 +727,31 @@ fn work_status(state: &State, actor: &str, as_of_ts: &str) -> WorkStatus {
         if candidate.reviewers.iter().any(|reviewer| reviewer == actor) {
             roles.insert("reviewer".to_string());
         }
+        for requirement in &candidate.role_review_requirements {
+            let eligible = state
+                .active_role_assignments_for_actor(actor, as_of_ts)
+                .into_iter()
+                .filter(|assignment| assignment.role_id == requirement.role_id)
+                .any(|assignment| {
+                    state
+                        .candidate_role_review_eligibility(
+                            &candidate.candidate_id,
+                            actor,
+                            &requirement.role_id,
+                            &assignment.assignment_id,
+                            as_of_ts,
+                        )
+                        .is_ok()
+                });
+            if eligible {
+                let role_name = state
+                    .roles
+                    .get(&requirement.role_id)
+                    .map(|role| role.name.as_str())
+                    .unwrap_or(requirement.role_id.as_str());
+                roles.insert(format!("role_reviewer:{role_name}"));
+            }
+        }
         if candidate
             .authorization
             .as_ref()
@@ -693,12 +777,31 @@ fn work_status(state: &State, actor: &str, as_of_ts: &str) -> WorkStatus {
     active_reservations.sort();
     orphaned_reservations.sort();
     candidates.sort_by(|a, b| a.candidate_id.cmp(&b.candidate_id));
+    let mut role_assignments = state
+        .active_role_assignments_for_actor(actor, as_of_ts)
+        .into_iter()
+        .filter_map(|assignment| {
+            state.roles.get(&assignment.role_id).map(|role| RoleWork {
+                role_id: role.role_id.clone(),
+                role_name: role.name.clone(),
+                assignment_id: assignment.assignment_id.clone(),
+                session_id: assignment.holder_session_id.clone(),
+                lease_until_ts: assignment.lease_until_ts.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    role_assignments.sort_by(|left, right| {
+        left.role_id
+            .cmp(&right.role_id)
+            .then_with(|| left.assignment_id.cmp(&right.assignment_id))
+    });
     WorkStatus {
         active_claims,
         orphaned_claims,
         active_reservations,
         orphaned_reservations,
         doing_beads,
+        role_assignments,
         candidates,
     }
 }

@@ -50,6 +50,7 @@ test("issue detail and durable conflict remain legible", async ({ page }) => {
 test("discussion retains its intended layout", async ({ page }) => {
   await page.locator(".rail-item").filter({ hasText: "Discussion" }).click();
   await page.getByText("Decision: split parser work from test work.", { exact: false }).waitFor();
+  await page.getByText("Cited decision", { exact: true }).waitFor();
   await settle(page);
   await expect(page).toHaveScreenshot("discussion-light.png");
 });

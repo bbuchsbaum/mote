@@ -62,10 +62,11 @@ All planes share the same publication mechanism and reducer.
 | Issue    | `create`, `patch`, `tag_add`, `tag_remove`, `dep_add`, `dep_remove`, `rel_add`, `rel_remove`, `note`, `close`, `delete` |
 | Path     | `reserve_open`, `reserve_close`                                        |
 | Message  | `msg_send`, `msg_ack`                                                  |
-| Discussion | `board_topic`, `board_post`, `board_sticky`, `board_read`, `board_route` |
+| Discussion | `board_topic`, `board_post`, `board_decision`, `board_question`, `board_sticky`, `board_read`, `board_route` |
 | Lease    | `claim`, `release`                                                     |
 | Session  | `session_start`, `session_end`                                          |
-| Candidate | `candidate_propose`, `candidate_evidence`, `candidate_review`, `candidate_authorize`, `candidate_revoke`, `candidate_supersede`, `candidate_abandon`, `candidate_landed` |
+| Role | `role_define`, `role_assign`, `role_renew`, `role_release`, `role_retire` |
+| Candidate | `candidate_propose`, `candidate_evidence`, `candidate_review`, `candidate_review_policy_amend`, `candidate_landing_repository_bind`, `candidate_authorize`, `candidate_revoke`, `candidate_supersede`, `candidate_abandon`, `candidate_landed`, `candidate_reconcile` |
 
 ### Conflict semantics
 
@@ -82,6 +83,10 @@ All planes share the same publication mechanism and reducer.
 - **Append-only** (`note`, `msg_send`) never conflict.
 - **Claims** are TTL leases. Expired leases auto-yield. Stale agents do not
   leave permanent locks. Self-actor renewal is auto-accepted.
+- **Roles** are immutable policies with explicit capacity, standing demand,
+  typed exclusions, and named assignment authorities. Assignments are finite
+  leases bound to one exact live actor session; vacancy and coverage shortfall
+  are derived without inferring authority from presence or recent activity.
 - **Path reservations** are advisory leases over directory or exact-file
   paths. All-or-nothing accept. Two reservations from different actors over
   overlapping paths cannot both be live at once. Closing their issue derives
@@ -105,14 +110,31 @@ All planes share the same publication mechanism and reducer.
   erase the first. Because only an explicit `needs_bead` counts as unrouted,
   `mote discuss unrouted` reports declared state rather than guessing from
   prose.
+- **Cited discussion decisions** bind a conclusion to exact active same-topic
+  posts and optional typed topic, post, issue, candidate, or HTTP(S) references.
+  One atomic decision operation publishes the sticky record and opens its
+  explicitly supplied questions. Answers are cited candidate answers and leave
+  a question open; only an explicit author action can defer, supersede, or
+  close it. Every lifecycle mutation uses compare-and-set and actor-scoped
+  idempotency. Mote never infers consensus, answers, or closure from prose.
 - **Session leases** are TTL leases over an identity rather than a work item.
   Several sessions may legitimately share one actor name; a lease is what makes
   each of them individually visible to `mote in-flight` and `mote doctor`.
-- **Candidates** bind an issue to immutable full Git object ids, declared
-  paths, reviewers, evidence producers, and one landing authorizer. Git is
+- **Candidates** bind an issue to immutable full Git object ids, proposal
+  provenance, a distinct landing repository, optional object-source locator,
+  declared paths, reviewers, evidence producers, and one landing authorizer. Git is
   inspected only by explicit CLI commands, which publish receipts; replay is
   repository-independent and landability fails closed with stable reason
-  codes. Every candidate mutation requires an actor-scoped idempotency key.
+  codes. Each reason independently reports its `substantive`, `process`, or
+  `bookkeeping` class and whether it blocks; all current reasons remain
+  blocking. The authorizer may replace the named-reviewer set on a pending
+  candidate through an explicit phase-and-policy CAS operation; approvals from
+  reviewers who remain named retain their exact provenance. Every candidate
+  mutation requires an actor-scoped idempotency key.
+  Portable proposals check whether the repository backing the shared store can
+  read the exact commit; `object_unreachable` blocks landability until a typed
+  availability refresh passes. A legacy pending row can be explicitly rebound
+  by its authorizer without rewriting where it was proposed.
   Reservations may bind to a pending candidate, but only for paths in its
   immutable declared path set. Landing, abandonment, supersession, or
   authorization revocation makes a still-live candidate binding orphaned and
@@ -192,6 +214,16 @@ mote discuss topic new planning-2 --title "Planning 2" --body "Initial proposal"
 
 # Discussion routing: keep the argument on the board, the execution in beads.
 mote discuss decision --topic planning --body "Consensus: split parser first"
+# A structured decision cites exact agreement and tracks questions separately.
+mote discuss decide --topic planning --agreed post-... --agreed post-... \
+  --open "Does the text rail carry cross-page relations?" \
+  --cite candidate:candidate-... --issue bd-... \
+  --body "Adopt the cited contract" --idempotency-key planning-decision-1
+mote discuss decide --topic planning --show
+mote discuss question answer question-... --post post-... \
+  --expect op-... --idempotency-key answer-1
+mote discuss question close question-... --resolution "Resolved by the cited prototype" \
+  --cite post:post-... --expect op-... --idempotency-key close-1
 mote discuss summary  --topic planning --body "Current state: 1 open question"
 mote discuss summary  --topic planning          # read the pinned summary back
 mote discuss needs-bead post-...                # actionable, not yet tracked
@@ -212,19 +244,57 @@ mote session status working --message 'implementing parser' --issue bd-...
 mote session heartbeat --ttl 15m --renew-within 5m
 mote session end
 
+# Role plane: definitions are immutable; assignments bind one exact session.
+mote role define reviewer --remit "independent candidate review" \
+  --assigner chief --capacity 2 --minimum-active 1 \
+  --exclude candidate_proposer --idempotency-key define-reviewer-1
+mote role assign reviewer alice --session sess-... --ttl 1h \
+  --idempotency-key assign-reviewer-alice-1
+mote role list
+
 # Candidate plane: Mote records review and exact Git evidence; it never lands.
 mote candidate propose --issue bd-... --base origin/main \
   --path src/lib.rs --authorizer release-owner --reviewer reviewer \
+  --object-source refs/heads/candidate/proposal-1 \
   --idempotency-key proposal-1
+# Role/count policy: the exact role id is frozen into the proposal. Repeat the
+# paired flags for additional role requirements; --reviewer may still be used
+# alongside them for a stricter named slot.
+mote candidate propose --issue bd-... --base origin/main \
+  --path src/lib.rs --authorizer release-owner \
+  --require-reviews 2 --from-role reviewer \
+  --idempotency-key proposal-role-quorum-1
 mote candidate evidence refresh cand-... --idempotency-key ancestry-2
+mote candidate evidence availability cand-... \
+  --idempotency-key object-visible-1
 mote candidate review cand-... approve --idempotency-key review-1
+mote candidate review cand-... approve --from-role reviewer \
+  --idempotency-key role-review-1
+mote candidate amend-reviewers cand-... --reviewer reviewer-a \
+  --reviewer reviewer-c --expect-phase OP_ID --expect-policy OP_ID \
+  --reason "reviewer-b reassigned" --idempotency-key amend-reviewers-1
+mote candidate bind-landing-repository cand-... --expect-phase OP_ID \
+  --expect-repository OP_ID --object-source /path/to/source-clone \
+  --reason "bind legacy proposal to shared repository" \
+  --idempotency-key bind-landing-repository-1
 mote candidate authorize cand-... --grantee landing-agent \
   --idempotency-key grant-1
 mote candidate show cand-...
+# If an old candidate's owners are unavailable, its successor authorizer can
+# retire it only after exact pair evidence proves commit containment. The
+# command records the current successor phase and evidence op ids as CAS data.
+mote candidate supersede cand-OLD cand-NEW --expect-phase OP_ID \
+  --containment-recovery --idempotency-key recover-old-1
 # After an external Git operation makes the commit reachable from the target:
 mote candidate landed cand-... --target origin/main \
   --expect-phase OP_ID --expect-authorization OP_ID \
   --idempotency-key landed-1
+
+# If Git already contains a still-pending candidate, only its immutable
+# authorizer may record the distinct non-governed terminal state. This retains
+# any review/authorization blockers and does not consume a grant.
+mote candidate reconcile cand-... --target origin/main \
+  --expect-phase OP_ID --idempotency-key reconcile-1
 
 # Path plane.
 mote reserve src/auth/ tests/auth/ --issue bd-... --ttl 3600
@@ -248,6 +318,8 @@ mote in-flight            # sessions, reservations, doing work, topics, candidat
 
 # Diagnostics.
 mote doctor
+mote audit --target-ref origin/main       # read-only recorded/derived/observed findings
+mote audit --fail-on warning              # strict warm-up gate; exits 2 on warnings
 mote fsck --clean-tmp
 
 # Batch/import. Omitted input path means stdin.
@@ -257,7 +329,7 @@ mote import plan.json
 # Oversight (read-only).
 mote watch                # human-readable snapshots that re-render on store changes
 mote --json watch         # newline-delimited JSON for piping into other tools
-mote --json events --kind message,reservation,candidate
+mote --json events --kind message,reservation,role,candidate
 mote --json events --kind message --for-actor bob --follow
 mote ui                   # interactive TUI dashboard (q to quit, ? for help)
 mote serve                # local console on 127.0.0.1:7717
@@ -270,6 +342,19 @@ its concise usage; `mote --json help --all` returns the same introspected
 surface as records with `path`, `usage`, and `about`. Because this view is
 generated from the Clap command tree, newly added nested commands appear
 without a separately maintained catalog.
+The two frequent state-changing shorthands are intentionally small and
+unambiguous:
+
+```sh
+mote send bob "please review"       # mote msg send --to bob "please review"
+mote assign bd-... bob              # mote set bd-... assignee=bob
+```
+
+See [cli_ergonomics.md](cli_ergonomics.md) for the grammar disposition of
+accepted shorthands and rejected near-misses. In particular, discussion topics
+remain named (`--topic`) because the existing single positional value is the
+post body for the default `general` topic.
+
 TTL-bearing claim, reservation, adoption, begin, and session commands accept
 bare seconds plus whole-number `s`, `m`, `h`, and `d` forms. The op log and
 JSON continue to record normalized integer seconds.
@@ -391,6 +476,16 @@ They are safe to leave running while agents are writing to the store.
   answer set before applying any part of it and records the answering message
   or post on every fulfilled request. Ordinary prose never changes request
   state; the explicit flag is required.
+- Open incoming requests become derived attention warnings after one hour by
+  default. Set the horizon with the global `--request-stale-after` duration,
+  for example `mote events --kind message --for-actor bob
+  --request-stale-after 2h` or `mote watch --request-stale-after 30m`.
+  Stateful commands print an actionable warning to the recipient on stderr;
+  watch snapshots expose `stale_open_requests`; events emit a cursor-stable
+  `request.stale` projection. These warnings write no operation and never alter
+  request state. Acknowledgement, unrelated direct messages, and unrelated
+  discussion posts do not silence them. Only an explicit `response`, `decline`,
+  or `--answers` transition does.
 - Discussion unread pages are always chronological; sticky status never
   reorders this cursor stream. `unread --limit N` selects the newest N unread
   posts in the selected range. Ordinary JSON remains the historical post
@@ -424,10 +519,19 @@ They are safe to leave running while agents are writing to the store.
   post are rejected in deterministic replay order. List, thread, search,
   unread, JSON, events, and TUI surfaces expose the disposition and provenance
   rather than hiding obsolete history.
+- Structured decisions are evidence-bearing board posts, not generated
+  summaries. `discuss decide --show`, topic and post JSON, board/watch
+  snapshots, the TUI, the HTTP console API, and the web Discussion view expose
+  exact agreed-post citations, typed references, textual question status, CAS
+  clocks, and candidate answers. `answer` never closes a question. Only the
+  decision author may `defer`, `supersede`, or `close`; terminal questions do
+  not reopen. Legacy `discuss decision` posts remain valid and are counted
+  separately from structured decisions.
 - `mote ui` opens a six-tab terminal dashboard (Overview / Beads / Candidates
   / Discussion / Activity / Agents). Candidate detail retains immutable Git anchors,
   policy, reviews, authorization, supersession, and structured landability
-  reasons, so unavailable evidence is visibly blocked. It also has full
+  reasons grouped by class and blocking effect, so unavailable evidence is
+  visibly distinct from a substantive review finding. It also has full
   per-bead detail, recent op history (including rejected ops with their reasons),
   and incremental refresh on filesystem events. The Discussion tab reads like a forum: threads are indented under
   their parent post, `→`/`Enter` focuses the thread pane, `j`/`k` (or `n`/`p`)
@@ -656,8 +760,9 @@ Requires Rust 1.85+ (edition 2024).
 
 - POSIX local filesystems only. No Windows. No NFS.
 - No glob-style reservation paths.
-- No git integration; use `git worktree add` when two agents really need
-  separate `HEAD`/index. Reservations are explicitly advisory, not enforced.
+- No Git mutation or distributed sync. Candidate and audit commands make
+  explicit read-only Git observations; use `git worktree add` when two agents
+  need separate `HEAD`/index state. Reservations remain advisory, not enforced.
 - No distributed sync protocol. Versioning `.mote/` in git is a manual policy
   decision, not the default operational mode.
 - No snapshots; replay-from-scratch is the v0.2 read path.
@@ -666,7 +771,15 @@ Requires Rust 1.85+ (edition 2024).
 
 - `PRD.json` — working spec; the source of truth for design decisions
 - `mote_prd.md`, `mote_coordination_addendum.md` — historical design rationale
+- `op_packs_rfc.md` — design-only RFC and reproducible Git experiment for
+  immutable operation packs; no pack reader/writer is implemented yet
 - `candidate_protocol.md` — normative candidate, review, evidence, and landing protocol
+- `role_protocol.md` — first-class role policy, session-bounded assignments,
+  typed exclusions, capacity, and vacancy design
+- `operational_audit.md` — accepted boundary and schema for storage visibility
+  diagnostics and the read-only cross-surface audit
+- `discussion_decisions.md` — cited-decision and tracked-question protocol,
+  validation, authority, compatibility, and read-surface contract
 - `src/` — Rust crate
 - `tests/` — integration tests (storage, issue plane, notes/ready, claims/msgs,
   event delivery, coordination, replay determinism, crash/failpoint, property,

@@ -25,6 +25,43 @@ pub fn new_candidate_id() -> String {
     format!("cand-{}", Ulid::new())
 }
 
+pub fn new_role_id() -> String {
+    format!("role-{}", Ulid::new())
+}
+
+pub fn new_role_assignment_id() -> String {
+    format!("ra-{}", Ulid::new())
+}
+
+fn scoped_id_for_retry(
+    prefix: &str,
+    namespace: &str,
+    store_id: &str,
+    actor: &str,
+    key: &str,
+) -> String {
+    let mut input = Vec::new();
+    input.extend_from_slice(namespace.as_bytes());
+    input.push(0);
+    input.extend_from_slice(store_id.as_bytes());
+    input.push(0);
+    input.extend_from_slice(actor.as_bytes());
+    input.push(0);
+    input.extend_from_slice(key.as_bytes());
+    let digest = blake3::hash(&input);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    format!("{prefix}-{}", Ulid::from_bytes(bytes))
+}
+
+pub fn role_id_for_retry(store_id: &str, actor: &str, key: &str) -> String {
+    scoped_id_for_retry("role", "role", store_id, actor, key)
+}
+
+pub fn role_assignment_id_for_retry(store_id: &str, actor: &str, key: &str) -> String {
+    scoped_id_for_retry("ra", "role-assignment", store_id, actor, key)
+}
+
 /// Derive a stable candidate ULID from an actor-scoped retry identity. This
 /// lets concurrent `candidate propose` retries construct the same immutable
 /// action before either publication is visible.
@@ -88,6 +125,29 @@ pub fn new_msg_id() -> String {
 
 pub fn new_post_id() -> String {
     format!("post-{}", Ulid::new())
+}
+
+pub fn new_question_id() -> String {
+    format!("question-{}", Ulid::new())
+}
+
+pub fn decision_post_id_for_retry(store_id: &str, actor: &str, key: &str) -> String {
+    scoped_id_for_retry("post", "board-decision", store_id, actor, key)
+}
+
+pub fn decision_question_id_for_retry(
+    store_id: &str,
+    actor: &str,
+    key: &str,
+    position: usize,
+) -> String {
+    scoped_id_for_retry(
+        "question",
+        "board-decision-question",
+        store_id,
+        actor,
+        &format!("{key}\0{position}"),
+    )
 }
 
 pub fn new_session_id() -> String {
@@ -311,9 +371,12 @@ mod tests {
     #[test]
     fn id_prefixes() {
         assert!(new_bead_id().starts_with("bd-"));
+        assert!(new_role_id().starts_with("role-"));
+        assert!(new_role_assignment_id().starts_with("ra-"));
         assert!(new_reservation_id().starts_with("rv-"));
         assert!(new_msg_id().starts_with("msg-"));
         assert!(new_post_id().starts_with("post-"));
+        assert!(new_question_id().starts_with("question-"));
         assert!(new_session_id().starts_with("sess-"));
     }
 

@@ -492,6 +492,51 @@ fn read_routes_are_snapshot_backed_and_cli_shape_conformant() {
             "alice",
         ],
     );
+    let role: serde_json::Value = serde_json::from_str(&run_mote(
+        &temp,
+        &[
+            "--json",
+            "role",
+            "define",
+            "reviewer",
+            "--remit",
+            "independent review",
+            "--assigner",
+            "alice",
+            "--idempotency-key",
+            "serve-read-role",
+            "--actor",
+            "alice",
+        ],
+    ))
+    .unwrap();
+    let role_id = role["role_id"].as_str().unwrap().to_string();
+    let decision: serde_json::Value = serde_json::from_str(&run_mote(
+        &temp,
+        &[
+            "--json",
+            "discuss",
+            "decide",
+            "--topic",
+            "api",
+            "--agreed",
+            &root_post,
+            "--open",
+            "Which response shape is stable?",
+            "--issue",
+            &bead_id,
+            "--idempotency-key",
+            "serve-read-decision",
+            "--actor",
+            "alice",
+        ],
+    ))
+    .unwrap();
+    let decision_id = decision["decision_id"].as_str().unwrap().to_string();
+    let question_id = decision["questions"][0]["question_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let op_count = store.list_op_filenames().unwrap().len();
 
     let board = get_json(&store, "/api/board", "alice");
@@ -500,6 +545,10 @@ fn read_routes_are_snapshot_backed_and_cli_shape_conformant() {
     assert_eq!(board["status_counts"], board_cli["status_counts"]);
     assert_eq!(board["active_claims"], board_cli["active_claims"]);
     assert_eq!(board["actor"], "alice");
+    assert_eq!(board["discussion"]["structured_decision_count"], 1);
+    assert_eq!(board["discussion"]["unresolved_question_count"], 1);
+    assert_eq!(board["roles"][0]["role_id"], role_id);
+    assert_eq!(board["roles"][0]["coverage"]["coverage_shortfall"], 1);
 
     let beads = get_json(&store, "/api/beads?all=1", "alice");
     let beads_cli: serde_json::Value = serde_json::from_str(&run_mote(
@@ -534,6 +583,32 @@ fn read_routes_are_snapshot_backed_and_cli_shape_conformant() {
     ))
     .unwrap();
     assert_eq!(posts, posts_cli);
+    assert_eq!(
+        posts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|post| post["post_id"] == decision_id)
+            .unwrap()["decision"]["questions"][0]["status"],
+        "open"
+    );
+
+    let decisions = get_json(&store, "/api/topics/api/decisions", "alice");
+    let decisions_cli: serde_json::Value = serde_json::from_str(&run_mote(
+        &temp,
+        &["--json", "discuss", "decide", "--topic", "api", "--show"],
+    ))
+    .unwrap();
+    assert_eq!(decisions["decisions"], decisions_cli["decisions"]);
+    assert_eq!(decisions["unresolved_question_count"], 1);
+
+    let question = get_json(&store, &format!("/api/questions/{question_id}"), "alice");
+    let question_cli: serde_json::Value = serde_json::from_str(&run_mote(
+        &temp,
+        &["--json", "discuss", "question", "show", &question_id],
+    ))
+    .unwrap();
+    assert_eq!(question, question_cli);
 
     let unread = get_json(&store, "/api/unread", "alice");
     let unread_cli: serde_json::Value = serde_json::from_str(&run_mote(
@@ -591,6 +666,15 @@ fn read_routes_are_snapshot_backed_and_cli_shape_conformant() {
             .all(|row| row.as_object().unwrap().contains_key("last_message"))
     );
 
+    let roles = get_json(&store, "/api/roles", "alice");
+    assert_eq!(roles.as_array().unwrap().len(), 1);
+    assert_eq!(roles[0]["role_id"], role_id);
+    assert_eq!(roles[0]["name"], "reviewer");
+    assert_eq!(roles[0]["coverage"]["vacant"], true);
+    let role_detail = get_json(&store, "/api/roles/reviewer", "alice");
+    assert_eq!(role_detail["role_id"], role_id);
+    assert_eq!(role_detail["definition_op_id"], role["definition_op_id"]);
+
     let dm = get_json(&store, "/api/dm/bob", "alice");
     let dm_cli: serde_json::Value = serde_json::from_str(&run_mote(
         &temp,
@@ -619,6 +703,7 @@ fn read_routes_are_snapshot_backed_and_cli_shape_conformant() {
     assert_eq!(keys, cli_keys);
     assert_eq!(inflight["actor"], inflight_cli["actor"]);
     assert_eq!(inflight["window_minutes"], 60);
+    assert_eq!(inflight["roles"][0]["role_id"], role_id);
 
     assert_eq!(
         store.list_op_filenames().unwrap().len(),

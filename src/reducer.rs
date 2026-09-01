@@ -7,15 +7,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::op::{
-    BoardPostOp, BoardReadOp, BoardRetractOp, BoardRouteOp, BoardStickyOp, BoardSupersedeOp,
-    BoardTopicOp, BoardWatchOp, CandidateAbandonOp, CandidateAuthorizeOp, CandidateEvidenceOp,
-    CandidateLandedOp, CandidateProposeOp, CandidateReviewOp, CandidateRevokeOp,
-    CandidateSupersedeOp, ClaimOp, CloseOp, CreateOp, DeleteOp, DepOp, MsgAckOp, MsgResolveOp,
-    MsgSendOp, NoteOp, Op, PatchOp, RelOp, ReleaseOp, ReserveAdoptOp, ReserveCloseOp,
-    ReserveOpenOp, ScalarSet, SessionEndOp, SessionHeartbeatOp, SessionStartOp, SessionStatusOp,
-    Status, TagOp, VALID_POST_KINDS, VALID_REPLY_KINDS, VALID_ROUTE_STATES,
-    validate_idempotency_key, validate_msg_kind, validate_note_kind, validate_post_kind,
-    validate_route_state, validate_session_intent,
+    BoardDecisionOp, BoardPostOp, BoardQuestionOp, BoardReadOp, BoardRetractOp, BoardRouteOp,
+    BoardStickyOp, BoardSupersedeOp, BoardTopicOp, BoardWatchOp, CandidateAbandonOp,
+    CandidateAuthorizeOp, CandidateEvidenceOp, CandidateLandedOp, CandidateLandingRepositoryBindOp,
+    CandidateProposeOp, CandidateReconcileOp, CandidateReviewOp, CandidateReviewPolicyAmendOp,
+    CandidateRevokeOp, CandidateSupersedeOp, ClaimOp, CloseOp, CreateOp, DecisionQuestionAction,
+    DeleteOp, DepOp, DiscussionReference, MsgAckOp, MsgResolveOp, MsgSendOp, NoteOp, Op, PatchOp,
+    RelOp, ReleaseOp, ReserveAdoptOp, ReserveCloseOp, ReserveOpenOp, RoleAssignOp, RoleDefineOp,
+    RoleReleaseOp, RoleRenewOp, RoleRetireOp, ScalarSet, SessionEndOp, SessionHeartbeatOp,
+    SessionStartOp, SessionStatusOp, Status, TagOp, VALID_POST_KINDS, VALID_REPLY_KINDS,
+    VALID_ROUTE_STATES, validate_idempotency_key, validate_msg_kind, validate_note_kind,
+    validate_post_kind, validate_route_state, validate_session_intent,
 };
 use crate::repo::Store;
 use crate::state::{Bead, HistoryEntry, RequestState, RouteState, State};
@@ -101,6 +103,13 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
     let candidate_retry = op.candidate_idempotency().map(|(candidate_id, key)| {
         (
             candidate_id.to_string(),
+            key.to_string(),
+            crate::candidate::action_digest(&op),
+        )
+    });
+    let role_retry = op.role_idempotency().map(|(role_id, key)| {
+        (
+            role_id.to_string(),
             key.to_string(),
             crate::candidate::action_digest(&op),
         )
@@ -192,6 +201,54 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
             return;
         }
     }
+    if let Some((role_id, key, digest)) = &role_retry {
+        if !validate_idempotency_key(key) {
+            reject(
+                state,
+                role_id,
+                op_id,
+                kind,
+                &actor,
+                &ts,
+                "invalid idempotency key".into(),
+            );
+            return;
+        }
+        let digest = match digest {
+            Ok(digest) => digest,
+            Err(error) => {
+                reject(
+                    state,
+                    role_id,
+                    op_id,
+                    kind,
+                    &actor,
+                    &ts,
+                    format!("cannot digest role action: {error}"),
+                );
+                return;
+            }
+        };
+        if let Some(previous) = state.role_idempotency.get(&(actor.clone(), key.clone())) {
+            if previous.role_id == *role_id && previous.digest == *digest {
+                accept(state, role_id, op_id, kind, &actor, &ts);
+            } else {
+                reject(
+                    state,
+                    role_id,
+                    op_id,
+                    kind,
+                    &actor,
+                    &ts,
+                    format!(
+                        "idempotency key already used by op {} for a different role action",
+                        previous.op_id
+                    ),
+                );
+            }
+            return;
+        }
+    }
 
     match op {
         Op::Create(o) => apply_create(state, op_id, kind, &actor, &ts, o),
@@ -211,6 +268,8 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
         Op::MsgAck(o) => apply_msg_ack(state, op_id, kind, &actor, &ts, o),
         Op::MsgResolve(o) => apply_msg_resolve(state, op_id, kind, &actor, &ts, o),
         Op::BoardPost(o) => apply_board_post(state, op_id, kind, &actor, &ts, o),
+        Op::BoardDecision(o) => apply_board_decision(state, op_id, kind, &actor, &ts, o),
+        Op::BoardQuestion(o) => apply_board_question(state, op_id, kind, &actor, &ts, o),
         Op::BoardRead(o) => apply_board_read(state, op_id, kind, &actor, &ts, o),
         Op::BoardWatch(o) => apply_board_watch(state, op_id, kind, &actor, &ts, o),
         Op::BoardTopic(o) => apply_board_topic(state, op_id, kind, &actor, &ts, o),
@@ -225,14 +284,26 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
         Op::ReserveOpen(o) => apply_reserve_open(state, op_id, kind, &actor, &ts, o),
         Op::ReserveClose(o) => apply_reserve_close(state, op_id, kind, &actor, &ts, o),
         Op::ReserveAdopt(o) => apply_reserve_adopt(state, op_id, kind, &actor, &ts, o),
+        Op::RoleDefine(o) => apply_role_define(state, op_id, kind, &actor, &ts, o),
+        Op::RoleAssign(o) => apply_role_assign(state, op_id, kind, &actor, &ts, o),
+        Op::RoleRenew(o) => apply_role_renew(state, op_id, kind, &actor, &ts, o),
+        Op::RoleRelease(o) => apply_role_release(state, op_id, kind, &actor, &ts, o),
+        Op::RoleRetire(o) => apply_role_retire(state, op_id, kind, &actor, &ts, o),
         Op::CandidatePropose(o) => apply_candidate_propose(state, op_id, kind, &actor, &ts, o),
         Op::CandidateEvidence(o) => apply_candidate_evidence(state, op_id, kind, &actor, &ts, o),
         Op::CandidateReview(o) => apply_candidate_review(state, op_id, kind, &actor, &ts, o),
+        Op::CandidateReviewPolicyAmend(o) => {
+            apply_candidate_review_policy_amend(state, op_id, kind, &actor, &ts, o)
+        }
+        Op::CandidateLandingRepositoryBind(o) => {
+            apply_candidate_landing_repository_bind(state, op_id, kind, &actor, &ts, o)
+        }
         Op::CandidateAuthorize(o) => apply_candidate_authorize(state, op_id, kind, &actor, &ts, o),
         Op::CandidateRevoke(o) => apply_candidate_revoke(state, op_id, kind, &actor, &ts, o),
         Op::CandidateSupersede(o) => apply_candidate_supersede(state, op_id, kind, &actor, &ts, o),
         Op::CandidateAbandon(o) => apply_candidate_abandon(state, op_id, kind, &actor, &ts, o),
         Op::CandidateLanded(o) => apply_candidate_landed(state, op_id, kind, &actor, &ts, o),
+        Op::CandidateReconcile(o) => apply_candidate_reconcile(state, op_id, kind, &actor, &ts, o),
     }
 
     if let Some((candidate_id, key, Ok(digest))) = candidate_retry {
@@ -241,6 +312,18 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
                 (actor.clone(), key),
                 crate::state::CandidateIdempotencyRecord {
                     candidate_id,
+                    digest,
+                    op_id: op_id.to_string(),
+                },
+            );
+        }
+    }
+    if let Some((role_id, key, Ok(digest))) = role_retry {
+        if state.was_accepted(op_id) {
+            state.role_idempotency.insert(
+                (actor.clone(), key),
+                crate::state::RoleIdempotencyRecord {
+                    role_id,
                     digest,
                     op_id: op_id.to_string(),
                 },
@@ -1679,6 +1762,611 @@ fn apply_board_post(
     state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
 }
 
+fn valid_discussion_url(url: &str) -> bool {
+    url.len() <= 2_048
+        && !url.chars().any(char::is_whitespace)
+        && !url.chars().any(char::is_control)
+        && ["http://", "https://"].into_iter().any(|scheme| {
+            url.strip_prefix(scheme)
+                .is_some_and(|rest| !rest.is_empty())
+        })
+}
+
+fn validate_discussion_references(
+    state: &State,
+    references: &[DiscussionReference],
+) -> Result<(), String> {
+    if !references.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err("discussion references must be sorted and unique".into());
+    }
+    for reference in references {
+        match reference {
+            DiscussionReference::Topic { topic } => {
+                if topic.trim() != topic || !state.board_topics.contains_key(topic) {
+                    return Err(format!(
+                        "referenced discussion topic `{topic}` does not exist"
+                    ));
+                }
+            }
+            DiscussionReference::Post { post_id } => {
+                if !state.board_posts.contains_key(post_id) {
+                    return Err(format!(
+                        "referenced discussion post {post_id} does not exist"
+                    ));
+                }
+            }
+            DiscussionReference::Issue { issue_id } => {
+                if state
+                    .beads
+                    .get(issue_id)
+                    .is_none_or(crate::state::Bead::is_deleted)
+                {
+                    return Err(format!("referenced live issue {issue_id} does not exist"));
+                }
+            }
+            DiscussionReference::Candidate { candidate_id } => {
+                if !state.candidates.contains_key(candidate_id) {
+                    return Err(format!(
+                        "referenced candidate {candidate_id} does not exist"
+                    ));
+                }
+            }
+            DiscussionReference::Url { url } => {
+                if !valid_discussion_url(url) {
+                    return Err(format!(
+                        "referenced URL `{url}` must be absolute HTTP(S), single-line, whitespace-free, and at most 2048 bytes"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_board_decision(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: BoardDecisionOp,
+) {
+    let BoardDecisionOp {
+        v,
+        post_id,
+        topic,
+        body,
+        agreed_post_ids,
+        references,
+        open_questions,
+        notify,
+        idempotency_key,
+        ..
+    } = o;
+    if v != 1 {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("unsupported board decision protocol version {v}"),
+        );
+        return;
+    }
+    if !prefixed_ulid(&post_id, "post-") {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "decision post id must use the post-ULID form".into(),
+        );
+        return;
+    }
+    if topic.trim() != topic || !state.board_topics.contains_key(&topic) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("discussion topic {topic} does not exist"),
+        );
+        return;
+    }
+    if body.trim().is_empty() || body.contains('\0') {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "decision body must be non-empty".into(),
+        );
+        return;
+    }
+    if state.board_posts.contains_key(&post_id) || state.board_decisions.contains_key(&post_id) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("duplicate decision/post id {post_id}"),
+        );
+        return;
+    }
+    if let Some(key) = idempotency_key.as_deref() {
+        if !validate_idempotency_key(key) {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "idempotency_key must be 1..=128 trimmed printable characters".into(),
+            );
+            return;
+        }
+        if let Some(existing) = state.board_post_by_idempotency(actor, key) {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!(
+                    "idempotency_key `{key}` already used by {}",
+                    existing.post_id
+                ),
+            );
+            return;
+        }
+    }
+    if !sorted_unique_nonempty(&agreed_post_ids) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "decision agreed post ids must be sorted, unique, and non-empty".into(),
+        );
+        return;
+    }
+    for agreed_post_id in &agreed_post_ids {
+        let Some(post) = state.board_posts.get(agreed_post_id) else {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("agreed post {agreed_post_id} does not exist"),
+            );
+            return;
+        };
+        if post.topic != topic || post.disposition() != "active" {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("agreed post {agreed_post_id} must be active in decision topic {topic}"),
+            );
+            return;
+        }
+    }
+    if let Err(reason) = validate_discussion_references(state, &references) {
+        reject_orphan(state, op_id, kind, actor, ts, reason);
+        return;
+    }
+
+    let mut question_ids = BTreeSet::new();
+    for question in &open_questions {
+        if !prefixed_ulid(&question.question_id, "question-")
+            || question.text.trim().is_empty()
+            || question.text.trim() != question.text
+            || question
+                .text
+                .chars()
+                .any(|character| matches!(character, '\0' | '\n' | '\r'))
+        {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "decision questions require unique question-ULID ids and non-empty single-line text"
+                    .into(),
+            );
+            return;
+        }
+        if !question_ids.insert(question.question_id.clone())
+            || state.board_questions.contains_key(&question.question_id)
+        {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("duplicate question id {}", question.question_id),
+            );
+            return;
+        }
+    }
+
+    let mut explicit_notify = BTreeSet::new();
+    for recipient in notify {
+        let recipient = recipient.trim();
+        if recipient.is_empty()
+            || recipient
+                .chars()
+                .any(|character| matches!(character, '\0' | '\n' | '\r'))
+        {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "notification recipients must be non-empty single-line actor names".into(),
+            );
+            return;
+        }
+        if recipient != actor {
+            explicit_notify.insert(recipient.to_string());
+        }
+    }
+    let mut notification_recipients: BTreeSet<String> =
+        state.topic_watchers(&topic).into_iter().collect();
+    notification_recipients.extend(explicit_notify.iter().cloned());
+    notification_recipients.remove(actor);
+
+    let issue_ids = references
+        .iter()
+        .filter_map(|reference| match reference {
+            DiscussionReference::Issue { issue_id } => Some(issue_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let route = if issue_ids.is_empty() {
+        crate::state::RouteRecord::default()
+    } else {
+        crate::state::RouteRecord {
+            state: RouteState::Routed,
+            issues: issue_ids,
+            updated_by: Some(actor.to_string()),
+            updated_ts: Some(ts.to_string()),
+            updated_op_id: Some(op_id.to_string()),
+        }
+    };
+
+    let topic_record = state
+        .board_topics
+        .get_mut(&topic)
+        .expect("validated decision topic disappeared");
+    topic_record.post_count += 1;
+    topic_record.sticky_count += 1;
+    topic_record.decision_count += 1;
+    topic_record.last_activity_ts = ts.to_string();
+    topic_record.last_activity_op_id = op_id.to_string();
+
+    state
+        .board_post_op_index
+        .insert(op_id.to_string(), post_id.clone());
+    state.board_posts.insert(
+        post_id.clone(),
+        crate::state::BoardPostRecord {
+            post_id: post_id.clone(),
+            from: actor.to_string(),
+            topic: topic.clone(),
+            body,
+            reply_to: None,
+            post_kind: "decision".into(),
+            answers: Vec::new(),
+            explicit_notify: explicit_notify.into_iter().collect(),
+            notification_recipients: notification_recipients.into_iter().collect(),
+            idempotency_key,
+            sticky: true,
+            sticky_op_id: Some(op_id.to_string()),
+            superseded_by: None,
+            superseded_op_id: None,
+            supersedes: Vec::new(),
+            retracted: false,
+            retraction_reason: None,
+            retracted_op_id: None,
+            route,
+            sent_ts: ts.to_string(),
+            sent_op_id: op_id.to_string(),
+        },
+    );
+    let question_ids = open_questions
+        .iter()
+        .map(|question| question.question_id.clone())
+        .collect::<Vec<_>>();
+    state.board_decisions.insert(
+        post_id.clone(),
+        crate::state::BoardDecisionRecord {
+            decision_id: post_id.clone(),
+            post_id: post_id.clone(),
+            topic: topic.clone(),
+            agreed_post_ids,
+            references,
+            question_ids,
+            actor: actor.to_string(),
+            op_id: op_id.to_string(),
+            ts: ts.to_string(),
+        },
+    );
+    for (position, question) in open_questions.into_iter().enumerate() {
+        state.board_questions.insert(
+            question.question_id.clone(),
+            crate::state::DecisionQuestionRecord {
+                question_id: question.question_id,
+                decision_id: post_id.clone(),
+                topic: topic.clone(),
+                text: question.text,
+                opened_by: actor.to_string(),
+                opened_op_id: op_id.to_string(),
+                opened_ts: ts.to_string(),
+                position,
+                status: crate::state::DecisionQuestionStatus::Open,
+                clock_op_id: op_id.to_string(),
+                successor_question_id: None,
+                transitions: Vec::new(),
+            },
+        );
+    }
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+fn apply_board_question(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: BoardQuestionOp,
+) {
+    if o.v != 1 {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("unsupported board question protocol version {}", o.v),
+        );
+        return;
+    }
+    if let Some(key) = o.idempotency_key.as_deref() {
+        if !validate_idempotency_key(key) {
+            reject_orphan(
+                state,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "idempotency_key must be 1..=128 trimmed printable characters".into(),
+            );
+            return;
+        }
+        if let Some((question, transition)) =
+            state.board_question_transition_by_idempotency(actor, key)
+        {
+            let same = question.question_id == o.question_id
+                && transition.action == o.action
+                && transition.expect_question == o.expect_question
+                && transition.references == o.references
+                && transition.note == o.note
+                && transition.successor_question_id == o.successor_question_id;
+            let reason = if same {
+                format!(
+                    "idempotent retry already accepted as op {}",
+                    transition.op_id
+                )
+            } else {
+                format!(
+                    "idempotency key `{key}` already used by op {} for a different question action",
+                    transition.op_id
+                )
+            };
+            reject_orphan(state, op_id, kind, actor, ts, reason);
+            return;
+        }
+    }
+    let Some(question) = state.board_questions.get(&o.question_id) else {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("decision question {} does not exist", o.question_id),
+        );
+        return;
+    };
+    if question.clock_op_id != o.expect_question {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            format!("stale question CAS: current is {}", question.clock_op_id),
+        );
+        return;
+    }
+    if !o.references.windows(2).all(|pair| pair[0] < pair[1]) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "discussion references must be sorted and unique".into(),
+        );
+        return;
+    }
+    if let Err(reason) = validate_discussion_references(state, &o.references) {
+        reject_orphan(state, op_id, kind, actor, ts, reason);
+        return;
+    }
+    if o.note.as_deref().is_some_and(|note| {
+        note.trim().is_empty() || note.chars().any(|character| character == '\0')
+    }) {
+        reject_orphan(
+            state,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "question transition note must be non-empty when supplied".into(),
+        );
+        return;
+    }
+
+    let question_status = question.status;
+    let question_topic = question.topic.clone();
+    let decision_actor = state
+        .board_decisions
+        .get(&question.decision_id)
+        .map(|decision| decision.actor.clone())
+        .expect("question references a missing decision");
+    let lifecycle_authorized = actor == decision_actor;
+    let (next_status, successor_question_id) = match o.action {
+        DecisionQuestionAction::Answer => {
+            let has_same_topic_post = o.references.iter().any(|reference| {
+                let DiscussionReference::Post { post_id } = reference else {
+                    return false;
+                };
+                state
+                    .board_posts
+                    .get(post_id)
+                    .is_some_and(|post| post.topic == question_topic)
+            });
+            if question_status != crate::state::DecisionQuestionStatus::Open
+                || !has_same_topic_post
+                || o.successor_question_id.is_some()
+            {
+                reject_orphan(
+                    state,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "answer requires an open question, at least one same-topic post citation, and no successor"
+                        .into(),
+                );
+                return;
+            }
+            (question_status, None)
+        }
+        DecisionQuestionAction::Defer => {
+            if question_status != crate::state::DecisionQuestionStatus::Open
+                || !lifecycle_authorized
+                || o.note.is_none()
+                || o.successor_question_id.is_some()
+            {
+                reject_orphan(
+                    state,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "defer requires the decision author, an open question, a reason, and no successor"
+                        .into(),
+                );
+                return;
+            }
+            (crate::state::DecisionQuestionStatus::Deferred, None)
+        }
+        DecisionQuestionAction::Supersede => {
+            let Some(successor_id) = o.successor_question_id.as_deref() else {
+                reject_orphan(
+                    state,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "supersede requires a successor question".into(),
+                );
+                return;
+            };
+            let valid_successor = successor_id != o.question_id
+                && state
+                    .board_questions
+                    .get(successor_id)
+                    .is_some_and(|successor| {
+                        successor.topic == question_topic && successor.status.unresolved()
+                    });
+            if !question_status.unresolved() || !lifecycle_authorized || !valid_successor {
+                reject_orphan(
+                    state,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "supersede requires the decision author and a different unresolved successor in the same topic"
+                        .into(),
+                );
+                return;
+            }
+            (
+                crate::state::DecisionQuestionStatus::Superseded,
+                Some(successor_id.to_string()),
+            )
+        }
+        DecisionQuestionAction::Close => {
+            if !question_status.unresolved()
+                || !lifecycle_authorized
+                || o.note.is_none()
+                || o.successor_question_id.is_some()
+            {
+                reject_orphan(
+                    state,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "close requires the decision author, an unresolved question, a resolution, and no successor"
+                        .into(),
+                );
+                return;
+            }
+            (crate::state::DecisionQuestionStatus::Closed, None)
+        }
+    };
+
+    let question = state
+        .board_questions
+        .get_mut(&o.question_id)
+        .expect("validated question disappeared");
+    question.status = next_status;
+    question.clock_op_id = op_id.to_string();
+    question.successor_question_id = successor_question_id;
+    question
+        .transitions
+        .push(crate::state::DecisionQuestionTransitionRecord {
+            action: o.action,
+            actor: actor.to_string(),
+            expect_question: o.expect_question,
+            references: o.references,
+            note: o.note,
+            successor_question_id: o.successor_question_id,
+            idempotency_key: o.idempotency_key,
+            op_id: op_id.to_string(),
+            ts: ts.to_string(),
+        });
+    state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
 fn apply_board_watch(
     state: &mut State,
     op_id: &str,
@@ -3066,6 +3754,549 @@ fn sorted_unique_nonempty(values: &[String]) -> bool {
         && values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
+fn prefixed_ulid(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|suffix| suffix.parse::<ulid::Ulid>().is_ok())
+}
+
+fn role_excludes(state: &State, role_id: &str, other_role_id: &str) -> bool {
+    state.roles.get(role_id).is_some_and(|role| {
+        role.exclusions.iter().any(|exclusion| {
+            exclusion.code == crate::role::RoleExclusionCode::ConcurrentRole
+                && exclusion.target_role_id.as_deref() == Some(other_role_id)
+        })
+    })
+}
+
+fn apply_role_define(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: RoleDefineOp,
+) {
+    let role_id = o.role_id.clone();
+    let fail =
+        |state: &mut State, reason: String| reject(state, &role_id, op_id, kind, actor, ts, reason);
+    if o.v != crate::role::ROLE_PROTOCOL_VERSION {
+        fail(
+            state,
+            format!(
+                "unsupported role protocol version {}; expected {}",
+                o.v,
+                crate::role::ROLE_PROTOCOL_VERSION
+            ),
+        );
+        return;
+    }
+    if !prefixed_ulid(&role_id, "role-") {
+        fail(state, "role id must use the role-ULID form".into());
+        return;
+    }
+    if state.roles.contains_key(&role_id) {
+        fail(state, format!("role {role_id} already exists"));
+        return;
+    }
+    if !crate::role::valid_role_name(&o.name) {
+        fail(
+            state,
+            "role name must be 1..=64 lowercase alphanumeric/hyphen characters and start/end alphanumeric"
+                .into(),
+        );
+        return;
+    }
+    if state.role_names.contains_key(&o.name) {
+        fail(state, format!("role name `{}` is already reserved", o.name));
+        return;
+    }
+    if o.remit.trim().is_empty() {
+        fail(state, "role remit must be non-empty".into());
+        return;
+    }
+    if !sorted_unique_nonempty(&o.assignment_authorities)
+        || !o
+            .assignment_authorities
+            .iter()
+            .any(|authority| authority == actor)
+    {
+        fail(
+            state,
+            "role assignment authorities must be sorted, unique, non-empty, and include the defining actor"
+                .into(),
+        );
+        return;
+    }
+    if o.capacity == 0 || o.minimum_active > o.capacity {
+        fail(
+            state,
+            "role capacity must be positive and minimum_active must not exceed capacity".into(),
+        );
+        return;
+    }
+    if !o.exclusions.windows(2).all(|pair| pair[0] < pair[1]) {
+        fail(state, "role exclusions must be sorted and unique".into());
+        return;
+    }
+    for exclusion in &o.exclusions {
+        match exclusion.code {
+            crate::role::RoleExclusionCode::ConcurrentRole => {
+                let Some(target_role_id) = exclusion.target_role_id.as_deref() else {
+                    fail(
+                        state,
+                        "concurrent_role exclusion requires target_role_id".into(),
+                    );
+                    return;
+                };
+                if target_role_id == role_id
+                    || state
+                        .roles
+                        .get(target_role_id)
+                        .is_none_or(|role| role.retired.is_some())
+                {
+                    fail(
+                        state,
+                        "concurrent_role exclusion requires a distinct existing non-retired role"
+                            .into(),
+                    );
+                    return;
+                }
+            }
+            _ if exclusion.target_role_id.is_some() => {
+                fail(
+                    state,
+                    format!(
+                        "{} exclusion must not carry target_role_id",
+                        exclusion.code.as_str()
+                    ),
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    state.role_names.insert(o.name.clone(), role_id.clone());
+    state.roles.insert(
+        role_id.clone(),
+        crate::state::RoleRecord {
+            role_id: role_id.clone(),
+            name: o.name,
+            remit: o.remit,
+            exclusions: o.exclusions,
+            assignment_authorities: o.assignment_authorities,
+            capacity: o.capacity,
+            minimum_active: o.minimum_active,
+            defined_by: actor.to_string(),
+            definition_op_id: op_id.to_string(),
+            defined_ts: ts.to_string(),
+            retired: None,
+        },
+    );
+    accept(state, &role_id, op_id, kind, actor, ts);
+}
+
+fn apply_role_assign(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: RoleAssignOp,
+) {
+    let role_id = o.role_id.clone();
+    let fail =
+        |state: &mut State, reason: String| reject(state, &role_id, op_id, kind, actor, ts, reason);
+    if o.v != crate::role::ROLE_PROTOCOL_VERSION {
+        fail(
+            state,
+            format!(
+                "unsupported role protocol version {}; expected {}",
+                o.v,
+                crate::role::ROLE_PROTOCOL_VERSION
+            ),
+        );
+        return;
+    }
+    let Some(role) = state.roles.get(&role_id) else {
+        fail(state, format!("role {role_id} does not exist"));
+        return;
+    };
+    if role.retired.is_some()
+        || role.definition_op_id != o.expect_definition
+        || !role
+            .assignment_authorities
+            .iter()
+            .any(|authority| authority == actor)
+    {
+        fail(
+            state,
+            "role assignment requires current definition CAS, non-retired role, and named assignment authority"
+                .into(),
+        );
+        return;
+    }
+    if !prefixed_ulid(&o.assignment_id, "ra-")
+        || state.role_assignments.contains_key(&o.assignment_id)
+    {
+        fail(
+            state,
+            "assignment id must be a new ra-ULID identifier".into(),
+        );
+        return;
+    }
+    if o.holder_actor.trim().is_empty() || o.ttl_s == 0 {
+        fail(
+            state,
+            "role assignment requires a non-empty holder actor and positive TTL".into(),
+        );
+        return;
+    }
+    let Some(session) = state.sessions.get(&o.holder_session_id) else {
+        fail(
+            state,
+            format!("holder session {} does not exist", o.holder_session_id),
+        );
+        return;
+    };
+    if session.actor != o.holder_actor
+        || !session.is_live(ts)
+        || session.last_heartbeat_op_id != o.expect_session
+    {
+        fail(
+            state,
+            "role assignment requires the holder's exact current live session lease CAS".into(),
+        );
+        return;
+    }
+    let lease_until_ts = match compute_lease_until(ts, o.ttl_s) {
+        Ok(lease_until_ts) => lease_until_ts,
+        Err(error) => {
+            fail(state, format!("bad ttl: {error}"));
+            return;
+        }
+    };
+    if lease_until_ts > session.lease_until_ts {
+        fail(
+            state,
+            format!(
+                "role lease would outlive holder session lease {}",
+                session.lease_until_ts
+            ),
+        );
+        return;
+    }
+    let current_active = state.role_active_assignment_clocks(&role_id, ts);
+    if current_active != o.expect_active {
+        fail(
+            state,
+            format!(
+                "stale active-assignment CAS: current is {}",
+                serde_json::to_string(&current_active).unwrap_or_else(|_| "[]".into())
+            ),
+        );
+        return;
+    }
+    if current_active.len() as u32 >= role.capacity {
+        fail(state, format!("role capacity {} is full", role.capacity));
+        return;
+    }
+    if state
+        .role_active_assignments(&role_id, ts)
+        .iter()
+        .any(|assignment| assignment.holder_actor == o.holder_actor)
+    {
+        fail(
+            state,
+            "holder already has an active assignment to this role".into(),
+        );
+        return;
+    }
+    for other in state.active_role_assignments_for_actor(&o.holder_actor, ts) {
+        if role_excludes(state, &role_id, &other.role_id)
+            || role_excludes(state, &other.role_id, &role_id)
+        {
+            fail(
+                state,
+                format!(
+                    "role {} conflicts with active role {} for holder {}",
+                    role_id, other.role_id, o.holder_actor
+                ),
+            );
+            return;
+        }
+    }
+
+    state.role_assignments.insert(
+        o.assignment_id.clone(),
+        crate::state::RoleAssignmentRecord {
+            assignment_id: o.assignment_id,
+            role_id: role_id.clone(),
+            holder_actor: o.holder_actor,
+            holder_session_id: o.holder_session_id,
+            session_lease_op_id: o.expect_session,
+            assigned_by: actor.to_string(),
+            assigned_op_id: op_id.to_string(),
+            assigned_ts: ts.to_string(),
+            ttl_s: o.ttl_s,
+            lease_until_ts,
+            clock_op_id: op_id.to_string(),
+            last_updated_by: actor.to_string(),
+            last_updated_ts: ts.to_string(),
+            released_by: None,
+            release_reason: None,
+            released_op_id: None,
+            released_ts: None,
+        },
+    );
+    accept(state, &role_id, op_id, kind, actor, ts);
+}
+
+fn apply_role_renew(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: RoleRenewOp,
+) {
+    let role_id = o.role_id.clone();
+    let fail =
+        |state: &mut State, reason: String| reject(state, &role_id, op_id, kind, actor, ts, reason);
+    if o.v != crate::role::ROLE_PROTOCOL_VERSION {
+        fail(
+            state,
+            format!(
+                "unsupported role protocol version {}; expected {}",
+                o.v,
+                crate::role::ROLE_PROTOCOL_VERSION
+            ),
+        );
+        return;
+    }
+    let Some(role) = state.roles.get(&role_id) else {
+        fail(state, "role does not exist".into());
+        return;
+    };
+    if role.retired.is_some()
+        || !role
+            .assignment_authorities
+            .iter()
+            .any(|authority| authority == actor)
+    {
+        fail(
+            state,
+            "only a named assignment authority may renew a non-retired role".into(),
+        );
+        return;
+    }
+    let Some(assignment) = state.role_assignments.get(&o.assignment_id) else {
+        fail(state, "role assignment does not exist".into());
+        return;
+    };
+    if assignment.role_id != role_id
+        || assignment.clock_op_id != o.expect_assignment
+        || state.role_assignment_disposition(assignment, ts)
+            != crate::role::RoleAssignmentDisposition::Active
+        || o.ttl_s == 0
+    {
+        fail(
+            state,
+            "role renewal requires the exact current clock of an active assignment and positive TTL"
+                .into(),
+        );
+        return;
+    }
+    let Some(session) = state.sessions.get(&assignment.holder_session_id) else {
+        fail(state, "holder session does not exist".into());
+        return;
+    };
+    if !session.is_live(ts) || session.last_heartbeat_op_id != o.expect_session {
+        fail(
+            state,
+            "role renewal requires the exact current live holder-session lease CAS".into(),
+        );
+        return;
+    }
+    let lease_until_ts = match compute_lease_until(ts, o.ttl_s) {
+        Ok(lease_until_ts) => lease_until_ts,
+        Err(error) => {
+            fail(state, format!("bad ttl: {error}"));
+            return;
+        }
+    };
+    if lease_until_ts > session.lease_until_ts {
+        fail(
+            state,
+            format!(
+                "role lease would outlive holder session lease {}",
+                session.lease_until_ts
+            ),
+        );
+        return;
+    }
+    let assignment = state
+        .role_assignments
+        .get_mut(&o.assignment_id)
+        .expect("assignment checked above");
+    assignment.session_lease_op_id = o.expect_session;
+    assignment.ttl_s = o.ttl_s;
+    assignment.lease_until_ts = lease_until_ts;
+    assignment.clock_op_id = op_id.to_string();
+    assignment.last_updated_by = actor.to_string();
+    assignment.last_updated_ts = ts.to_string();
+    accept(state, &role_id, op_id, kind, actor, ts);
+}
+
+fn apply_role_release(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: RoleReleaseOp,
+) {
+    let role_id = o.role_id.clone();
+    let fail =
+        |state: &mut State, reason: String| reject(state, &role_id, op_id, kind, actor, ts, reason);
+    if o.v != crate::role::ROLE_PROTOCOL_VERSION {
+        fail(
+            state,
+            format!(
+                "unsupported role protocol version {}; expected {}",
+                o.v,
+                crate::role::ROLE_PROTOCOL_VERSION
+            ),
+        );
+        return;
+    }
+    let Some(role) = state.roles.get(&role_id) else {
+        fail(state, "role does not exist".into());
+        return;
+    };
+    let Some(assignment) = state.role_assignments.get(&o.assignment_id) else {
+        fail(state, "role assignment does not exist".into());
+        return;
+    };
+    if assignment.role_id != role_id
+        || assignment.clock_op_id != o.expect_assignment
+        || assignment.released_op_id.is_some()
+        || assignment.holder_actor != actor
+            && !role
+                .assignment_authorities
+                .iter()
+                .any(|authority| authority == actor)
+    {
+        fail(
+            state,
+            "role release requires holder/assignment-authority ownership and current assignment CAS"
+                .into(),
+        );
+        return;
+    }
+    if o.reason.as_deref().is_some_and(|reason| {
+        reason.trim().is_empty()
+            || reason
+                .chars()
+                .any(|character| matches!(character, '\0' | '\n' | '\r'))
+    }) {
+        fail(
+            state,
+            "role release reason must be non-empty single-line text when supplied".into(),
+        );
+        return;
+    }
+    let assignment = state
+        .role_assignments
+        .get_mut(&o.assignment_id)
+        .expect("assignment checked above");
+    assignment.clock_op_id = op_id.to_string();
+    assignment.last_updated_by = actor.to_string();
+    assignment.last_updated_ts = ts.to_string();
+    assignment.released_by = Some(actor.to_string());
+    assignment.release_reason = o.reason;
+    assignment.released_op_id = Some(op_id.to_string());
+    assignment.released_ts = Some(ts.to_string());
+    accept(state, &role_id, op_id, kind, actor, ts);
+}
+
+fn apply_role_retire(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: RoleRetireOp,
+) {
+    let role_id = o.role_id.clone();
+    let fail =
+        |state: &mut State, reason: String| reject(state, &role_id, op_id, kind, actor, ts, reason);
+    if o.v != crate::role::ROLE_PROTOCOL_VERSION {
+        fail(
+            state,
+            format!(
+                "unsupported role protocol version {}; expected {}",
+                o.v,
+                crate::role::ROLE_PROTOCOL_VERSION
+            ),
+        );
+        return;
+    }
+    let Some(role) = state.roles.get(&role_id) else {
+        fail(state, "role does not exist".into());
+        return;
+    };
+    if role.retired.is_some()
+        || role.definition_op_id != o.expect_definition
+        || !role
+            .assignment_authorities
+            .iter()
+            .any(|authority| authority == actor)
+    {
+        fail(
+            state,
+            "role retirement requires current definition CAS, non-retired role, and named assignment authority"
+                .into(),
+        );
+        return;
+    }
+    if state.role_assignment_clocks(&role_id) != o.expect_assignments {
+        fail(state, "stale role assignment-clock snapshot CAS".into());
+        return;
+    }
+    if !state.role_active_assignments(&role_id, ts).is_empty() {
+        fail(
+            state,
+            "role with active assignments cannot be retired".into(),
+        );
+        return;
+    }
+    if o.reason.as_deref().is_some_and(|reason| {
+        reason.trim().is_empty()
+            || reason
+                .chars()
+                .any(|character| matches!(character, '\0' | '\n' | '\r'))
+    }) {
+        fail(
+            state,
+            "role retirement reason must be non-empty single-line text when supplied".into(),
+        );
+        return;
+    }
+    state
+        .roles
+        .get_mut(&role_id)
+        .expect("role checked above")
+        .retired = Some(crate::state::RoleRetirementRecord {
+        actor: actor.to_string(),
+        reason: o.reason,
+        op_id: op_id.to_string(),
+        ts: ts.to_string(),
+    });
+    accept(state, &role_id, op_id, kind, actor, ts);
+}
+
 fn full_oid(value: &str, object_format: &str) -> bool {
     let expected = if object_format == "sha256" { 64 } else { 40 };
     value.len() == expected
@@ -3112,6 +4343,35 @@ fn apply_candidate_propose(
         fail(state, "proposal repository identity is incomplete".into());
         return;
     }
+    let (landing_repository_id, object_source, object_availability_required) = match (
+        &o.landing_repository_id,
+        &o.object_source,
+    ) {
+        (None, None) => (o.repository_id.clone(), None, false),
+        (Some(landing_repository_id), Some(object_source))
+            if !landing_repository_id.trim().is_empty()
+                && object_source.repository_id == o.repository_id
+                && !object_source.commit_ref.trim().is_empty()
+                && object_source
+                    .locator
+                    .as_ref()
+                    .is_none_or(|locator| !locator.trim().is_empty()) =>
+        {
+            (
+                landing_repository_id.clone(),
+                Some(object_source.clone()),
+                true,
+            )
+        }
+        _ => {
+            fail(
+                    state,
+                    "portable proposal requires a landing repository and matching non-empty object-source provenance together"
+                        .into(),
+                );
+            return;
+        }
+    };
     if !full_oid(&o.commit_oid, &o.object_format)
         || !full_oid(&o.base_oid, &o.object_format)
         || !o
@@ -3125,24 +4385,108 @@ fn apply_candidate_propose(
         );
         return;
     }
-    if actor == o.authorizer || o.reviewers.iter().any(|reviewer| reviewer == actor) {
+    let (review_policy_version, reviewers, role_review_requirements) = match (
+        o.v,
+        object_availability_required,
+    ) {
+        (crate::candidate::CANDIDATE_PROTOCOL_VERSION, false) if o.review_policy.is_none() => {
+            if !sorted_unique_nonempty(&o.reviewers) {
+                fail(
+                    state,
+                    "legacy candidate policy requires sorted unique named reviewers".into(),
+                );
+                return;
+            }
+            (o.v, o.reviewers.clone(), Vec::new())
+        }
+        (crate::candidate::CANDIDATE_ROLE_REVIEW_VERSION, false)
+        | (crate::candidate::CANDIDATE_PORTABLE_PROTOCOL_VERSION, true)
+            if o.reviewers.is_empty() && o.review_policy.is_some() =>
+        {
+            let policy = o.review_policy.as_ref().expect("checked above");
+            let named_valid = policy
+                .named_reviewers
+                .iter()
+                .all(|reviewer| !reviewer.trim().is_empty())
+                && policy
+                    .named_reviewers
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]);
+            let roles_valid = policy.role_requirements.iter().all(|requirement| {
+                !requirement.role_id.trim().is_empty()
+                    && !requirement.definition_op_id.trim().is_empty()
+                    && requirement.required_approvals > 0
+            }) && policy
+                .role_requirements
+                .windows(2)
+                .all(|pair| pair[0].role_id < pair[1].role_id);
+            if (!named_valid || !roles_valid)
+                || (policy.named_reviewers.is_empty() && policy.role_requirements.is_empty())
+            {
+                fail(
+                    state,
+                    "role-aware review policy requires sorted unique named reviewers and role requirements, with at least one requirement"
+                        .into(),
+                );
+                return;
+            }
+            for requirement in &policy.role_requirements {
+                let Some(role) = state.roles.get(&requirement.role_id) else {
+                    fail(
+                        state,
+                        format!(
+                            "required review role {} does not exist",
+                            requirement.role_id
+                        ),
+                    );
+                    return;
+                };
+                if role.retired.is_some()
+                    || role.definition_op_id != requirement.definition_op_id
+                    || requirement.required_approvals > role.capacity
+                {
+                    fail(
+                        state,
+                        format!(
+                            "required review role {} must be non-retired, match its immutable definition, and have capacity for {} distinct approval(s)",
+                            requirement.role_id, requirement.required_approvals
+                        ),
+                    );
+                    return;
+                }
+            }
+            (
+                o.v,
+                policy.named_reviewers.clone(),
+                policy.role_requirements.clone(),
+            )
+        }
+        _ => {
+            fail(
+                state,
+                format!(
+                    "unsupported or inconsistent candidate review policy version {}",
+                    o.v
+                ),
+            );
+            return;
+        }
+    };
+    if actor == o.authorizer || reviewers.iter().any(|reviewer| reviewer == actor) {
         fail(
             state,
             "proposer must be distinct from the authorizer and all reviewers".into(),
         );
         return;
     }
-    if o.authorizer.trim().is_empty()
-        || !sorted_unique_nonempty(&o.reviewers)
-        || !sorted_unique_nonempty(&o.paths)
-    {
+    if o.authorizer.trim().is_empty() || !sorted_unique_nonempty(&o.paths) {
         fail(
             state,
-            "authorizer, sorted unique reviewers, and sorted unique paths are required".into(),
+            "authorizer and sorted unique paths are required".into(),
         );
         return;
     }
-    if o.reviewers.iter().any(|reviewer| reviewer == &o.authorizer) {
+    if reviewers.iter().any(|reviewer| reviewer == &o.authorizer) {
         fail(state, "authorizer must be distinct from reviewers".into());
         return;
     }
@@ -3197,22 +4541,33 @@ fn apply_candidate_propose(
             proposal_op_id: op_id.to_string(),
             store_id: o.store_id,
             repository_id: o.repository_id,
+            landing_repository_id,
+            landing_repository_op_id: op_id.to_string(),
+            landing_repository_bindings: Vec::new(),
+            object_source,
+            object_availability_required,
             object_format: o.object_format,
             commit_oid: o.commit_oid,
             base_oid: o.base_oid,
             parent_oids: o.parent_oids,
             paths: o.paths,
             authorizer: o.authorizer,
-            reviewers: o.reviewers,
+            review_policy_version,
+            review_policy_op_id: op_id.to_string(),
+            reviewers,
+            role_review_requirements,
+            review_policy_amendments: Vec::new(),
             evidence_requirements: o.evidence_requirements,
             evidence_refs: o.evidence_refs,
             phase: crate::candidate::CandidatePhase::Pending,
             phase_op_id: op_id.to_string(),
             successor_id: None,
+            supersession: None,
             reviews: BTreeMap::new(),
             evidence: BTreeMap::new(),
             authorization: None,
             landed: None,
+            reconciled: None,
         },
     );
     accept(state, &candidate_id, op_id, kind, actor, ts);
@@ -3316,7 +4671,45 @@ fn apply_candidate_evidence(
                     .grantees
                     .iter()
                     .any(|grantee| grantee == actor)
-            });
+            })
+        || o.name == crate::candidate::GIT_REACHABILITY_EVIDENCE
+            && o.evidence_kind == "git"
+            && candidate.authorizer == actor
+        || o.name == crate::candidate::GIT_OBJECT_AVAILABILITY_EVIDENCE
+            && o.evidence_kind == "git"
+            && (candidate.proposer == actor
+                || candidate.authorizer == actor
+                || candidate.reviewers.iter().any(|reviewer| reviewer == actor)
+                || candidate.reviews.contains_key(actor)
+                || candidate
+                    .role_review_requirements
+                    .iter()
+                    .any(|requirement| {
+                        state
+                            .active_role_assignments_for_actor(actor, ts)
+                            .into_iter()
+                            .filter(|assignment| assignment.role_id == requirement.role_id)
+                            .any(|assignment| {
+                                state
+                                    .candidate_role_review_eligibility(
+                                        &candidate.candidate_id,
+                                        actor,
+                                        &requirement.role_id,
+                                        &assignment.assignment_id,
+                                        ts,
+                                    )
+                                    .is_ok()
+                            })
+                    })
+                || candidate
+                    .authorization
+                    .as_ref()
+                    .is_some_and(|authorization| {
+                        authorization
+                            .grantees
+                            .iter()
+                            .any(|grantee| grantee == actor)
+                    }));
     if !required_producer {
         reject(
             state,
@@ -3332,7 +4725,8 @@ fn apply_candidate_evidence(
     if o.name == crate::candidate::GIT_ANCESTRY_EVIDENCE {
         match &o.payload {
             crate::candidate::CandidateEvidencePayload::GitAncestry(git)
-                if git.repository_id == candidate.repository_id
+                if (git.repository_id == candidate.repository_id
+                    || git.repository_id == candidate.landing_repository_id)
                     && git.object_format == candidate.object_format
                     && git.commit_oid == candidate.commit_oid
                     && git.base_oid == candidate.base_oid
@@ -3351,26 +4745,164 @@ fn apply_candidate_evidence(
             }
         }
     }
-    let candidate = state
-        .candidates
-        .get_mut(&candidate_id)
-        .expect("candidate checked above");
-    candidate.evidence.insert(
-        (o.name.clone(), actor.to_string()),
-        crate::state::CandidateEvidenceRecord {
-            producer: actor.to_string(),
-            producer_tool: o.producer_tool,
-            evidence_id: o.evidence_id,
-            name: o.name,
-            evidence_kind: o.evidence_kind,
-            candidate_oid: o.candidate_oid,
-            outcome: o.outcome,
-            payload: o.payload,
-            refs: o.refs,
-            op_id: op_id.to_string(),
-            ts: ts.to_string(),
-        },
-    );
+    if o.name == crate::candidate::GIT_REACHABILITY_EVIDENCE {
+        match &o.payload {
+            crate::candidate::CandidateEvidencePayload::GitReachability(git)
+                if git.repository_id == candidate.landing_repository_id
+                    && git.object_format == candidate.object_format
+                    && git.candidate_oid == candidate.commit_oid
+                    && !git.target_ref.trim().is_empty()
+                    && full_oid(&git.observed_target_oid, &candidate.object_format) => {}
+            _ => {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "git-reachability receipt does not match proposal anchors".into(),
+                );
+                return;
+            }
+        }
+    }
+    if o.name == crate::candidate::GIT_OBJECT_AVAILABILITY_EVIDENCE {
+        match &o.payload {
+            crate::candidate::CandidateEvidencePayload::GitObjectAvailability(git)
+                if git.repository_id == candidate.landing_repository_id
+                    && git.object_format == candidate.object_format
+                    && git.candidate_oid == candidate.commit_oid
+                    && match git.object_available {
+                        Some(true) => {
+                            o.outcome == crate::candidate::EvidenceOutcome::Pass
+                                && git.observed_parent_oids == candidate.parent_oids
+                        }
+                        Some(false) => {
+                            o.outcome == crate::candidate::EvidenceOutcome::Fail
+                                && git.observed_parent_oids.is_empty()
+                        }
+                        None => {
+                            matches!(
+                                o.outcome,
+                                crate::candidate::EvidenceOutcome::Unavailable
+                                    | crate::candidate::EvidenceOutcome::Ambiguous
+                            ) && git.observed_parent_oids.is_empty()
+                        }
+                    } => {}
+            _ => {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "git-object-availability receipt does not match the current landing repository and immutable object anchors"
+                        .into(),
+                );
+                return;
+            }
+        }
+    }
+    if matches!(
+        &o.payload,
+        crate::candidate::CandidateEvidencePayload::GitObjectAvailability(_)
+    ) && (o.name != crate::candidate::GIT_OBJECT_AVAILABILITY_EVIDENCE
+        || o.evidence_kind != "git")
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "git-object-availability payload requires the built-in git evidence name and kind"
+                .into(),
+        );
+        return;
+    }
+    let pair_updates = match &o.payload {
+        crate::candidate::CandidateEvidencePayload::GitAncestry(git)
+            if o.name == crate::candidate::GIT_ANCESTRY_EVIDENCE =>
+        {
+            let mut known_ids = BTreeSet::new();
+            known_ids.extend(
+                git.candidate_relations
+                    .iter()
+                    .map(|relation| relation.candidate_id.clone()),
+            );
+            known_ids.extend(
+                git.covered_candidates
+                    .iter()
+                    .map(|(known_id, _)| known_id.clone()),
+            );
+            if let Some(snapshot) = &git.producer_snapshot {
+                known_ids.extend(
+                    snapshot
+                        .observed_candidates
+                        .iter()
+                        .map(|(known_id, _)| known_id.clone()),
+                );
+            }
+            known_ids.remove(&candidate_id);
+
+            known_ids
+                .into_iter()
+                .map(|known_candidate_id| {
+                    let relations = git
+                        .candidate_relations
+                        .iter()
+                        .filter(|relation| relation.candidate_id == known_candidate_id)
+                        .cloned()
+                        .collect();
+                    (
+                        (candidate_id.clone(), known_candidate_id.clone()),
+                        crate::state::CandidatePairEvidenceRecord {
+                            subject_candidate_id: candidate_id.clone(),
+                            subject_proposal_op_id: candidate.proposal_op_id.clone(),
+                            subject_store_id: candidate.store_id.clone(),
+                            repository_id: git.repository_id.clone(),
+                            object_format: git.object_format.clone(),
+                            subject_commit_oid: git.commit_oid.clone(),
+                            subject_base_oid: git.base_oid.clone(),
+                            relation_schema: git.relation_schema,
+                            known_candidate_id,
+                            relations,
+                            covered_candidates: git.covered_candidates.clone(),
+                            producer_snapshot: git.producer_snapshot.clone(),
+                            evidence_op_id: op_id.to_string(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
+    };
+    {
+        let candidate = state
+            .candidates
+            .get_mut(&candidate_id)
+            .expect("candidate checked above");
+        candidate.evidence.insert(
+            (o.name.clone(), actor.to_string()),
+            crate::state::CandidateEvidenceRecord {
+                producer: actor.to_string(),
+                producer_tool: o.producer_tool,
+                evidence_id: o.evidence_id,
+                name: o.name,
+                evidence_kind: o.evidence_kind,
+                candidate_oid: o.candidate_oid,
+                outcome: o.outcome,
+                payload: o.payload,
+                refs: o.refs,
+                op_id: op_id.to_string(),
+                ts: ts.to_string(),
+            },
+        );
+    }
+    state.candidate_pair_evidence.extend(pair_updates);
     accept(state, &candidate_id, op_id, kind, actor, ts);
 }
 
@@ -3395,9 +4927,7 @@ fn apply_candidate_review(
         );
         return;
     };
-    if candidate.phase != crate::candidate::CandidatePhase::Pending
-        || !candidate.reviewers.iter().any(|reviewer| reviewer == actor)
-    {
+    if candidate.phase != crate::candidate::CandidatePhase::Pending {
         reject(
             state,
             &candidate_id,
@@ -3405,10 +4935,106 @@ fn apply_candidate_review(
             kind,
             actor,
             ts,
-            "only a named reviewer may review a pending candidate".into(),
+            "only a pending candidate may be reviewed".into(),
         );
         return;
     }
+    if actor == candidate.proposer {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "candidate proposer cannot review their own candidate".into(),
+        );
+        return;
+    }
+    let qualification = match (&o.role, o.v) {
+        (None, crate::candidate::CANDIDATE_PROTOCOL_VERSION)
+            if candidate.reviewers.iter().any(|reviewer| reviewer == actor) =>
+        {
+            crate::candidate::CandidateReviewQualification::NamedReviewer
+        }
+        (Some(binding), crate::candidate::CANDIDATE_ROLE_REVIEW_VERSION) => {
+            let Some(assignment) = state.role_assignments.get(&binding.assignment_id) else {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "role review assignment does not exist".into(),
+                );
+                return;
+            };
+            if assignment.clock_op_id != binding.expect_assignment {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    format!(
+                        "stale role assignment CAS: current is {}",
+                        assignment.clock_op_id
+                    ),
+                );
+                return;
+            }
+            if let Err((code, detail)) = state.candidate_role_review_eligibility(
+                &candidate_id,
+                actor,
+                &binding.role_id,
+                &binding.assignment_id,
+                ts,
+            ) {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    format!("role review ineligible ({code}): {detail}"),
+                );
+                return;
+            }
+            crate::candidate::CandidateReviewQualification::RoleAssignment {
+                role_id: binding.role_id.clone(),
+                assignment_id: binding.assignment_id.clone(),
+                assignment_clock_op_id: binding.expect_assignment.clone(),
+            }
+        }
+        (None, _) => {
+            reject(
+                state,
+                &candidate_id,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "actor is not a named reviewer; role reviews require an explicit v2 role assignment binding"
+                    .into(),
+            );
+            return;
+        }
+        (Some(_), _) => {
+            reject(
+                state,
+                &candidate_id,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "role reviews require candidate review protocol version 2".into(),
+            );
+            return;
+        }
+    };
     let current = candidate
         .reviews
         .get(actor)
@@ -3451,6 +5077,7 @@ fn apply_candidate_review(
             actor.to_string(),
             crate::state::CandidateReviewRecord {
                 reviewer: actor.to_string(),
+                qualification,
                 verdict: o.verdict,
                 body: o.body,
                 evidence_refs: o.evidence_refs,
@@ -3458,6 +5085,226 @@ fn apply_candidate_review(
                 ts: ts.to_string(),
             },
         );
+    accept(state, &candidate_id, op_id, kind, actor, ts);
+}
+
+fn apply_candidate_review_policy_amend(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateReviewPolicyAmendOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let Some(candidate) = state.candidates.get(&candidate_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "candidate does not exist".into(),
+        );
+        return;
+    };
+    let reviewers_valid = o
+        .named_reviewers
+        .iter()
+        .all(|reviewer| !reviewer.trim().is_empty())
+        && o.named_reviewers.windows(2).all(|pair| pair[0] < pair[1]);
+    if o.v != crate::candidate::CANDIDATE_PROTOCOL_VERSION
+        || candidate.phase != crate::candidate::CandidatePhase::Pending
+        || candidate.phase_op_id != o.expect_phase
+        || candidate.review_policy_op_id != o.expect_review_policy
+        || candidate.authorizer != actor
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "review-policy amendment requires the proposal authorizer and current pending phase and policy CAS"
+                .into(),
+        );
+        return;
+    }
+    if !reviewers_valid
+        || o.named_reviewers
+            .iter()
+            .any(|reviewer| reviewer == &candidate.proposer || reviewer == &candidate.authorizer)
+        || o.named_reviewers.is_empty() && candidate.role_review_requirements.is_empty()
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "named reviewers must be sorted, unique, non-empty actors distinct from proposer and authorizer, and the resulting policy must retain at least one review requirement"
+                .into(),
+        );
+        return;
+    }
+    if o.reason.trim().is_empty() {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "review-policy amendment requires a non-empty reason".into(),
+        );
+        return;
+    }
+    if candidate.reviewers == o.named_reviewers {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "review-policy amendment must change the named-reviewer set".into(),
+        );
+        return;
+    }
+
+    let before_named_reviewers = candidate.reviewers.clone();
+    let before: BTreeSet<_> = before_named_reviewers.iter().cloned().collect();
+    let after: BTreeSet<_> = o.named_reviewers.iter().cloned().collect();
+    let added_reviewers = after.difference(&before).cloned().collect();
+    let removed_reviewers = before.difference(&after).cloned().collect();
+    let prior_policy_op_id = candidate.review_policy_op_id.clone();
+    let candidate = state
+        .candidates
+        .get_mut(&candidate_id)
+        .expect("candidate checked above");
+    candidate.reviewers = o.named_reviewers.clone();
+    candidate.review_policy_op_id = op_id.to_string();
+    candidate
+        .review_policy_amendments
+        .push(crate::state::CandidateReviewPolicyAmendmentRecord {
+            actor: actor.to_string(),
+            before_named_reviewers,
+            after_named_reviewers: o.named_reviewers,
+            added_reviewers,
+            removed_reviewers,
+            reason: o.reason,
+            prior_policy_op_id,
+            op_id: op_id.to_string(),
+            ts: ts.to_string(),
+        });
+    accept(state, &candidate_id, op_id, kind, actor, ts);
+}
+
+fn apply_candidate_landing_repository_bind(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateLandingRepositoryBindOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let Some(candidate) = state.candidates.get(&candidate_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "candidate does not exist".into(),
+        );
+        return;
+    };
+    if o.v != crate::candidate::CANDIDATE_PROTOCOL_VERSION
+        || candidate.phase != crate::candidate::CandidatePhase::Pending
+        || candidate.phase_op_id != o.expect_phase
+        || candidate.landing_repository_op_id != o.expect_landing_repository
+        || candidate.authorizer != actor
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "landing-repository binding requires the proposal authorizer and current pending phase and repository CAS"
+                .into(),
+        );
+        return;
+    }
+    let source_valid = o.object_source.as_ref().is_none_or(|source| {
+        source.repository_id == candidate.repository_id
+            && !source.commit_ref.trim().is_empty()
+            && source
+                .locator
+                .as_ref()
+                .is_none_or(|locator| !locator.trim().is_empty())
+    });
+    if o.landing_repository_id.trim().is_empty() || o.reason.trim().is_empty() || !source_valid {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "landing-repository binding requires a repository id, non-empty reason, and object source matching proposal provenance"
+                .into(),
+        );
+        return;
+    }
+    let effective_source = o
+        .object_source
+        .clone()
+        .or_else(|| candidate.object_source.clone());
+    if candidate.landing_repository_id == o.landing_repository_id
+        && candidate.object_source == effective_source
+        && candidate.object_availability_required
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "landing-repository binding must change the repository or object-source provenance"
+                .into(),
+        );
+        return;
+    }
+    let before_repository_id = candidate.landing_repository_id.clone();
+    let prior_binding_op_id = candidate.landing_repository_op_id.clone();
+    let candidate = state
+        .candidates
+        .get_mut(&candidate_id)
+        .expect("candidate checked above");
+    candidate.landing_repository_id = o.landing_repository_id.clone();
+    candidate.landing_repository_op_id = op_id.to_string();
+    candidate.object_source = effective_source.clone();
+    candidate.object_availability_required = true;
+    candidate.landing_repository_bindings.push(
+        crate::state::CandidateLandingRepositoryBindingRecord {
+            actor: actor.to_string(),
+            before_repository_id,
+            after_repository_id: o.landing_repository_id,
+            object_source: effective_source,
+            reason: o.reason,
+            prior_binding_op_id,
+            op_id: op_id.to_string(),
+            ts: ts.to_string(),
+        },
+    );
     accept(state, &candidate_id, op_id, kind, actor, ts);
 }
 
@@ -3659,10 +5506,12 @@ fn apply_candidate_supersede(
     if candidate_id == o.successor_id
         || candidate.phase != crate::candidate::CandidatePhase::Pending
         || candidate.phase_op_id != o.expect_phase
-        || (candidate.proposer != actor && candidate.authorizer != actor)
+        || candidate.successor_id.is_some()
+        || candidate.supersession.is_some()
         || successor.phase != crate::candidate::CandidatePhase::Pending
         || successor.store_id != candidate.store_id
-        || successor.repository_id != candidate.repository_id
+        || successor.landing_repository_id != candidate.landing_repository_id
+        || successor.object_format != candidate.object_format
         || successor.entity != candidate.entity
     {
         reject(
@@ -3672,17 +5521,120 @@ fn apply_candidate_supersede(
             kind,
             actor,
             ts,
-            "supersede requires proposer ownership, current phase CAS, and a distinct pending same-repository successor".into(),
+            "supersede requires current predecessor phase CAS and a distinct pending successor with the same store, landing repository, object format, and issue".into(),
         );
         return;
     }
+    let (authority, containment_evidence_op_ids) = match &o.recovery {
+        None if candidate.proposer == actor => (
+            crate::candidate::CandidateSupersessionAuthority::PredecessorProposer,
+            Vec::new(),
+        ),
+        None if candidate.authorizer == actor => (
+            crate::candidate::CandidateSupersessionAuthority::PredecessorAuthorizer,
+            Vec::new(),
+        ),
+        None => {
+            reject(
+                state,
+                &candidate_id,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "ordinary supersession requires predecessor proposer or predecessor authorizer ownership; use explicit containment recovery only as the successor authorizer".into(),
+            );
+            return;
+        }
+        Some(recovery) => {
+            let expected_authority =
+                crate::candidate::CandidateSupersessionAuthority::SuccessorAuthorizerContainment;
+            if recovery.authority != expected_authority || successor.authorizer != actor {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "containment recovery requires the immutable successor authorizer authority"
+                        .into(),
+                );
+                return;
+            }
+            if recovery.expect_successor_phase != successor.phase_op_id
+                || !sorted_unique_nonempty(&recovery.containment_evidence_op_ids)
+            {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "containment recovery requires current successor phase CAS and sorted exact evidence op ids".into(),
+                );
+                return;
+            }
+            let Some(containment) =
+                state.candidate_containment_basis(&candidate_id, &o.successor_id)
+            else {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    "containment recovery requires complete determinate evidence that the predecessor commit is an ancestor of the successor commit".into(),
+                );
+                return;
+            };
+            if containment.evidence_op_ids != recovery.containment_evidence_op_ids {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    format!(
+                        "stale containment evidence CAS: current evidence ops are {}",
+                        containment.evidence_op_ids.join(",")
+                    ),
+                );
+                return;
+            }
+            (expected_authority, containment.evidence_op_ids)
+        }
+    };
+    let reviews_not_carried = candidate
+        .reviews
+        .values()
+        .map(|review| crate::state::CandidateSupersededReviewRecord {
+            reviewer: review.reviewer.clone(),
+            qualification: review.qualification.clone(),
+            verdict: review.verdict,
+            review_op_id: review.op_id.clone(),
+        })
+        .collect();
+    let successor_id = o.successor_id;
     let candidate = state
         .candidates
         .get_mut(&candidate_id)
         .expect("candidate checked above");
     candidate.phase = crate::candidate::CandidatePhase::Superseded;
     candidate.phase_op_id = op_id.to_string();
-    candidate.successor_id = Some(o.successor_id);
+    candidate.successor_id = Some(successor_id.clone());
+    candidate.supersession = Some(crate::state::CandidateSupersessionRecord {
+        successor_id,
+        actor: actor.to_string(),
+        authority,
+        containment_evidence_op_ids,
+        reviews_not_carried,
+        op_id: op_id.to_string(),
+        ts: ts.to_string(),
+    });
     accept(state, &candidate_id, op_id, kind, actor, ts);
 }
 
@@ -3789,7 +5741,7 @@ fn apply_candidate_landed(
         && matches!(
             &receipt.payload,
             crate::candidate::CandidateEvidencePayload::GitLanding(git)
-                if git.repository_id == candidate.repository_id
+                if git.repository_id == candidate.landing_repository_id
                     && git.candidate_oid == candidate.commit_oid
                     && git.target_ref == o.target_ref
                     && git.authorization_op_id == o.expect_authorization
@@ -3808,7 +5760,7 @@ fn apply_candidate_landed(
         );
         return;
     }
-    let landability = state.candidate_landability(&candidate_id, Some(actor));
+    let landability = state.candidate_landability_at(&candidate_id, Some(actor), ts);
     if !landability.landable {
         reject(
             state,
@@ -3840,6 +5792,132 @@ fn apply_candidate_landed(
         evidence_id: o.evidence_id,
         authorization_op_id: o.expect_authorization,
         target_ref: o.target_ref,
+        op_id: op_id.to_string(),
+        ts: ts.to_string(),
+    });
+    accept(state, &candidate_id, op_id, kind, actor, ts);
+}
+
+fn apply_candidate_reconcile(
+    state: &mut State,
+    op_id: &str,
+    kind: &str,
+    actor: &str,
+    ts: &str,
+    o: CandidateReconcileOp,
+) {
+    let candidate_id = o.candidate_id.clone();
+    let Some(candidate) = state.candidates.get(&candidate_id) else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "candidate does not exist".into(),
+        );
+        return;
+    };
+    let expected_authority = crate::candidate::CandidateReconciliationAuthority::ProposalAuthorizer;
+    if candidate.phase != crate::candidate::CandidatePhase::Pending
+        || candidate.phase_op_id != o.expect_phase
+        || candidate.authorizer != actor
+        || o.authority != expected_authority
+    {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "out-of-band reconciliation requires proposal-authorizer authority and current pending phase CAS"
+                .into(),
+        );
+        return;
+    }
+
+    let mut current_policy = state
+        .candidate_policy_snapshot_at(&candidate_id, ts)
+        .expect("candidate checked above");
+    if o.policy_snapshot.review_policy_op_id.is_none() {
+        current_policy.review_policy_op_id = None;
+    }
+    if o.policy_snapshot.landing_repository_op_id.is_none() {
+        current_policy.landing_repository_op_id = None;
+    }
+    if current_policy != o.policy_snapshot {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "stale reconciliation policy snapshot CAS".into(),
+        );
+        return;
+    }
+
+    let Some(receipt) = candidate
+        .evidence
+        .values()
+        .find(|receipt| receipt.evidence_id == o.evidence_id)
+    else {
+        reject(
+            state,
+            &candidate_id,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "reconciliation reachability evidence not found".into(),
+        );
+        return;
+    };
+    let target_oid = match &receipt.payload {
+        crate::candidate::CandidateEvidencePayload::GitReachability(git)
+            if receipt.outcome == crate::candidate::EvidenceOutcome::Pass
+                && receipt.name == crate::candidate::GIT_REACHABILITY_EVIDENCE
+                && receipt.evidence_kind == "git"
+                && receipt.producer == actor
+                && git.repository_id == candidate.landing_repository_id
+                && git.object_format == candidate.object_format
+                && git.candidate_oid == candidate.commit_oid
+                && git.target_ref == o.target_ref
+                && git.candidate_reachable == Some(true) =>
+        {
+            git.observed_target_oid.clone()
+        }
+        _ => {
+            reject(
+                state,
+                &candidate_id,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "reconciliation requires a passing exact-reachability receipt produced by the proposal authorizer"
+                    .into(),
+            );
+            return;
+        }
+    };
+
+    let candidate = state
+        .candidates
+        .get_mut(&candidate_id)
+        .expect("candidate checked above");
+    candidate.phase = crate::candidate::CandidatePhase::LandedOutOfBand;
+    candidate.phase_op_id = op_id.to_string();
+    candidate.reconciled = Some(crate::state::CandidateReconciledRecord {
+        actor: actor.to_string(),
+        authority: expected_authority,
+        evidence_id: o.evidence_id,
+        target_ref: o.target_ref,
+        target_oid,
+        policy_snapshot: o.policy_snapshot,
         op_id: op_id.to_string(),
         ts: ts.to_string(),
     });

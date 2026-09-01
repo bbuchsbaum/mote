@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use mote::cli::{Cli, run, run_help_all};
+use mote::cli::{Cli, near_miss_hint, run, run_help_all};
 use mote::errors::MoteError;
 
 fn main() {
@@ -23,7 +23,19 @@ fn main() {
             }
         }
     }
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            if let Err(print_error) = error.print() {
+                eprintln!("mote: could not print command diagnostic: {print_error}");
+            }
+            if let Some(hint) = near_miss_hint(&args) {
+                eprintln!("\nhint: {hint}");
+            }
+            std::process::exit(exit_code);
+        }
+    };
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(e) => {

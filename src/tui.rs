@@ -1108,6 +1108,7 @@ fn bead_detail_lines(state: &State, b: &Bead) -> Vec<Line<'static>> {
 }
 
 fn render_candidates(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
+    let now = crate::ids::format_rfc3339(jiff::Timestamp::now());
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Min(24)])
@@ -1118,7 +1119,7 @@ fn render_candidates(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
         .filter_map(|id| state.candidates.get(id))
         .map(|candidate| {
             let landability =
-                state.candidate_landability(&candidate.candidate_id, app.actor.as_deref());
+                state.candidate_landability_at(&candidate.candidate_id, app.actor.as_deref(), &now);
             let disposition = if landability.landable {
                 "landable".to_string()
             } else {
@@ -1185,6 +1186,7 @@ fn candidate_phase_color(phase: crate::candidate::CandidatePhase) -> Color {
     match phase {
         crate::candidate::CandidatePhase::Pending => Color::Yellow,
         crate::candidate::CandidatePhase::Landed => Color::Green,
+        crate::candidate::CandidatePhase::LandedOutOfBand => Color::Magenta,
         crate::candidate::CandidatePhase::Superseded => Color::Blue,
         crate::candidate::CandidatePhase::Abandoned => Color::DarkGray,
     }
@@ -1195,7 +1197,8 @@ fn candidate_detail_lines(
     candidate: &crate::state::CandidateRecord,
     actor: Option<&str>,
 ) -> Vec<Line<'static>> {
-    let landability = state.candidate_landability(&candidate.candidate_id, actor);
+    let now = crate::ids::format_rfc3339(jiff::Timestamp::now());
+    let landability = state.candidate_landability_at(&candidate.candidate_id, actor, &now);
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -1210,11 +1213,24 @@ fn candidate_detail_lines(
         ]),
         Line::from(format!("issue:       {}", candidate.entity)),
         Line::from(format!("proposer:    {}", candidate.proposer)),
+        Line::from(format!("proposal repo: {}", candidate.repository_id)),
+        Line::from(format!(
+            "landing repo:  {} ({})",
+            candidate.landing_repository_id, candidate.landing_repository_op_id
+        )),
         Line::from(format!("commit:      {}", candidate.commit_oid)),
         Line::from(format!("base:        {}", candidate.base_oid)),
         Line::from(format!("paths:       {}", candidate.paths.join(", "))),
         Line::from(format!("authorizer:  {}", candidate.authorizer)),
     ];
+    if let Some(source) = &candidate.object_source {
+        lines.push(Line::from(format!(
+            "object source: {}#{} ({})",
+            source.repository_id,
+            source.commit_ref,
+            source.locator.as_deref().unwrap_or("unrecorded")
+        )));
+    }
     let reviews = candidate
         .reviewers
         .iter()
@@ -1228,7 +1244,26 @@ fn candidate_detail_lines(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    lines.push(Line::from(format!("reviews:     {reviews}")));
+    lines.push(Line::from(format!(
+        "named reviews: {}",
+        if reviews.is_empty() {
+            "none"
+        } else {
+            reviews.as_str()
+        }
+    )));
+    if let Some(review_status) = state.candidate_review_status(&candidate.candidate_id, &now) {
+        for requirement in review_status.roles {
+            lines.push(Line::from(format!(
+                "role review: {} ({}) {}/{} approvals blocks={}",
+                requirement.role_name.as_deref().unwrap_or("unknown"),
+                requirement.role_id,
+                requirement.eligible_approval_count,
+                requirement.required_approvals,
+                requirement.eligible_block_count,
+            )));
+        }
+    }
     let evidence = candidate
         .evidence
         .values()
@@ -1275,6 +1310,26 @@ fn candidate_detail_lines(
     if let Some(successor) = &candidate.successor_id {
         lines.push(Line::from(format!("successor:   {successor}")));
     }
+    if let Some(supersession) = &candidate.supersession {
+        lines.push(Line::from(format!(
+            "superseded:  by {} via {} evidence=[{}]",
+            supersession.actor,
+            supersession.authority.as_str(),
+            supersession.containment_evidence_op_ids.join(",")
+        )));
+    }
+    if let Some(reconciliation) = &candidate.reconciled {
+        lines.push(Line::from(format!(
+            "reconciled:  by {} via {} target={} oid={}",
+            reconciliation.actor,
+            reconciliation.authority.as_str(),
+            reconciliation.target_ref,
+            reconciliation.target_oid,
+        )));
+        lines.push(Line::from(
+            "governance:  formal review/authorization did not govern this landing",
+        ));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("landability: ", Style::default().fg(Color::DarkGray)),
@@ -1284,14 +1339,42 @@ fn candidate_detail_lines(
             Span::styled("blocked", Style::default().fg(Color::Red).bold())
         },
     ]));
-    for reason in landability.reasons {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {}", reason.code),
-                Style::default().fg(Color::Red),
-            ),
-            Span::raw(format!(" — {}", reason.detail)),
-        ]));
+    for blocking in [true, false] {
+        for class in crate::candidate::LandabilityReasonClass::ALL {
+            let group = landability
+                .reasons
+                .iter()
+                .filter(|reason| reason.blocking == blocking && reason.class == class)
+                .collect::<Vec<_>>();
+            if group.is_empty() {
+                continue;
+            }
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} — {}:",
+                    if blocking { "BLOCKED" } else { "INFORMATIONAL" },
+                    class.as_str()
+                ),
+                Style::default().fg(if blocking {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
+            )));
+            for reason in group {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {}", reason.code),
+                        Style::default().fg(match reason.class {
+                            crate::candidate::LandabilityReasonClass::Substantive => Color::Red,
+                            crate::candidate::LandabilityReasonClass::Process => Color::Yellow,
+                            crate::candidate::LandabilityReasonClass::Bookkeeping => Color::Cyan,
+                        }),
+                    ),
+                    Span::raw(format!(" — {}", reason.detail)),
+                ]));
+            }
+        }
     }
     lines
 }
@@ -1334,7 +1417,13 @@ fn render_discussion(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
                 )),
                 None => spans.push(Span::raw("  ")),
             }
-            let counts = if t.sticky_count > 0 {
+            let question_counts = state.board_question_counts(Some(&t.topic));
+            let counts = if t.decision_count > 0 || question_counts.total > 0 {
+                format!(
+                    " posts={} decisions={} unresolved={}",
+                    t.post_count, t.decision_count, question_counts.unresolved
+                )
+            } else if t.sticky_count > 0 {
                 format!(" posts={} sticky={}", t.post_count, t.sticky_count)
             } else {
                 format!(" posts={}", t.post_count)
@@ -1565,6 +1654,21 @@ fn discussion_post_lines(
                 ]));
             }
         }
+        if let Some(decision) = state.board_decisions.get(&post.post_id) {
+            let detail_indent = format!("{body_indent}  ");
+            let detail_width = width.saturating_sub(1 + display_width(&detail_indent));
+            for (detail, color) in structured_decision_detail_rows(state, decision) {
+                for wrapped in wrap_line(&detail, detail_width) {
+                    lines.push(Line::from(vec![
+                        gutter.clone(),
+                        Span::styled(
+                            format!("{detail_indent}{wrapped}"),
+                            Style::default().fg(color),
+                        ),
+                    ]));
+                }
+            }
+        }
         lines.push(Line::from(gutter));
     }
 
@@ -1572,6 +1676,111 @@ fn discussion_post_lines(
         lines,
         starts,
         unread,
+    }
+}
+
+fn structured_decision_detail_rows(
+    state: &State,
+    decision: &crate::state::BoardDecisionRecord,
+) -> Vec<(String, Color)> {
+    let mut rows = vec![(
+        format!(
+            "AGREED — {} cited post{}",
+            decision.agreed_post_ids.len(),
+            if decision.agreed_post_ids.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ),
+        Color::Cyan,
+    )];
+    for post_id in &decision.agreed_post_ids {
+        if let Some(post) = state.board_posts.get(post_id) {
+            rows.push((
+                format!(
+                    "AGREED [{}] {} @{} — {}",
+                    post.disposition().to_ascii_uppercase(),
+                    post.post_id,
+                    post.from,
+                    post.body.replace(['\n', '\r'], " ")
+                ),
+                Color::Cyan,
+            ));
+        }
+    }
+    for reference in &decision.references {
+        rows.push((
+            format!("REFERENCE {}", discussion_reference_text(reference)),
+            Color::DarkGray,
+        ));
+    }
+    for question in state.board_questions_for_decision(&decision.decision_id) {
+        rows.push((
+            format!(
+                "QUESTION [{}] {} — {}",
+                question.status.as_str().to_ascii_uppercase(),
+                question.question_id,
+                question.text
+            ),
+            match question.status {
+                crate::state::DecisionQuestionStatus::Open => Color::Yellow,
+                crate::state::DecisionQuestionStatus::Deferred => Color::Magenta,
+                crate::state::DecisionQuestionStatus::Superseded => Color::DarkGray,
+                crate::state::DecisionQuestionStatus::Closed => Color::Green,
+            },
+        ));
+        for transition in &question.transitions {
+            let references = transition
+                .references
+                .iter()
+                .map(discussion_reference_text)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = [
+                (!references.is_empty()).then(|| format!("cites={references}")),
+                transition.note.as_ref().map(|note| format!("note={note}")),
+                transition
+                    .successor_question_id
+                    .as_ref()
+                    .map(|successor| format!("successor={successor}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
+            rows.push((
+                format!(
+                    "{} by @{}{}",
+                    match transition.action {
+                        crate::op::DecisionQuestionAction::Answer => "CANDIDATE ANSWER",
+                        crate::op::DecisionQuestionAction::Defer => "DEFERRED",
+                        crate::op::DecisionQuestionAction::Supersede => "SUPERSEDED",
+                        crate::op::DecisionQuestionAction::Close => "CLOSED",
+                    },
+                    transition.actor,
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {detail}")
+                    }
+                ),
+                Color::DarkGray,
+            ));
+        }
+    }
+    rows
+}
+
+fn discussion_reference_text(reference: &crate::op::DiscussionReference) -> String {
+    match reference {
+        crate::op::DiscussionReference::Topic { topic } => format!("topic:{topic}"),
+        crate::op::DiscussionReference::Post { post_id } => format!("post:{post_id}"),
+        crate::op::DiscussionReference::Issue { issue_id } => format!("issue:{issue_id}"),
+        crate::op::DiscussionReference::Candidate { candidate_id } => {
+            format!("candidate:{candidate_id}")
+        }
+        crate::op::DiscussionReference::Url { url } => format!("url:{url}"),
     }
 }
 
@@ -1971,14 +2180,32 @@ fn agent_detail_lines(status: &crate::actor_status::ActorStatus) -> Vec<Line<'st
         agent_field(
             "work sets:   ",
             format!(
-                "claims={} reservations={} doing={} candidates={}",
+                "claims={} reservations={} doing={} roles={} candidates={}",
                 status.work.active_claims.len(),
                 status.work.active_reservations.len(),
                 status.work.doing_beads.len(),
+                status.work.role_assignments.len(),
                 status.work.candidates.len(),
             ),
         ),
     ];
+    if !status.work.role_assignments.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "active roles:",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )));
+        for role in &status.work.role_assignments {
+            lines.push(Line::from(format!(
+                "{} ({}) assignment={} session={} until={}",
+                role.role_name,
+                role.role_id,
+                role.assignment_id,
+                role.session_id,
+                role.lease_until_ts,
+            )));
+        }
+    }
     if !status.sessions.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -2169,6 +2396,7 @@ mod tests {
         let candidate_id = "cand-01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
         let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let payload = CandidateEvidencePayload::GitAncestry(GitAncestryReceipt {
+            relation_schema: 1,
             repository_id: "repo-test".into(),
             object_format: "sha1".into(),
             common_dir_hash: String::new(),
@@ -2178,6 +2406,7 @@ mod tests {
             base_is_ancestor: None,
             candidate_relations: Vec::new(),
             covered_candidates: Vec::new(),
+            producer_snapshot: None,
             git_version: "unavailable".into(),
             detail: Some("shallow clone".into()),
         });
@@ -2205,13 +2434,22 @@ mod tests {
             proposal_op_id: "op-proposal".into(),
             store_id: "st-test".into(),
             repository_id: "repo-test".into(),
+            landing_repository_id: "repo-test".into(),
+            landing_repository_op_id: "op-proposal".into(),
+            landing_repository_bindings: Vec::new(),
+            object_source: None,
+            object_availability_required: false,
             object_format: "sha1".into(),
             commit_oid: commit,
             base_oid: "1111111111111111111111111111111111111111".into(),
             parent_oids: vec!["1111111111111111111111111111111111111111".into()],
             paths: vec!["src/lib.rs".into()],
             authorizer: "authorizer".into(),
+            review_policy_version: 1,
+            review_policy_op_id: "op-proposal".into(),
             reviewers: vec!["reviewer".into()],
+            role_review_requirements: Vec::new(),
+            review_policy_amendments: Vec::new(),
             evidence_requirements: vec![EvidenceRequirement {
                 name: GIT_ANCESTRY_EVIDENCE.into(),
                 kind: "git".into(),
@@ -2221,10 +2459,12 @@ mod tests {
             phase: CandidatePhase::Pending,
             phase_op_id: "op-proposal".into(),
             successor_id: None,
+            supersession: None,
             reviews: std::collections::BTreeMap::new(),
             evidence,
             authorization: None,
             landed: None,
+            reconciled: None,
         };
         let mut state = State::default();
         state.candidates.insert(candidate_id.clone(), candidate);
@@ -2235,6 +2475,8 @@ mod tests {
             .join("\n");
         assert!(text.contains("git_evidence_unavailable"));
         assert!(text.contains("authorization_absent"));
+        assert!(text.contains("BLOCKED — process:"));
+        assert!(!text.contains("BLOCKED — substantive:"));
         assert!(!text.contains("landability: landable"));
     }
 
@@ -2435,6 +2677,76 @@ mod tests {
             .join("\n");
         assert!(text.contains("SUPERSEDED -> post-new"), "{text}");
         assert!(text.contains("RETRACTED"), "{text}");
+    }
+
+    #[test]
+    fn discussion_decisions_show_citations_and_textual_question_status() {
+        let mut state = State::default();
+        let agreed = post("post-agreed", "bob", "exact agreed clause", None);
+        state.board_posts.insert(agreed.post_id.clone(), agreed);
+        let mut decision_post = post("post-decision", "alice", "adopt cited contract", None);
+        decision_post.post_kind = "decision".into();
+        decision_post.sticky = true;
+        decision_post.sent_op_id = "op-decision".into();
+        state
+            .board_posts
+            .insert(decision_post.post_id.clone(), decision_post);
+        state.board_decisions.insert(
+            "post-decision".into(),
+            crate::state::BoardDecisionRecord {
+                decision_id: "post-decision".into(),
+                post_id: "post-decision".into(),
+                topic: "planning".into(),
+                agreed_post_ids: vec!["post-agreed".into()],
+                references: vec![crate::op::DiscussionReference::Issue {
+                    issue_id: "bd-follow-up".into(),
+                }],
+                question_ids: vec!["question-open".into()],
+                actor: "alice".into(),
+                op_id: "op-decision".into(),
+                ts: "2026-05-14T09:31:07Z".into(),
+            },
+        );
+        state.board_questions.insert(
+            "question-open".into(),
+            crate::state::DecisionQuestionRecord {
+                question_id: "question-open".into(),
+                decision_id: "post-decision".into(),
+                topic: "planning".into(),
+                text: "Does the rail carry relations?".into(),
+                opened_by: "alice".into(),
+                opened_op_id: "op-decision".into(),
+                opened_ts: "2026-05-14T09:31:07Z".into(),
+                position: 0,
+                status: crate::state::DecisionQuestionStatus::Open,
+                clock_op_id: "op-answer".into(),
+                successor_question_id: None,
+                transitions: vec![crate::state::DecisionQuestionTransitionRecord {
+                    action: crate::op::DecisionQuestionAction::Answer,
+                    actor: "bob".into(),
+                    expect_question: "op-decision".into(),
+                    references: vec![crate::op::DiscussionReference::Post {
+                        post_id: "post-agreed".into(),
+                    }],
+                    note: Some("candidate only".into()),
+                    successor_question_id: None,
+                    idempotency_key: Some("answer-key".into()),
+                    op_id: "op-answer".into(),
+                    ts: "2026-05-14T09:32:07Z".into(),
+                }],
+            },
+        );
+
+        let text = rendered(&state, 1)
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("AGREED [ACTIVE] post-agreed @bob"), "{text}");
+        assert!(text.contains("REFERENCE issue:bd-follow-up"), "{text}");
+        assert!(text.contains("QUESTION [OPEN] question-open"), "{text}");
+        assert!(text.contains("CANDIDATE ANSWER by @bob"), "{text}");
     }
 
     #[test]

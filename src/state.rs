@@ -9,11 +9,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Serialize, Serializer};
 
 use crate::candidate::{
-    AuthorizationStatus, CandidateEvidencePayload, CandidatePhase, EvidenceOutcome,
-    EvidenceRequirement, GIT_ANCESTRY_EVIDENCE, GitRelationKind, Landability, LandabilityReason,
-    ReviewVerdict,
+    AuthorizationStatus, CandidateContainmentBasis, CandidateEvidencePayload, CandidatePhase,
+    CandidatePolicySnapshot, CandidateReconciliationAuthority, CandidateReviewQualification,
+    CandidateReviewStatus, CandidateSnapshotProvenance, CandidateSupersessionAuthority,
+    EvidenceOutcome, EvidenceRequirement, GIT_ANCESTRY_EVIDENCE, GIT_RELATION_SCHEMA_V2,
+    GitCandidateRelation, GitRelationKind, Landability, LandabilityReason, LandabilityReasonCode,
+    NamedReviewStatus, ReviewVerdict, RoleReviewEntryStatus, RoleReviewRequirementStatus,
 };
-use crate::op::Status;
+use crate::op::{DecisionQuestionAction, DiscussionReference, Status};
+use crate::role::{
+    RoleAssignmentClock, RoleAssignmentDisposition, RoleCoverage, RoleDemandSource, RoleExclusion,
+};
 
 #[derive(Debug, Clone)]
 pub struct Bead {
@@ -82,6 +88,10 @@ pub struct State {
     pub board_posts: BTreeMap<String, BoardPostRecord>,
     /// Discussion-board posts indexed by the accepted board_post op id.
     pub board_post_op_index: BTreeMap<String, String>,
+    /// Structured cited decisions, indexed by their decision/post id.
+    pub board_decisions: BTreeMap<String, BoardDecisionRecord>,
+    /// Decision questions, including terminal records, indexed by question id.
+    pub board_questions: BTreeMap<String, DecisionQuestionRecord>,
     /// Public discussion-board topics, indexed by topic name.
     pub board_topics: BTreeMap<String, BoardTopicRecord>,
     /// Per-actor discussion-board read cursor, as the latest seen board_post op id.
@@ -96,8 +106,21 @@ pub struct State {
     pub sessions: BTreeMap<String, SessionRecord>,
     /// Actor-scoped retry registry for heartbeat and status operations.
     pub session_idempotency: BTreeMap<(String, String), SessionIdempotencyRecord>,
+    /// Immutable role definitions, indexed by role id.
+    pub roles: BTreeMap<String, RoleRecord>,
+    /// Store-unique immutable role names to ids. Retired names remain reserved.
+    pub role_names: BTreeMap<String, String>,
+    /// All bounded role assignments, including terminal assignments.
+    pub role_assignments: BTreeMap<String, RoleAssignmentRecord>,
+    /// Actor-scoped retry registry for role mutations.
+    pub role_idempotency: BTreeMap<(String, String), RoleIdempotencyRecord>,
     /// Candidate protocol state, derived exclusively from candidate ops.
     pub candidates: BTreeMap<String, CandidateRecord>,
+    /// Latest explicit ancestry rows contributed by each subject candidate for
+    /// each known candidate. The directed key makes the two independently
+    /// produced observations of one unordered pair available without allowing
+    /// an omitted row to erase an immutable fact.
+    pub candidate_pair_evidence: BTreeMap<(String, String), CandidatePairEvidenceRecord>,
     /// Sender-scoped retry registry. Same key plus same digest is a no-op;
     /// reusing a key for a different action is rejected.
     pub candidate_idempotency: BTreeMap<(String, String), CandidateIdempotencyRecord>,
@@ -110,24 +133,37 @@ pub struct CandidateRecord {
     pub proposer: String,
     pub proposal_op_id: String,
     pub store_id: String,
+    /// Repository where proposal ancestry was observed.
     pub repository_id: String,
+    /// Repository against which object availability and landing are checked.
+    pub landing_repository_id: String,
+    pub landing_repository_op_id: String,
+    pub landing_repository_bindings: Vec<CandidateLandingRepositoryBindingRecord>,
+    pub object_source: Option<crate::candidate::CandidateObjectSource>,
+    pub object_availability_required: bool,
     pub object_format: String,
     pub commit_oid: String,
     pub base_oid: String,
     pub parent_oids: Vec<String>,
     pub paths: Vec<String>,
     pub authorizer: String,
+    pub review_policy_version: u32,
+    pub review_policy_op_id: String,
     pub reviewers: Vec<String>,
+    pub role_review_requirements: Vec<crate::candidate::RoleReviewRequirement>,
+    pub review_policy_amendments: Vec<CandidateReviewPolicyAmendmentRecord>,
     pub evidence_requirements: Vec<EvidenceRequirement>,
     pub evidence_refs: Vec<String>,
     pub phase: CandidatePhase,
     pub phase_op_id: String,
     pub successor_id: Option<String>,
+    pub supersession: Option<CandidateSupersessionRecord>,
     pub reviews: BTreeMap<String, CandidateReviewRecord>,
     #[serde(serialize_with = "serialize_candidate_evidence")]
     pub evidence: BTreeMap<(String, String), CandidateEvidenceRecord>,
     pub authorization: Option<CandidateAuthorizationRecord>,
     pub landed: Option<CandidateLandedRecord>,
+    pub reconciled: Option<CandidateReconciledRecord>,
 }
 
 fn serialize_candidate_evidence<S>(
@@ -143,9 +179,35 @@ where
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateReviewRecord {
     pub reviewer: String,
+    pub qualification: crate::candidate::CandidateReviewQualification,
     pub verdict: ReviewVerdict,
     pub body: Option<String>,
     pub evidence_refs: Vec<String>,
+    pub op_id: String,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateReviewPolicyAmendmentRecord {
+    pub actor: String,
+    pub before_named_reviewers: Vec<String>,
+    pub after_named_reviewers: Vec<String>,
+    pub added_reviewers: Vec<String>,
+    pub removed_reviewers: Vec<String>,
+    pub reason: String,
+    pub prior_policy_op_id: String,
+    pub op_id: String,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateLandingRepositoryBindingRecord {
+    pub actor: String,
+    pub before_repository_id: String,
+    pub after_repository_id: String,
+    pub object_source: Option<crate::candidate::CandidateObjectSource>,
+    pub reason: String,
+    pub prior_binding_op_id: String,
     pub op_id: String,
     pub ts: String,
 }
@@ -163,6 +225,51 @@ pub struct CandidateEvidenceRecord {
     pub refs: Vec<String>,
     pub op_id: String,
     pub ts: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidatePairEvidenceRecord {
+    pub subject_candidate_id: String,
+    pub subject_proposal_op_id: String,
+    pub subject_store_id: String,
+    pub repository_id: String,
+    pub object_format: String,
+    pub subject_commit_oid: String,
+    pub subject_base_oid: String,
+    pub relation_schema: u32,
+    pub known_candidate_id: String,
+    pub relations: Vec<GitCandidateRelation>,
+    pub covered_candidates: Vec<(String, String)>,
+    pub producer_snapshot: Option<Box<CandidateSnapshotProvenance>>,
+    pub evidence_op_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CandidatePairFact {
+    other_to_candidate_base: GitRelationKind,
+    other_to_candidate_tip: GitRelationKind,
+}
+
+#[derive(Debug, Clone)]
+enum PairSourceObservation {
+    Absent(String),
+    Unknown(String),
+    Conflict(String),
+    Determinate {
+        fact: CandidatePairFact,
+        source: String,
+        evidence_op_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum CandidatePairResolution {
+    Stale(String),
+    Ambiguous(String),
+    Resolved {
+        fact: CandidatePairFact,
+        evidence_op_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,9 +291,91 @@ pub struct CandidateLandedRecord {
     pub ts: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateReconciledRecord {
+    pub actor: String,
+    pub authority: CandidateReconciliationAuthority,
+    pub evidence_id: String,
+    pub target_ref: String,
+    pub target_oid: String,
+    pub policy_snapshot: CandidatePolicySnapshot,
+    pub op_id: String,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateSupersessionRecord {
+    pub successor_id: String,
+    pub actor: String,
+    pub authority: CandidateSupersessionAuthority,
+    pub containment_evidence_op_ids: Vec<String>,
+    pub reviews_not_carried: Vec<CandidateSupersededReviewRecord>,
+    pub op_id: String,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateSupersededReviewRecord {
+    pub reviewer: String,
+    pub qualification: CandidateReviewQualification,
+    pub verdict: ReviewVerdict,
+    pub review_op_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct CandidateIdempotencyRecord {
     pub candidate_id: String,
+    pub digest: String,
+    pub op_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RoleRecord {
+    pub role_id: String,
+    pub name: String,
+    pub remit: String,
+    pub exclusions: Vec<RoleExclusion>,
+    pub assignment_authorities: Vec<String>,
+    pub capacity: u32,
+    pub minimum_active: u32,
+    pub defined_by: String,
+    pub definition_op_id: String,
+    pub defined_ts: String,
+    pub retired: Option<RoleRetirementRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RoleRetirementRecord {
+    pub actor: String,
+    pub reason: Option<String>,
+    pub op_id: String,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RoleAssignmentRecord {
+    pub assignment_id: String,
+    pub role_id: String,
+    pub holder_actor: String,
+    pub holder_session_id: String,
+    pub session_lease_op_id: String,
+    pub assigned_by: String,
+    pub assigned_op_id: String,
+    pub assigned_ts: String,
+    pub ttl_s: u32,
+    pub lease_until_ts: String,
+    pub clock_op_id: String,
+    pub last_updated_by: String,
+    pub last_updated_ts: String,
+    pub released_by: Option<String>,
+    pub release_reason: Option<String>,
+    pub released_op_id: Option<String>,
+    pub released_ts: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoleIdempotencyRecord {
+    pub role_id: String,
     pub digest: String,
     pub op_id: String,
 }
@@ -440,6 +629,82 @@ impl BoardPostRecord {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BoardDecisionRecord {
+    pub decision_id: String,
+    pub post_id: String,
+    pub topic: String,
+    pub agreed_post_ids: Vec<String>,
+    pub references: Vec<DiscussionReference>,
+    pub question_ids: Vec<String>,
+    pub actor: String,
+    pub op_id: String,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionQuestionStatus {
+    Open,
+    Deferred,
+    Superseded,
+    Closed,
+}
+
+impl DecisionQuestionStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Deferred => "deferred",
+            Self::Superseded => "superseded",
+            Self::Closed => "closed",
+        }
+    }
+
+    pub const fn unresolved(self) -> bool {
+        matches!(self, Self::Open | Self::Deferred)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionQuestionTransitionRecord {
+    pub action: DecisionQuestionAction,
+    pub actor: String,
+    pub expect_question: String,
+    pub references: Vec<DiscussionReference>,
+    pub note: Option<String>,
+    pub successor_question_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub op_id: String,
+    pub ts: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionQuestionRecord {
+    pub question_id: String,
+    pub decision_id: String,
+    pub topic: String,
+    pub text: String,
+    pub opened_by: String,
+    pub opened_op_id: String,
+    pub opened_ts: String,
+    pub position: usize,
+    pub status: DecisionQuestionStatus,
+    pub clock_op_id: String,
+    pub successor_question_id: Option<String>,
+    pub transitions: Vec<DecisionQuestionTransitionRecord>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DecisionQuestionCounts {
+    pub total: usize,
+    pub open: usize,
+    pub deferred: usize,
+    pub superseded: usize,
+    pub closed: usize,
+    pub unresolved: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct BoardTopicRecord {
     pub topic: String,
@@ -556,15 +821,35 @@ impl HistoryEntry {
 }
 
 fn candidate_reason(
-    code: &str,
+    code: LandabilityReasonCode,
     subject: Option<impl Into<String>>,
     detail: impl Into<String>,
 ) -> LandabilityReason {
-    LandabilityReason {
-        code: code.to_string(),
-        subject: subject.map(Into::into),
-        detail: detail.into(),
-    }
+    LandabilityReason::new(code, subject, detail)
+}
+
+fn snapshot_summary(snapshot: &CandidateSnapshotProvenance) -> String {
+    format!(
+        "producer snapshot store={} replayed_ops={} op_ids_digest={} git_head={} uncommitted_ops={}",
+        snapshot.store_id,
+        snapshot.replayed_op_count,
+        snapshot.replayed_op_ids_digest,
+        snapshot.store_git_head.as_deref().unwrap_or("unavailable"),
+        snapshot
+            .uncommitted_op_count
+            .map_or_else(|| "unavailable".to_string(), |count| count.to_string())
+    )
+}
+
+fn snapshot_omission_detail(
+    source: &str,
+    snapshot: &CandidateSnapshotProvenance,
+    missing_proposal_op: &str,
+) -> String {
+    format!(
+        "{source} was published after proposal op {missing_proposal_op}, but proposal op {missing_proposal_op} is absent from the declared {}; repeating the refresh in this producer checkout cannot repair the target until the checkout receives the missing proposal op; refresh from a store snapshot containing both exact proposal ops",
+        snapshot_summary(snapshot)
+    )
 }
 
 impl State {
@@ -656,6 +941,417 @@ impl State {
         Some(crate::ids::format_rfc3339(warning_at))
     }
 
+    pub fn resolve_role(&self, id_or_name: &str) -> Option<&RoleRecord> {
+        self.roles.get(id_or_name).or_else(|| {
+            self.role_names
+                .get(id_or_name)
+                .and_then(|role_id| self.roles.get(role_id))
+        })
+    }
+
+    pub fn role_assignments_for(&self, role_id: &str) -> Vec<&RoleAssignmentRecord> {
+        self.role_assignments
+            .values()
+            .filter(|assignment| assignment.role_id == role_id)
+            .collect()
+    }
+
+    pub fn role_assignment_disposition(
+        &self,
+        assignment: &RoleAssignmentRecord,
+        as_of_ts: &str,
+    ) -> RoleAssignmentDisposition {
+        if assignment.assigned_ts.as_str() > as_of_ts {
+            return RoleAssignmentDisposition::NotStarted;
+        }
+        let Some(session) = self.sessions.get(&assignment.holder_session_id) else {
+            return RoleAssignmentDisposition::SessionMissing;
+        };
+        let mut terminal: Vec<(&str, u8, RoleAssignmentDisposition)> = Vec::new();
+        if assignment.lease_until_ts.as_str() <= as_of_ts {
+            terminal.push((
+                assignment.lease_until_ts.as_str(),
+                2,
+                RoleAssignmentDisposition::Expired,
+            ));
+        }
+        if let Some(ended_ts) = session
+            .ended_ts
+            .as_deref()
+            .filter(|ended_ts| *ended_ts <= as_of_ts)
+        {
+            terminal.push((ended_ts, 1, RoleAssignmentDisposition::SessionEnded));
+        }
+        if let Some(released_ts) = assignment
+            .released_ts
+            .as_deref()
+            .filter(|released_ts| *released_ts <= as_of_ts)
+        {
+            terminal.push((released_ts, 0, RoleAssignmentDisposition::Released));
+        }
+        terminal
+            .into_iter()
+            .min_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(&right.1)))
+            .map(|(_, _, disposition)| disposition)
+            .unwrap_or(RoleAssignmentDisposition::Active)
+    }
+
+    pub fn role_active_assignments(
+        &self,
+        role_id: &str,
+        as_of_ts: &str,
+    ) -> Vec<&RoleAssignmentRecord> {
+        self.role_assignments_for(role_id)
+            .into_iter()
+            .filter(|assignment| {
+                self.role_assignment_disposition(assignment, as_of_ts)
+                    == RoleAssignmentDisposition::Active
+            })
+            .collect()
+    }
+
+    pub fn role_active_assignment_clocks(
+        &self,
+        role_id: &str,
+        as_of_ts: &str,
+    ) -> Vec<RoleAssignmentClock> {
+        let mut clocks: Vec<RoleAssignmentClock> = self
+            .role_active_assignments(role_id, as_of_ts)
+            .into_iter()
+            .map(|assignment| RoleAssignmentClock {
+                assignment_id: assignment.assignment_id.clone(),
+                clock_op_id: assignment.clock_op_id.clone(),
+            })
+            .collect();
+        clocks.sort();
+        clocks
+    }
+
+    pub fn role_assignment_clocks(&self, role_id: &str) -> Vec<RoleAssignmentClock> {
+        let mut clocks: Vec<RoleAssignmentClock> = self
+            .role_assignments_for(role_id)
+            .into_iter()
+            .map(|assignment| RoleAssignmentClock {
+                assignment_id: assignment.assignment_id.clone(),
+                clock_op_id: assignment.clock_op_id.clone(),
+            })
+            .collect();
+        clocks.sort();
+        clocks
+    }
+
+    pub fn role_coverage(&self, role_id: &str, as_of_ts: &str) -> Option<RoleCoverage> {
+        let role = self.roles.get(role_id)?;
+        let active = self.role_active_assignments(role_id, as_of_ts);
+        let active_assignment_ids = active
+            .iter()
+            .map(|assignment| assignment.assignment_id.clone())
+            .collect::<Vec<_>>();
+        let active_count = active_assignment_ids.len() as u32;
+        let mut demand_sources = (role.minimum_active > 0)
+            .then(|| RoleDemandSource {
+                kind: "standing".into(),
+                source_id: role.role_id.clone(),
+                required: role.minimum_active,
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        for candidate in self
+            .candidates
+            .values()
+            .filter(|candidate| candidate.phase == CandidatePhase::Pending)
+        {
+            let Some(status) = self.candidate_review_status(&candidate.candidate_id, as_of_ts)
+            else {
+                continue;
+            };
+            for requirement in status
+                .roles
+                .iter()
+                .filter(|requirement| requirement.role_id == role_id && !requirement.satisfied)
+            {
+                demand_sources.push(RoleDemandSource {
+                    kind: "candidate_review".into(),
+                    source_id: candidate.candidate_id.clone(),
+                    required: requirement.required_approvals,
+                });
+            }
+        }
+        let demanded_count = demand_sources
+            .iter()
+            .map(|source| source.required)
+            .max()
+            .unwrap_or(0);
+        Some(RoleCoverage {
+            as_of_ts: as_of_ts.to_string(),
+            active_assignment_ids,
+            active_count,
+            capacity: role.capacity,
+            minimum_active: role.minimum_active,
+            demanded_count,
+            available_capacity: role.capacity.saturating_sub(active_count),
+            coverage_shortfall: demanded_count.saturating_sub(active_count),
+            vacant: active_count == 0,
+            demand_sources,
+        })
+    }
+
+    pub fn active_role_assignments_for_actor(
+        &self,
+        actor: &str,
+        as_of_ts: &str,
+    ) -> Vec<&RoleAssignmentRecord> {
+        self.role_assignments
+            .values()
+            .filter(|assignment| {
+                assignment.holder_actor == actor
+                    && self.role_assignment_disposition(assignment, as_of_ts)
+                        == RoleAssignmentDisposition::Active
+            })
+            .collect()
+    }
+
+    pub(crate) fn candidate_role_review_eligibility(
+        &self,
+        candidate_id: &str,
+        actor: &str,
+        role_id: &str,
+        assignment_id: &str,
+        as_of_ts: &str,
+    ) -> Result<(), (String, String)> {
+        let candidate = self.candidates.get(candidate_id).ok_or_else(|| {
+            (
+                "candidate_missing".into(),
+                "candidate does not exist".into(),
+            )
+        })?;
+        let requirement = candidate
+            .role_review_requirements
+            .iter()
+            .find(|requirement| requirement.role_id == role_id)
+            .ok_or_else(|| {
+                (
+                    "role_not_required".into(),
+                    format!("role {role_id} is not required by this candidate"),
+                )
+            })?;
+        if candidate.proposer == actor {
+            return Err((
+                "candidate_self_review".into(),
+                "candidate proposer cannot consume a role review slot".into(),
+            ));
+        }
+        let role = self.roles.get(role_id).ok_or_else(|| {
+            (
+                "role_missing".into(),
+                format!("required role {role_id} does not exist"),
+            )
+        })?;
+        if role.definition_op_id != requirement.definition_op_id {
+            return Err((
+                "role_definition_mismatch".into(),
+                format!(
+                    "role definition is {}, policy requires {}",
+                    role.definition_op_id, requirement.definition_op_id
+                ),
+            ));
+        }
+        if role
+            .retired
+            .as_ref()
+            .is_some_and(|retirement| retirement.ts.as_str() <= as_of_ts)
+        {
+            return Err((
+                "role_retired".into(),
+                format!("required role {} is retired", role.name),
+            ));
+        }
+        let assignment = self.role_assignments.get(assignment_id).ok_or_else(|| {
+            (
+                "assignment_missing".into(),
+                format!("role assignment {assignment_id} does not exist"),
+            )
+        })?;
+        if assignment.role_id != role_id || assignment.holder_actor != actor {
+            return Err((
+                "assignment_mismatch".into(),
+                format!("assignment {assignment_id} does not bind actor {actor} to role {role_id}"),
+            ));
+        }
+        if assignment.assigned_ts.as_str() > as_of_ts {
+            return Err((
+                "assignment_not_started".into(),
+                format!(
+                    "assignment {assignment_id} was created at {}, after {as_of_ts}",
+                    assignment.assigned_ts
+                ),
+            ));
+        }
+        let disposition = self.role_assignment_disposition(assignment, as_of_ts);
+        if disposition != RoleAssignmentDisposition::Active {
+            return Err((
+                "assignment_inactive".into(),
+                format!(
+                    "assignment {assignment_id} is {} at {as_of_ts}",
+                    disposition.as_str()
+                ),
+            ));
+        }
+
+        for exclusion in &role.exclusions {
+            let excluded = match exclusion.code {
+                crate::role::RoleExclusionCode::ConcurrentRole => false,
+                crate::role::RoleExclusionCode::CandidateProposer => candidate.proposer == actor,
+                crate::role::RoleExclusionCode::CandidateAuthorizer => {
+                    candidate.authorizer == actor
+                }
+                crate::role::RoleExclusionCode::CandidateNamedReviewer => {
+                    candidate.reviewers.iter().any(|reviewer| reviewer == actor)
+                }
+                crate::role::RoleExclusionCode::CandidateEvidenceProducer => candidate
+                    .evidence
+                    .values()
+                    .any(|evidence| evidence.ts.as_str() <= as_of_ts && evidence.producer == actor),
+                crate::role::RoleExclusionCode::CandidatePathReservation => {
+                    self.reservations.values().any(|reservation| {
+                        reservation.actor == actor
+                            && reservation.opened_ts.as_str() <= as_of_ts
+                            && self.reservation_disposition(reservation, as_of_ts)
+                                == LeaseDisposition::Active
+                            && reservation.live_paths().iter().any(|reserved| {
+                                candidate
+                                    .paths
+                                    .iter()
+                                    .any(|path| crate::paths::overlap(reserved, path))
+                            })
+                    })
+                }
+            };
+            if excluded {
+                return Err((
+                    format!("excluded_{}", exclusion.code.as_str()),
+                    format!(
+                        "role {} excludes actor {actor} because {} applies",
+                        role.name,
+                        exclusion.code.as_str()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn candidate_review_status(
+        &self,
+        candidate_id: &str,
+        as_of_ts: &str,
+    ) -> Option<CandidateReviewStatus> {
+        let candidate = self.candidates.get(candidate_id)?;
+        let named = candidate
+            .reviewers
+            .iter()
+            .map(|reviewer| {
+                let review = candidate.reviews.get(reviewer).filter(|review| {
+                    review.ts.as_str() <= as_of_ts
+                        && matches!(
+                            review.qualification,
+                            CandidateReviewQualification::NamedReviewer
+                        )
+                        && !candidate.review_policy_amendments.iter().any(|amendment| {
+                            amendment.op_id > review.op_id
+                                && amendment.ts.as_str() <= as_of_ts
+                                && !amendment.after_named_reviewers.contains(reviewer)
+                        })
+                });
+                NamedReviewStatus {
+                    reviewer: reviewer.clone(),
+                    verdict: review.map(|review| review.verdict),
+                    review_op_id: review.map(|review| review.op_id.clone()),
+                    satisfied: review
+                        .is_some_and(|review| review.verdict == ReviewVerdict::Approve),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let roles = candidate
+            .role_review_requirements
+            .iter()
+            .map(|requirement| {
+                let mut reviews = candidate
+                    .reviews
+                    .values()
+                    .filter_map(|review| {
+                        if review.ts.as_str() > as_of_ts {
+                            return None;
+                        }
+                        let CandidateReviewQualification::RoleAssignment {
+                            role_id,
+                            assignment_id,
+                            ..
+                        } = &review.qualification
+                        else {
+                            return None;
+                        };
+                        if role_id != &requirement.role_id {
+                            return None;
+                        }
+                        let eligibility = self.candidate_role_review_eligibility(
+                            candidate_id,
+                            &review.reviewer,
+                            role_id,
+                            assignment_id,
+                            as_of_ts,
+                        );
+                        let (eligible, reason_code, detail) = match eligibility {
+                            Ok(()) => (true, None, None),
+                            Err((code, detail)) => (false, Some(code), Some(detail)),
+                        };
+                        Some(RoleReviewEntryStatus {
+                            reviewer: review.reviewer.clone(),
+                            assignment_id: assignment_id.clone(),
+                            verdict: review.verdict,
+                            review_op_id: review.op_id.clone(),
+                            eligible,
+                            reason_code,
+                            detail,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                reviews.sort_by(|left, right| left.reviewer.cmp(&right.reviewer));
+                let eligible_approval_count = reviews
+                    .iter()
+                    .filter(|review| review.eligible && review.verdict == ReviewVerdict::Approve)
+                    .count() as u32;
+                let eligible_block_count = reviews
+                    .iter()
+                    .filter(|review| review.eligible && review.verdict == ReviewVerdict::Block)
+                    .count() as u32;
+                RoleReviewRequirementStatus {
+                    role_id: requirement.role_id.clone(),
+                    role_name: self
+                        .roles
+                        .get(&requirement.role_id)
+                        .map(|role| role.name.clone()),
+                    definition_op_id: requirement.definition_op_id.clone(),
+                    required_approvals: requirement.required_approvals,
+                    eligible_approval_count,
+                    eligible_block_count,
+                    satisfied: eligible_approval_count >= requirement.required_approvals
+                        && eligible_block_count == 0,
+                    reviews,
+                }
+            })
+            .collect::<Vec<_>>();
+        let satisfied = named.iter().all(|status| status.satisfied)
+            && roles.iter().all(|status| status.satisfied);
+        Some(CandidateReviewStatus {
+            as_of_ts: as_of_ts.to_string(),
+            named,
+            roles,
+            satisfied,
+        })
+    }
+
     pub fn candidate_reservations(&self, candidate_id: &str) -> Vec<&ReservationState> {
         self.reservations
             .values()
@@ -678,11 +1374,30 @@ impl State {
 
     /// Deterministically explain whether the named candidate may be landed.
     /// `lander` is supplied by the landing command to enforce named grants;
-    /// read-only status views may omit it.
+    /// read-only status views may omit it. This compatibility entry point uses
+    /// the latest replayed operation timestamp. Time-aware surfaces should call
+    /// `candidate_landability_at` with one explicit snapshot timestamp.
     pub fn candidate_landability(&self, candidate_id: &str, lander: Option<&str>) -> Landability {
+        let as_of_ts = self
+            .history
+            .values()
+            .flatten()
+            .chain(self.orphan_history.iter())
+            .map(|entry| entry.ts.as_str())
+            .max()
+            .unwrap_or("1970-01-01T00:00:00.000000Z");
+        self.candidate_landability_at(candidate_id, lander, as_of_ts)
+    }
+
+    pub fn candidate_landability_at(
+        &self,
+        candidate_id: &str,
+        lander: Option<&str>,
+        as_of_ts: &str,
+    ) -> Landability {
         let Some(candidate) = self.candidates.get(candidate_id) else {
             return Landability::from_reasons(vec![candidate_reason(
-                "candidate_missing",
+                LandabilityReasonCode::CandidateMissing,
                 Some(candidate_id),
                 "candidate does not exist",
             )]);
@@ -691,25 +1406,74 @@ impl State {
 
         if candidate.phase != CandidatePhase::Pending {
             reasons.push(candidate_reason(
-                "phase_not_pending",
+                LandabilityReasonCode::PhaseNotPending,
                 Some(candidate_id),
                 format!("phase is {}", candidate.phase.as_str()),
             ));
         }
 
-        for reviewer in &candidate.reviewers {
-            match candidate.reviews.get(reviewer) {
-                Some(review) if review.verdict == ReviewVerdict::Approve => {}
-                Some(review) => reasons.push(candidate_reason(
-                    "review_blocking",
-                    Some(reviewer),
-                    format!("latest verdict is {}", review.verdict.as_str()),
+        let review_status = self
+            .candidate_review_status(candidate_id, as_of_ts)
+            .expect("known candidate has review status");
+        for status in &review_status.named {
+            match status.verdict {
+                Some(ReviewVerdict::Approve) => {}
+                Some(verdict) => reasons.push(candidate_reason(
+                    LandabilityReasonCode::ReviewBlocking,
+                    Some(&status.reviewer),
+                    format!("latest verdict is {}", verdict.as_str()),
                 )),
                 None => reasons.push(candidate_reason(
-                    "review_missing",
-                    Some(reviewer),
+                    LandabilityReasonCode::ReviewMissing,
+                    Some(&status.reviewer),
                     "required reviewer has not approved",
                 )),
+            }
+        }
+        for requirement in &review_status.roles {
+            let role_available = self.roles.get(&requirement.role_id).is_some_and(|role| {
+                role.definition_op_id == requirement.definition_op_id
+                    && role
+                        .retired
+                        .as_ref()
+                        .is_none_or(|retirement| retirement.ts.as_str() > as_of_ts)
+            });
+            if !role_available {
+                reasons.push(candidate_reason(
+                    LandabilityReasonCode::ReviewRoleUnavailable,
+                    Some(&requirement.role_id),
+                    "required role is missing, retired, or does not match the immutable definition",
+                ));
+            }
+            for review in &requirement.reviews {
+                if review.eligible && review.verdict == ReviewVerdict::Block {
+                    reasons.push(candidate_reason(
+                        LandabilityReasonCode::ReviewRoleBlocking,
+                        Some(format!("{}:{}", requirement.role_id, review.reviewer)),
+                        format!(
+                            "eligible role reviewer {} currently blocks",
+                            review.reviewer
+                        ),
+                    ));
+                } else if !review.eligible && review.verdict == ReviewVerdict::Approve {
+                    reasons.push(candidate_reason(
+                        LandabilityReasonCode::ReviewRoleApprovalIneligible,
+                        Some(format!("{}:{}", requirement.role_id, review.reviewer)),
+                        review.detail.as_deref().unwrap_or(
+                            "recorded approval no longer has an eligible role assignment",
+                        ),
+                    ));
+                }
+            }
+            if requirement.eligible_approval_count < requirement.required_approvals {
+                reasons.push(candidate_reason(
+                    LandabilityReasonCode::ReviewRoleQuorumMissing,
+                    Some(&requirement.role_id),
+                    format!(
+                        "requires {} distinct eligible approval(s), has {}",
+                        requirement.required_approvals, requirement.eligible_approval_count
+                    ),
+                ));
             }
         }
 
@@ -725,15 +1489,15 @@ impl State {
                             receipt.outcome,
                             EvidenceOutcome::Unavailable | EvidenceOutcome::Ambiguous
                         ) {
-                            "evidence_unavailable"
+                            LandabilityReasonCode::EvidenceUnavailable
                         } else {
-                            "evidence_failed"
+                            LandabilityReasonCode::EvidenceFailed
                         },
                         Some(format!("{}:{producer}", requirement.name)),
                         format!("latest outcome is {}", receipt.outcome.as_str()),
                     )),
                     None => reasons.push(candidate_reason(
-                        "evidence_missing",
+                        LandabilityReasonCode::EvidenceMissing,
                         Some(format!("{}:{producer}", requirement.name)),
                         "required evidence is absent",
                     )),
@@ -747,107 +1511,208 @@ impl State {
             .filter(|e| e.name == GIT_ANCESTRY_EVIDENCE)
             .max_by(|a, b| a.op_id.cmp(&b.op_id));
         match ancestry {
-            Some(receipt) if receipt.outcome == EvidenceOutcome::Pass => match &receipt.payload {
-                CandidateEvidencePayload::GitAncestry(git)
-                    if git.repository_id == candidate.repository_id
-                        && git.object_format == candidate.object_format
-                        && git.commit_oid == candidate.commit_oid
-                        && git.base_oid == candidate.base_oid
-                        && git.parent_oids == candidate.parent_oids =>
-                {
-                    if git.base_is_ancestor != Some(true) {
-                        reasons.push(candidate_reason(
-                            "base_not_ancestor",
-                            Some(candidate_id),
-                            "proposal base is not a verified ancestor",
-                        ));
-                    }
-                    let expected: BTreeSet<(String, String)> = self
-                        .candidates
-                        .values()
-                        .filter(|other| {
-                            other.candidate_id != candidate.candidate_id
-                                && other.repository_id == candidate.repository_id
-                        })
-                        .map(|other| (other.candidate_id.clone(), other.proposal_op_id.clone()))
-                        .collect();
-                    let covered: BTreeSet<(String, String)> =
-                        git.covered_candidates.iter().cloned().collect();
-                    for missing in expected.difference(&covered) {
-                        reasons.push(candidate_reason(
-                            "git_evidence_stale",
-                            Some(&missing.0),
-                            format!("proposal op {} is not covered", missing.1),
-                        ));
-                    }
-                    for relation in &git.candidate_relations {
-                        let tip_ambiguous = matches!(
-                            relation.relation,
-                            GitRelationKind::Ambiguous | GitRelationKind::Unavailable
-                        );
-                        let base_ambiguous = matches!(
-                            relation.base_relation,
-                            None | Some(GitRelationKind::Ambiguous | GitRelationKind::Unavailable)
-                        );
-                        let inconsistent = relation.base_relation
-                            == Some(GitRelationKind::Ancestor)
-                            && relation.relation == GitRelationKind::NotAncestor;
-                        if tip_ambiguous || base_ambiguous || inconsistent {
-                            let base = relation
-                                .base_relation
-                                .map(GitRelationKind::as_str)
-                                .unwrap_or("missing");
+            Some(receipt) if receipt.outcome == EvidenceOutcome::Pass => {
+                match &receipt.payload {
+                    CandidateEvidencePayload::GitAncestry(git)
+                        if (git.repository_id == candidate.repository_id
+                            || git.repository_id == candidate.landing_repository_id)
+                            && git.object_format == candidate.object_format
+                            && git.commit_oid == candidate.commit_oid
+                            && git.base_oid == candidate.base_oid
+                            && git.parent_oids == candidate.parent_oids =>
+                    {
+                        if git.base_is_ancestor != Some(true) {
                             reasons.push(candidate_reason(
-                                "ancestor_ambiguous",
-                                Some(&relation.candidate_id),
-                                format!(
-                                    "base relation is {base}; tip relation is {}",
-                                    relation.relation.as_str()
-                                ),
+                                LandabilityReasonCode::BaseNotAncestor,
+                                Some(candidate_id),
+                                "proposal base is not a verified ancestor",
                             ));
                         }
-                        if relation.relation == GitRelationKind::Ancestor {
-                            self.check_ancestor_candidate(
-                                candidate,
-                                &relation.candidate_id,
-                                relation.base_relation,
-                                &mut reasons,
-                            );
+                        for other in self.candidates.values().filter(|other| {
+                            other.candidate_id != candidate.candidate_id
+                                && other.landing_repository_id == candidate.landing_repository_id
+                                && other.object_format == candidate.object_format
+                        }) {
+                            match self.resolve_candidate_pair(candidate, other) {
+                                CandidatePairResolution::Stale(detail) => {
+                                    reasons.push(candidate_reason(
+                                        LandabilityReasonCode::GitEvidenceStale,
+                                        Some(&other.candidate_id),
+                                        detail,
+                                    ));
+                                }
+                                CandidatePairResolution::Ambiguous(detail) => {
+                                    reasons.push(candidate_reason(
+                                        LandabilityReasonCode::AncestorAmbiguous,
+                                        Some(&other.candidate_id),
+                                        detail,
+                                    ));
+                                }
+                                CandidatePairResolution::Resolved { fact, .. } => {
+                                    if fact.other_to_candidate_tip == GitRelationKind::Ancestor {
+                                        self.check_ancestor_candidate(
+                                            candidate,
+                                            &other.candidate_id,
+                                            Some(fact.other_to_candidate_base),
+                                            &mut reasons,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // Preserve the v1 fail-closed treatment of rows that claim
+                        // an unknown ancestor. Known candidates are handled by the
+                        // exact pair resolver above.
+                        for relation in git.candidate_relations.iter().filter(|relation| {
+                            !self.candidates.contains_key(&relation.candidate_id)
+                        }) {
+                            if matches!(
+                                relation.relation,
+                                GitRelationKind::Ambiguous | GitRelationKind::Unavailable
+                            ) || relation.base_relation.is_none()
+                            {
+                                reasons.push(candidate_reason(
+                                    LandabilityReasonCode::AncestorAmbiguous,
+                                    Some(&relation.candidate_id),
+                                    "ancestry receipt contains an unresolved unknown candidate",
+                                ));
+                            } else if relation.relation == GitRelationKind::Ancestor {
+                                reasons.push(candidate_reason(
+                                    LandabilityReasonCode::AncestorMissing,
+                                    Some(&relation.candidate_id),
+                                    "ancestry receipt references an unknown candidate",
+                                ));
+                            }
                         }
                     }
+                    CandidateEvidencePayload::GitAncestry(git) => reasons.push(candidate_reason(
+                        if git.repository_id != candidate.repository_id
+                            && git.repository_id != candidate.landing_repository_id
+                        {
+                            LandabilityReasonCode::RepositoryMismatch
+                        } else {
+                            LandabilityReasonCode::ProposalAnchorMismatch
+                        },
+                        Some(candidate_id),
+                        "receipt does not match immutable proposal anchors",
+                    )),
+                    _ => reasons.push(candidate_reason(
+                        LandabilityReasonCode::ProposalAnchorMismatch,
+                        Some(candidate_id),
+                        "git-ancestry evidence has the wrong payload kind",
+                    )),
                 }
-                CandidateEvidencePayload::GitAncestry(git) => reasons.push(candidate_reason(
-                    if git.repository_id != candidate.repository_id {
-                        "repository_mismatch"
-                    } else {
-                        "proposal_anchor_mismatch"
-                    },
-                    Some(candidate_id),
-                    "receipt does not match immutable proposal anchors",
-                )),
-                _ => reasons.push(candidate_reason(
-                    "proposal_anchor_mismatch",
-                    Some(candidate_id),
-                    "git-ancestry evidence has the wrong payload kind",
-                )),
-            },
+            }
             Some(receipt) => reasons.push(candidate_reason(
                 if matches!(
                     receipt.outcome,
                     EvidenceOutcome::Unavailable | EvidenceOutcome::Ambiguous
                 ) {
-                    "git_evidence_unavailable"
+                    LandabilityReasonCode::GitEvidenceUnavailable
                 } else {
-                    "evidence_failed"
+                    LandabilityReasonCode::EvidenceFailed
                 },
                 Some(candidate_id),
                 "latest git-ancestry receipt did not pass",
             )),
             None => reasons.push(candidate_reason(
-                "git_evidence_missing",
+                LandabilityReasonCode::GitEvidenceMissing,
                 Some(candidate_id),
                 "git-ancestry receipt is mandatory",
             )),
+        }
+
+        if candidate.object_availability_required {
+            let availability = candidate
+                .evidence
+                .values()
+                .filter(|evidence| {
+                    evidence.name == crate::candidate::GIT_OBJECT_AVAILABILITY_EVIDENCE
+                        && matches!(
+                            &evidence.payload,
+                            CandidateEvidencePayload::GitObjectAvailability(git)
+                                if git.repository_id == candidate.landing_repository_id
+                                    && git.object_format == candidate.object_format
+                                    && git.candidate_oid == candidate.commit_oid
+                        )
+                })
+                .max_by(|left, right| left.op_id.cmp(&right.op_id));
+            let exact_reachability_pass = candidate.evidence.values().any(|evidence| {
+                evidence.outcome == EvidenceOutcome::Pass
+                    && match &evidence.payload {
+                        CandidateEvidencePayload::GitLanding(git) => {
+                            git.repository_id == candidate.landing_repository_id
+                                && git.object_format == candidate.object_format
+                                && git.candidate_oid == candidate.commit_oid
+                                && git.candidate_reachable == Some(true)
+                        }
+                        CandidateEvidencePayload::GitReachability(git) => {
+                            git.repository_id == candidate.landing_repository_id
+                                && git.object_format == candidate.object_format
+                                && git.candidate_oid == candidate.commit_oid
+                                && git.candidate_reachable == Some(true)
+                        }
+                        _ => false,
+                    }
+            });
+            match availability {
+                Some(receipt)
+                    if receipt.outcome == EvidenceOutcome::Pass
+                        && matches!(
+                            &receipt.payload,
+                            CandidateEvidencePayload::GitObjectAvailability(git)
+                                if git.object_available == Some(true)
+                                    && git.observed_parent_oids == candidate.parent_oids
+                        ) => {}
+                Some(receipt)
+                    if !exact_reachability_pass
+                        && (receipt.outcome == EvidenceOutcome::Fail
+                            || matches!(
+                                &receipt.payload,
+                                CandidateEvidencePayload::GitObjectAvailability(git)
+                                    if git.object_available == Some(false)
+                            )) =>
+                {
+                    let detail = match &receipt.payload {
+                        CandidateEvidencePayload::GitObjectAvailability(git) => git
+                            .detail
+                            .clone()
+                            .unwrap_or_else(|| "candidate commit object is not readable".into()),
+                        _ => "candidate commit object is not readable".into(),
+                    };
+                    reasons.push(candidate_reason(
+                        LandabilityReasonCode::ObjectUnreachable,
+                        Some(&candidate.landing_repository_id),
+                        detail,
+                    ));
+                }
+                Some(receipt) if !exact_reachability_pass => {
+                    let detail = match &receipt.payload {
+                        CandidateEvidencePayload::GitObjectAvailability(git) => git
+                            .detail
+                            .clone()
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "latest object-availability outcome is {}",
+                                    receipt.outcome.as_str()
+                                )
+                            }),
+                        _ => "object-availability evidence has the wrong payload".into(),
+                    };
+                    reasons.push(candidate_reason(
+                        LandabilityReasonCode::ObjectAvailabilityUnavailable,
+                        Some(&candidate.landing_repository_id),
+                        detail,
+                    ));
+                }
+                None if !exact_reachability_pass => reasons.push(candidate_reason(
+                    LandabilityReasonCode::ObjectAvailabilityMissing,
+                    Some(&candidate.landing_repository_id),
+                    "no current receipt proves the candidate object is readable from the bound landing repository",
+                )),
+                Some(_) | None => {}
+            }
         }
 
         match &candidate.authorization {
@@ -860,7 +1725,7 @@ impl State {
                 if let Some(lander) = lander {
                     if !auth.grantees.iter().any(|grantee| grantee == lander) {
                         reasons.push(candidate_reason(
-                            "actor_not_grantee",
+                            LandabilityReasonCode::ActorNotGrantee,
                             Some(lander),
                             "actor is not a named landing grantee",
                         ));
@@ -873,7 +1738,7 @@ impl State {
                         .any(|e| e.name == *condition && e.outcome == EvidenceOutcome::Pass)
                     {
                         reasons.push(candidate_reason(
-                            "condition_unsatisfied",
+                            LandabilityReasonCode::ConditionUnsatisfied,
                             Some(condition),
                             "no current passing receipt satisfies this condition",
                         ));
@@ -882,21 +1747,392 @@ impl State {
             }
             Some(auth) => reasons.push(candidate_reason(
                 if auth.status == AuthorizationStatus::Revoked {
-                    "authorization_revoked"
+                    LandabilityReasonCode::AuthorizationRevoked
                 } else {
-                    "authorization_absent"
+                    LandabilityReasonCode::AuthorizationAbsent
                 },
                 Some(&auth.op_id),
                 format!("authorization is {}", auth.status.as_str()),
             )),
             None => reasons.push(candidate_reason(
-                "authorization_absent",
+                LandabilityReasonCode::AuthorizationAbsent,
                 Some(candidate_id),
                 "candidate has no landing authorization",
             )),
         }
 
         Landability::from_reasons(reasons)
+    }
+
+    pub fn candidate_policy_snapshot(&self, candidate_id: &str) -> Option<CandidatePolicySnapshot> {
+        let as_of_ts = self
+            .history
+            .values()
+            .flatten()
+            .chain(self.orphan_history.iter())
+            .map(|entry| entry.ts.as_str())
+            .max()
+            .unwrap_or("1970-01-01T00:00:00.000000Z");
+        self.candidate_policy_snapshot_at(candidate_id, as_of_ts)
+    }
+
+    pub fn candidate_policy_snapshot_at(
+        &self,
+        candidate_id: &str,
+        as_of_ts: &str,
+    ) -> Option<CandidatePolicySnapshot> {
+        let candidate = self.candidates.get(candidate_id)?;
+        let mut review_op_ids: Vec<String> = candidate
+            .reviews
+            .values()
+            .map(|review| review.op_id.clone())
+            .collect();
+        review_op_ids.sort();
+        review_op_ids.dedup();
+
+        let mut evidence_op_ids: Vec<String> = candidate
+            .evidence
+            .values()
+            .map(|evidence| evidence.op_id.clone())
+            .collect();
+        evidence_op_ids.sort();
+        evidence_op_ids.dedup();
+
+        let mut pair_evidence_op_ids: Vec<String> = self
+            .candidate_pair_evidence
+            .values()
+            .filter(|evidence| {
+                evidence.subject_candidate_id == candidate_id
+                    || evidence.known_candidate_id == candidate_id
+            })
+            .map(|evidence| evidence.evidence_op_id.clone())
+            .collect();
+        pair_evidence_op_ids.sort();
+        pair_evidence_op_ids.dedup();
+
+        Some(CandidatePolicySnapshot {
+            phase_op_id: candidate.phase_op_id.clone(),
+            review_policy_op_id: Some(candidate.review_policy_op_id.clone()),
+            landing_repository_op_id: Some(candidate.landing_repository_op_id.clone()),
+            review_op_ids,
+            evidence_op_ids,
+            pair_evidence_op_ids,
+            authorization_op_id: candidate
+                .authorization
+                .as_ref()
+                .map(|authorization| authorization.op_id.clone()),
+            authorization_status: candidate
+                .authorization
+                .as_ref()
+                .map(|authorization| authorization.status),
+            pre_transition_landability: self.candidate_landability_at(candidate_id, None, as_of_ts),
+        })
+    }
+
+    fn resolve_candidate_pair(
+        &self,
+        candidate: &CandidateRecord,
+        other: &CandidateRecord,
+    ) -> CandidatePairResolution {
+        let observations = [
+            self.pair_source_observation(candidate, other, false),
+            self.pair_source_observation(other, candidate, true),
+        ];
+
+        let conflicts: Vec<String> = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                PairSourceObservation::Conflict(detail) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+        if !conflicts.is_empty() {
+            return CandidatePairResolution::Ambiguous(conflicts.join("; "));
+        }
+
+        let determinate: Vec<(CandidatePairFact, String, String)> = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                PairSourceObservation::Determinate {
+                    fact,
+                    source,
+                    evidence_op_id,
+                } => Some((*fact, source.clone(), evidence_op_id.clone())),
+                _ => None,
+            })
+            .collect();
+        if let Some((first, first_source, _)) = determinate.first() {
+            if let Some((_, conflicting_source, _)) =
+                determinate.iter().find(|(fact, _, _)| fact != first)
+            {
+                return CandidatePairResolution::Ambiguous(format!(
+                    "conflicting determinate pair observations from {first_source} and {conflicting_source}"
+                ));
+            }
+            let mut evidence_op_ids: Vec<String> = determinate
+                .iter()
+                .map(|(_, _, evidence_op_id)| evidence_op_id.clone())
+                .collect();
+            evidence_op_ids.sort();
+            evidence_op_ids.dedup();
+            return CandidatePairResolution::Resolved {
+                fact: *first,
+                evidence_op_ids,
+            };
+        }
+
+        let unknown: Vec<String> = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                PairSourceObservation::Unknown(detail) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+        if !unknown.is_empty() {
+            return CandidatePairResolution::Ambiguous(unknown.join("; "));
+        }
+
+        let absent: Vec<String> = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                PairSourceObservation::Absent(detail) => Some(detail.clone()),
+                _ => None,
+            })
+            .collect();
+        CandidatePairResolution::Stale(format!(
+            "no exact pair observation covers proposal op {}; {}",
+            other.proposal_op_id,
+            absent.join("; ")
+        ))
+    }
+
+    pub fn candidate_containment_basis(
+        &self,
+        predecessor_id: &str,
+        successor_id: &str,
+    ) -> Option<CandidateContainmentBasis> {
+        let predecessor = self.candidates.get(predecessor_id)?;
+        let successor = self.candidates.get(successor_id)?;
+        if predecessor_id == successor_id
+            || predecessor.store_id != successor.store_id
+            || predecessor.landing_repository_id != successor.landing_repository_id
+            || predecessor.object_format != successor.object_format
+            || predecessor.entity != successor.entity
+        {
+            return None;
+        }
+        match self.resolve_candidate_pair(successor, predecessor) {
+            CandidatePairResolution::Resolved {
+                fact,
+                evidence_op_ids,
+            } if fact.other_to_candidate_tip == GitRelationKind::Ancestor => {
+                Some(CandidateContainmentBasis {
+                    predecessor_candidate_id: predecessor_id.to_string(),
+                    successor_candidate_id: successor_id.to_string(),
+                    predecessor_to_successor_base: fact.other_to_candidate_base,
+                    predecessor_to_successor_tip: fact.other_to_candidate_tip,
+                    evidence_op_ids,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn pair_source_observation(
+        &self,
+        subject: &CandidateRecord,
+        known: &CandidateRecord,
+        reciprocal: bool,
+    ) -> PairSourceObservation {
+        let source_direction = if reciprocal { "reciprocal" } else { "direct" };
+        let Some(record) = self
+            .candidate_pair_evidence
+            .get(&(subject.candidate_id.clone(), known.candidate_id.clone()))
+        else {
+            return PairSourceObservation::Absent(self.missing_pair_source_detail(
+                subject,
+                known,
+                source_direction,
+            ));
+        };
+        let source = format!(
+            "{} evidence op {}",
+            subject.candidate_id, record.evidence_op_id
+        );
+
+        if record.subject_candidate_id != subject.candidate_id
+            || record.subject_proposal_op_id != subject.proposal_op_id
+            || record.subject_store_id != subject.store_id
+            || (record.repository_id != subject.repository_id
+                && record.repository_id != subject.landing_repository_id)
+            || record.object_format != subject.object_format
+            || record.subject_commit_oid != subject.commit_oid
+            || record.subject_base_oid != subject.base_oid
+            || record.known_candidate_id != known.candidate_id
+        {
+            return PairSourceObservation::Conflict(format!(
+                "{source} does not match immutable subject anchors"
+            ));
+        }
+
+        let schema_v2 = record.relation_schema >= GIT_RELATION_SCHEMA_V2;
+        if reciprocal && !schema_v2 {
+            return PairSourceObservation::Absent(format!(
+                "{source} is legacy and has no reciprocal relation"
+            ));
+        }
+
+        if schema_v2 {
+            let Some(snapshot) = &record.producer_snapshot else {
+                return PairSourceObservation::Unknown(format!(
+                    "{source} uses relation schema {} without producer snapshot provenance",
+                    record.relation_schema
+                ));
+            };
+            if snapshot.store_id != subject.store_id {
+                return PairSourceObservation::Conflict(format!(
+                    "{source} snapshot store {} does not match candidate store {}",
+                    snapshot.store_id, subject.store_id
+                ));
+            }
+            if !snapshot
+                .observed_candidates
+                .contains(&(known.candidate_id.clone(), known.proposal_op_id.clone()))
+            {
+                return PairSourceObservation::Absent(snapshot_omission_detail(
+                    &source,
+                    snapshot,
+                    &known.proposal_op_id,
+                ));
+            }
+        }
+
+        if !record
+            .covered_candidates
+            .contains(&(known.candidate_id.clone(), known.proposal_op_id.clone()))
+        {
+            return PairSourceObservation::Absent(format!(
+                "{source} does not declare coverage of proposal op {}",
+                known.proposal_op_id
+            ));
+        }
+
+        let exact_rows: Vec<&GitCandidateRelation> = record
+            .relations
+            .iter()
+            .filter(|relation| {
+                relation.candidate_id == known.candidate_id
+                    && relation.proposal_op_id == known.proposal_op_id
+                    && relation.commit_oid == known.commit_oid
+                    && (!schema_v2 || relation.base_oid.as_deref() == Some(&known.base_oid))
+            })
+            .collect();
+        if exact_rows.is_empty() {
+            return PairSourceObservation::Absent(format!(
+                "{source} has no row matching the exact commit and base anchors for proposal op {}",
+                known.proposal_op_id
+            ));
+        }
+        if exact_rows.len() != 1 {
+            return PairSourceObservation::Conflict(format!(
+                "{source} contains {} exact rows for one candidate pair",
+                exact_rows.len()
+            ));
+        }
+
+        let relation = exact_rows[0];
+        let (base, tip) = if reciprocal {
+            (
+                relation.subject_to_known_base,
+                relation.subject_to_known_tip,
+            )
+        } else {
+            (relation.base_relation, Some(relation.relation))
+        };
+        let (Some(base), Some(tip)) = (base, tip) else {
+            return PairSourceObservation::Unknown(format!(
+                "{source} has a partial {source_direction} relation"
+            ));
+        };
+        if matches!(
+            base,
+            GitRelationKind::Unavailable | GitRelationKind::Ambiguous
+        ) || matches!(
+            tip,
+            GitRelationKind::Unavailable | GitRelationKind::Ambiguous
+        ) {
+            return PairSourceObservation::Unknown(format!(
+                "{source} base relation is {} and tip relation is {}",
+                base.as_str(),
+                tip.as_str()
+            ));
+        }
+        if base == GitRelationKind::Ancestor && tip == GitRelationKind::NotAncestor {
+            return PairSourceObservation::Conflict(format!(
+                "{source} says the commit is an ancestor of the base but not the tip"
+            ));
+        }
+
+        PairSourceObservation::Determinate {
+            fact: CandidatePairFact {
+                other_to_candidate_base: base,
+                other_to_candidate_tip: tip,
+            },
+            source,
+            evidence_op_id: record.evidence_op_id.clone(),
+        }
+    }
+
+    fn missing_pair_source_detail(
+        &self,
+        subject: &CandidateRecord,
+        known: &CandidateRecord,
+        source_direction: &str,
+    ) -> String {
+        let Some(receipt) = subject
+            .evidence
+            .values()
+            .filter(|evidence| evidence.name == GIT_ANCESTRY_EVIDENCE)
+            .max_by(|left, right| left.op_id.cmp(&right.op_id))
+        else {
+            return format!(
+                "no {source_direction} git-ancestry receipt exists for {}",
+                subject.candidate_id
+            );
+        };
+        let source = format!(
+            "{source_direction} source {} evidence op {}",
+            subject.candidate_id, receipt.op_id
+        );
+        if receipt.op_id < known.proposal_op_id {
+            return format!(
+                "{source} predates proposal op {}; refresh from a store snapshot containing both exact proposal ops",
+                known.proposal_op_id
+            );
+        }
+
+        match &receipt.payload {
+            CandidateEvidencePayload::GitAncestry(git) => match &git.producer_snapshot {
+                Some(snapshot)
+                    if !snapshot
+                        .observed_candidates
+                        .contains(&(known.candidate_id.clone(), known.proposal_op_id.clone())) =>
+                {
+                    snapshot_omission_detail(&source, snapshot, &known.proposal_op_id)
+                }
+                Some(snapshot) => format!(
+                    "{source} declares proposal op {} in {}, but contains no exact pair row; refresh from a store snapshot containing both exact proposal ops",
+                    known.proposal_op_id,
+                    snapshot_summary(snapshot)
+                ),
+                None => format!(
+                    "{source} is a legacy receipt without producer snapshot provenance, so the target cannot distinguish incomplete input from malformed coverage; refresh with a v2 binary from a store snapshot containing both exact proposal ops"
+                ),
+            },
+            _ => format!(
+                "{source} has the wrong payload kind; refresh from a store snapshot containing both exact proposal ops"
+            ),
+        }
     }
 
     fn check_ancestor_candidate(
@@ -908,21 +2144,21 @@ impl State {
     ) {
         let Some(ancestor) = self.candidates.get(ancestor_id) else {
             reasons.push(candidate_reason(
-                "ancestor_missing",
+                LandabilityReasonCode::AncestorMissing,
                 Some(ancestor_id),
                 "ancestry receipt references an unknown candidate",
             ));
             return;
         };
         match ancestor.phase {
-            CandidatePhase::Landed => {}
+            CandidatePhase::Landed | CandidatePhase::LandedOutOfBand => {}
             CandidatePhase::Superseded => {
                 let mut cursor = ancestor;
                 let mut visited = BTreeSet::new();
                 while cursor.phase == CandidatePhase::Superseded {
                     if !visited.insert(cursor.candidate_id.clone()) {
                         reasons.push(candidate_reason(
-                            "supersession_cycle",
+                            LandabilityReasonCode::SupersessionCycle,
                             Some(ancestor_id),
                             "supersession chain contains a cycle",
                         ));
@@ -930,7 +2166,7 @@ impl State {
                     }
                     let Some(next_id) = cursor.successor_id.as_deref() else {
                         reasons.push(candidate_reason(
-                            "supersession_broken",
+                            LandabilityReasonCode::SupersessionBroken,
                             Some(&cursor.candidate_id),
                             "superseded candidate has no successor",
                         ));
@@ -938,7 +2174,7 @@ impl State {
                     };
                     let Some(next) = self.candidates.get(next_id) else {
                         reasons.push(candidate_reason(
-                            "supersession_broken",
+                            LandabilityReasonCode::SupersessionBroken,
                             Some(next_id),
                             "successor candidate does not exist",
                         ));
@@ -947,10 +2183,13 @@ impl State {
                     cursor = next;
                 }
                 if cursor.candidate_id != candidate.candidate_id
-                    && cursor.phase != CandidatePhase::Landed
+                    && !matches!(
+                        cursor.phase,
+                        CandidatePhase::Landed | CandidatePhase::LandedOutOfBand
+                    )
                 {
                     reasons.push(candidate_reason(
-                        "ancestor_supersession_unresolved",
+                        LandabilityReasonCode::AncestorSupersessionUnresolved,
                         Some(ancestor_id),
                         format!(
                             "chain ends at {} ({})",
@@ -973,11 +2212,11 @@ impl State {
                     });
                 reasons.push(candidate_reason(
                     if blocking_review {
-                        "ancestor_blocked"
+                        LandabilityReasonCode::AncestorBlocked
                     } else if revoked {
-                        "ancestor_authorization_revoked"
+                        LandabilityReasonCode::AncestorAuthorizationRevoked
                     } else {
-                        "ancestor_pending"
+                        LandabilityReasonCode::AncestorPending
                     },
                     Some(ancestor_id),
                     "an ancestor candidate is not safely resolved",
@@ -986,7 +2225,7 @@ impl State {
             CandidatePhase::Abandoned => match base_relation {
                 Some(GitRelationKind::Ancestor) => {}
                 Some(GitRelationKind::NotAncestor) => reasons.push(candidate_reason(
-                    "ancestor_abandoned",
+                    LandabilityReasonCode::AncestorAbandoned,
                     Some(ancestor_id),
                     "an abandoned candidate was introduced after the immutable base",
                 )),
@@ -1131,6 +2370,81 @@ impl State {
         self.board_posts
             .values()
             .find(|post| post.from == actor && post.idempotency_key.as_deref() == Some(key))
+    }
+
+    pub fn board_decisions_for_topic<'a>(&'a self, topic: &str) -> Vec<&'a BoardDecisionRecord> {
+        let mut decisions = self
+            .board_decisions
+            .values()
+            .filter(|decision| decision.topic == topic)
+            .collect::<Vec<_>>();
+        decisions.sort_by(|left, right| left.op_id.cmp(&right.op_id));
+        decisions
+    }
+
+    pub fn board_questions_for_topic<'a>(&'a self, topic: &str) -> Vec<&'a DecisionQuestionRecord> {
+        let mut questions = self
+            .board_questions
+            .values()
+            .filter(|question| question.topic == topic)
+            .collect::<Vec<_>>();
+        questions.sort_by(|left, right| {
+            left.opened_op_id
+                .cmp(&right.opened_op_id)
+                .then_with(|| left.position.cmp(&right.position))
+        });
+        questions
+    }
+
+    pub fn board_question_counts(&self, topic: Option<&str>) -> DecisionQuestionCounts {
+        let mut counts = DecisionQuestionCounts::default();
+        for question in self
+            .board_questions
+            .values()
+            .filter(|question| topic.is_none_or(|topic| question.topic == topic))
+        {
+            counts.total += 1;
+            match question.status {
+                DecisionQuestionStatus::Open => counts.open += 1,
+                DecisionQuestionStatus::Deferred => counts.deferred += 1,
+                DecisionQuestionStatus::Superseded => counts.superseded += 1,
+                DecisionQuestionStatus::Closed => counts.closed += 1,
+            }
+        }
+        counts.unresolved = counts.open + counts.deferred;
+        counts
+    }
+
+    pub fn board_questions_for_decision<'a>(
+        &'a self,
+        decision_id: &str,
+    ) -> Vec<&'a DecisionQuestionRecord> {
+        let mut questions = self
+            .board_questions
+            .values()
+            .filter(|question| question.decision_id == decision_id)
+            .collect::<Vec<_>>();
+        questions.sort_by(|left, right| left.position.cmp(&right.position));
+        questions
+    }
+
+    pub fn board_question_transition_by_idempotency<'a>(
+        &'a self,
+        actor: &str,
+        key: &str,
+    ) -> Option<(
+        &'a DecisionQuestionRecord,
+        &'a DecisionQuestionTransitionRecord,
+    )> {
+        self.board_questions.values().find_map(|question| {
+            question
+                .transitions
+                .iter()
+                .find(|transition| {
+                    transition.actor == actor && transition.idempotency_key.as_deref() == Some(key)
+                })
+                .map(|transition| (question, transition))
+        })
     }
 
     pub fn watched_topics_for(&self, actor: &str) -> Vec<String> {

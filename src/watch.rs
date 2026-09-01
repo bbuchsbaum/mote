@@ -21,6 +21,7 @@ pub fn run(
     actor: Option<&str>,
     json_mode: bool,
     interval_s: u64,
+    request_stale_after_s: u32,
 ) -> MoteResult<i32> {
     let actor = actor.map(String::from);
 
@@ -30,23 +31,28 @@ pub fn run(
     let watcher = StoreWatcher::new(store, interval_s)?;
 
     // A fresh viewer always sees the current state, not just future changes.
-    emit_snapshot(store, actor.as_deref(), json_mode)?;
+    emit_snapshot(store, actor.as_deref(), json_mode, request_stale_after_s)?;
 
     while watcher.wait() {
-        emit_snapshot(store, actor.as_deref(), json_mode)?;
+        emit_snapshot(store, actor.as_deref(), json_mode, request_stale_after_s)?;
     }
 
     Ok(0)
 }
 
-fn emit_snapshot(store: &Store, actor: Option<&str>, json_mode: bool) -> MoteResult<()> {
+fn emit_snapshot(
+    store: &Store,
+    actor: Option<&str>,
+    json_mode: bool,
+    request_stale_after_s: u32,
+) -> MoteResult<()> {
     let state = reducer::replay_store(store)?;
     let now = ids::format_rfc3339(Timestamp::now());
     if json_mode {
-        let v = snapshot_value(&state, actor, &now);
+        let v = snapshot_value_with_request_horizon(&state, actor, &now, request_stale_after_s);
         println!("{}", serde_json::to_string(&v)?);
     } else {
-        print_human(&state, actor, &now);
+        print_human(&state, actor, &now, request_stale_after_s);
     }
     Ok(())
 }
@@ -54,6 +60,20 @@ fn emit_snapshot(store: &Store, actor: Option<&str>, json_mode: bool) -> MoteRes
 /// JSON shape mirrors `mote board --json` plus an outer envelope with the
 /// snapshot timestamp, so a consumer can tell two snapshots apart.
 pub fn snapshot_value(state: &State, actor: Option<&str>, now: &str) -> Value {
+    snapshot_value_with_request_horizon(
+        state,
+        actor,
+        now,
+        crate::events::DEFAULT_REQUEST_STALE_AFTER_S,
+    )
+}
+
+pub fn snapshot_value_with_request_horizon(
+    state: &State,
+    actor: Option<&str>,
+    now: &str,
+    request_stale_after_s: u32,
+) -> Value {
     use std::collections::BTreeMap;
     let parsed_as_of = now.parse::<Timestamp>().ok();
     let snapshot_ts = parsed_as_of
@@ -163,6 +183,11 @@ pub fn snapshot_value(state: &State, actor: Option<&str>, now: &str) -> Value {
         })
         .collect();
     let inbox_unacked = actor.map(|a| state.inbox_for(a).len()).unwrap_or(0);
+    let stale_open_requests = actor
+        .map(|recipient| {
+            crate::events::stale_open_requests(state, Some(recipient), now, request_stale_after_s)
+        })
+        .unwrap_or_default();
     let discussion_unread = actor
         .map(|a| state.unread_board_posts_for(a, None).len())
         .unwrap_or(0);
@@ -170,7 +195,8 @@ pub fn snapshot_value(state: &State, actor: Option<&str>, now: &str) -> Value {
         .candidates
         .values()
         .map(|candidate| {
-            let landability = state.candidate_landability(&candidate.candidate_id, actor);
+            let landability =
+                state.candidate_landability_at(&candidate.candidate_id, actor, now);
             serde_json::json!({
                 "candidate_id": candidate.candidate_id,
                 "entity": candidate.entity,
@@ -181,13 +207,19 @@ pub fn snapshot_value(state: &State, actor: Option<&str>, now: &str) -> Value {
                 "policy": {
                     "paths": candidate.paths,
                     "authorizer": candidate.authorizer,
+                    "review_policy_version": candidate.review_policy_version,
                     "reviewers": candidate.reviewers,
+                    "role_review_requirements": candidate.role_review_requirements,
                     "evidence_requirements": candidate.evidence_requirements,
                 },
                 "reviews": candidate.reviews,
+                "review_status": state.candidate_review_status(&candidate.candidate_id, now),
                 "evidence": candidate.evidence.values().collect::<Vec<_>>(),
                 "authorization": candidate.authorization,
                 "successor_id": candidate.successor_id,
+                "supersession": candidate.supersession,
+                "landing": candidate.landed,
+                "reconciliation": candidate.reconciled,
                 "reservations": state.candidate_reservations(&candidate.candidate_id).iter().map(|reservation| serde_json::json!({
                     "reservation_id": reservation.reservation_id,
                     "actor": reservation.actor,
@@ -198,6 +230,11 @@ pub fn snapshot_value(state: &State, actor: Option<&str>, now: &str) -> Value {
                 "landability": landability,
             })
         })
+        .collect();
+    let roles: Vec<Value> = state
+        .roles
+        .values()
+        .map(|role| crate::cli::role_json(state, role, now))
         .collect();
     let actors = parsed_as_of
         .map(|as_of| {
@@ -221,16 +258,20 @@ pub fn snapshot_value(state: &State, actor: Option<&str>, now: &str) -> Value {
         "expiring_reservations": expiring_reservations,
         "expired_reservations": expired_reservations,
         "inbox_unacked": inbox_unacked,
+        "stale_open_requests": stale_open_requests,
+        "request_stale_after_s": request_stale_after_s,
         "discussion_unread": discussion_unread,
+        "discussion": crate::cli::discussion_decisions_json(state, None),
         "board_topics": state.board_topics.len(),
         "board_posts": state.board_posts.len(),
         "candidates": candidates,
+        "roles": roles,
         "actors": actors,
         "ops": state.history.values().map(Vec::len).sum::<usize>() + state.orphan_history.len(),
     })
 }
 
-fn print_human(state: &State, actor: Option<&str>, now: &str) {
+fn print_human(state: &State, actor: Option<&str>, now: &str, request_stale_after_s: u32) {
     use std::collections::BTreeMap;
 
     // ANSI: clear screen + home cursor. We only emit this in human mode, so a
@@ -381,20 +422,43 @@ fn print_human(state: &State, actor: Option<&str>, now: &str) {
     }
 
     let inbox = actor.map(|a| state.inbox_for(a).len()).unwrap_or(0);
+    let stale_requests = actor
+        .map(|recipient| {
+            crate::events::stale_open_requests(state, Some(recipient), now, request_stale_after_s)
+        })
+        .unwrap_or_default();
     let unread = actor
         .map(|a| state.unread_board_posts_for(a, None).len())
         .unwrap_or(0);
     println!("inbox:        {inbox} unacked");
-    println!("discussion:   {unread} unread");
     println!(
-        "board:        {} topics, {} posts",
+        "requests:     {} stale open (threshold={}s; acknowledgement is receipt only)",
+        stale_requests.len(),
+        request_stale_after_s
+    );
+    for request in stale_requests.iter().take(10) {
+        println!(
+            "  STALE {} from={} sent={} ack={}  {}",
+            request.msg_id,
+            request.from,
+            request.sent_ts,
+            if request.acknowledged { "yes" } else { "no" },
+            request.body.replace(['\n', '\r'], " ")
+        );
+    }
+    println!("discussion:   {unread} unread");
+    let question_counts = state.board_question_counts(None);
+    println!(
+        "board:        {} topics, {} posts, {} cited decisions, {} unresolved questions",
         state.board_topics.len(),
-        state.board_posts.len()
+        state.board_posts.len(),
+        state.board_decisions.len(),
+        question_counts.unresolved,
     );
 
     println!("candidates:   {} total", state.candidates.len());
     for candidate in state.candidates.values().take(10) {
-        let landability = state.candidate_landability(&candidate.candidate_id, actor);
+        let landability = state.candidate_landability_at(&candidate.candidate_id, actor, now);
         let disposition = if landability.landable {
             "landable".to_string()
         } else {
@@ -455,13 +519,22 @@ mod tests {
             proposal_op_id: "op-proposal".into(),
             store_id: "st-test".into(),
             repository_id: "repo-test".into(),
+            landing_repository_id: "repo-test".into(),
+            landing_repository_op_id: "op-proposal".into(),
+            landing_repository_bindings: Vec::new(),
+            object_source: None,
+            object_availability_required: false,
             object_format: "sha1".into(),
             commit_oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             base_oid: "1111111111111111111111111111111111111111".into(),
             parent_oids: vec!["1111111111111111111111111111111111111111".into()],
             paths: vec!["src/lib.rs".into()],
             authorizer: "authorizer".into(),
+            review_policy_version: 1,
+            review_policy_op_id: "op-proposal".into(),
             reviewers: vec!["reviewer".into()],
+            role_review_requirements: Vec::new(),
+            review_policy_amendments: Vec::new(),
             evidence_requirements: vec![EvidenceRequirement {
                 name: GIT_ANCESTRY_EVIDENCE.into(),
                 kind: "git".into(),
@@ -471,10 +544,12 @@ mod tests {
             phase: CandidatePhase::Pending,
             phase_op_id: "op-proposal".into(),
             successor_id: None,
+            supersession: None,
             reviews: BTreeMap::new(),
             evidence: BTreeMap::new(),
             authorization: None,
             landed: None,
+            reconciled: None,
         };
         let mut state = State::default();
         state.candidates.insert(candidate_id.clone(), candidate);

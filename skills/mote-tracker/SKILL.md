@@ -245,6 +245,16 @@ request sender can mark that result `resolved`. Use a stable sender-scoped
 with identical content returns the original message id; reusing it for
 different content is rejected.
 
+Incoming requests that stay explicitly open for one hour are surfaced as
+derived warnings on the recipient's next state-changing command and through
+`mote watch` or `mote events --kind message`. Configure the horizon with the
+global `--request-stale-after <duration>` option. The cursor-stable event type
+is `request.stale`. A warning is attention only: it publishes no operation and
+does not acknowledge or fulfill the request. An acknowledgement or unrelated
+post still leaves the warning active; use `msg reply` or an explicit
+`--answers <msg-id>` transition to answer, or `msg reply --kind decline` to
+decline.
+
 Ordinary direct messages queue for `live`, `recent`, `expired`, `untracked`,
 and previously unseen recipients. Use `--require-live` only for a genuinely
 live-only interaction: the reducer checks the recipient's session lease at the

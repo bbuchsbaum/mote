@@ -81,6 +81,45 @@ fn resolve_positional_text(value: Option<String>, stdin: bool, what: &str) -> Mo
     TextInput::positional(value, stdin, what)?.read()
 }
 
+/// Add a concrete recovery path to command shapes that Clap cannot safely
+/// reinterpret. These hints are deliberately limited to observed mistakes;
+/// valid invocations keep their existing parse and output behavior.
+pub fn near_miss_hint(args: &[String]) -> Option<String> {
+    let args = args.get(1..).unwrap_or_default();
+
+    if let Some(index) = args.iter().position(|arg| arg == "msg") {
+        let next = args.get(index + 1)?;
+        let known = [
+            "send", "reply", "thread", "requests", "resolve", "ack", "help",
+        ];
+        if next == "--to" || (!next.starts_with('-') && !known.contains(&next.as_str())) {
+            return Some(
+                "direct-send shorthand is `mote send <actor> <body>`; the canonical form is \
+                 `mote msg send --to <actor> <body>`"
+                    .into(),
+            );
+        }
+    }
+
+    if let Some(index) = args.windows(2).position(|pair| pair == ["discuss", "post"]) {
+        let tail = &args[index + 2..];
+        if !tail.iter().any(|arg| arg == "--topic")
+            && tail.len() >= 2
+            && !tail[0].starts_with('-')
+            && !tail[1].starts_with('-')
+        {
+            return Some(
+                "discussion topic is a named option: use \
+                 `mote discuss post --topic <topic> <body>`; one positional value remains the \
+                 backward-compatible body for topic `general`"
+                    .into(),
+            );
+        }
+    }
+
+    None
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "mote",
@@ -103,6 +142,15 @@ pub struct Cli {
     /// Suppress non-essential stderr
     #[arg(long, global = true)]
     pub quiet: bool,
+
+    /// Warn when an incoming request remains open for this duration
+    #[arg(
+        long,
+        global = true,
+        default_value = "1h",
+        value_parser = parse_duration_seconds
+    )]
+    pub request_stale_after: u32,
 
     #[command(subcommand)]
     pub command: Command,
@@ -152,6 +200,9 @@ pub enum Command {
         #[arg(num_args = 1.., required = true)]
         fields: Vec<String>,
     },
+
+    /// Set a bead's assignee (shorthand for `set <id> assignee=<actor>`)
+    Assign { id: String, assignee: String },
 
     /// Show full state of a bead
     Show { id: String },
@@ -243,6 +294,36 @@ pub enum Command {
 
     /// Release the current claim on a bead
     Release { id: String },
+
+    /// Send a direct message (`msg send --to` shorthand)
+    Send {
+        /// Recipient actor
+        to: String,
+        /// Optional issue context
+        #[arg(long)]
+        issue: Option<String>,
+        /// Optional reservation context
+        #[arg(long)]
+        reservation: Option<String>,
+        /// Message kind (note | request | handoff | blocked | fyi)
+        #[arg(long = "kind", default_value = "note")]
+        msg_kind: String,
+        /// Sender-scoped retry key; an identical retry returns the first msg-id
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        /// Reject unless the recipient has a valid session lease at send time
+        #[arg(long)]
+        require_live: bool,
+        /// Open request msg-id answered by this message; repeatable
+        #[arg(long = "answers")]
+        answers: Vec<String>,
+        /// Body text (positional)
+        #[arg(required_unless_present = "stdin")]
+        text: Option<String>,
+        /// Read body text literally from stdin
+        #[arg(long, conflicts_with = "text")]
+        stdin: bool,
+    },
 
     /// Direct message commands
     Msg {
@@ -378,6 +459,12 @@ pub enum Command {
         cmd: SessionCmd,
     },
 
+    /// Define operational roles and manage session-bounded assignment leases
+    Role {
+        #[command(subcommand)]
+        cmd: RoleCmd,
+    },
+
     /// Manage immutable Git change candidates and landing authorization
     Candidate {
         #[command(subcommand)]
@@ -399,7 +486,7 @@ pub enum Command {
 
     /// Emit accepted operation events, optionally following for new events
     Events {
-        /// Event categories: issue, claim, reservation, message, discussion, session, candidate, or all
+        /// Event categories: issue, claim, reservation, message, discussion, session, role, candidate, or all
         #[arg(long = "kind", value_delimiter = ',')]
         kinds: Vec<String>,
         /// Include only events authored by or directly related to this actor
@@ -435,6 +522,19 @@ pub enum Command {
 
     /// Check store layout, actor identity, and op-log health
     Doctor,
+
+    /// Report read-only operational findings without changing recorded state
+    Audit {
+        /// Explicit Git ref for ambient candidate reachability checks
+        #[arg(long = "target-ref")]
+        target_ref: Option<String>,
+        /// Enable age-based findings at this threshold
+        #[arg(long = "stale-after", value_parser = parse_duration_seconds)]
+        stale_after: Option<u32>,
+        /// Exit 2 for findings at this severity: error | warning | never
+        #[arg(long = "fail-on", default_value = "error")]
+        fail_on: String,
+    },
 
     /// Verify op-file hashes; with --clean-tmp, remove stale tmp/ entries
     Fsck {
@@ -477,11 +577,20 @@ pub enum CandidateCmd {
         authorizer: String,
         #[arg(long = "reviewer", num_args = 1..)]
         reviewers: Vec<String>,
+        /// Required approval count; pair each occurrence with one --from-role
+        #[arg(long = "require-reviews")]
+        required_review_counts: Vec<u32>,
+        /// Exact role name/id paired by position with --require-reviews
+        #[arg(long = "from-role")]
+        review_roles: Vec<String>,
         /// Additional requirement as `name:kind:producer[,producer]`
         #[arg(long = "require")]
         requirements: Vec<String>,
         #[arg(long = "evidence-ref")]
         evidence_refs: Vec<String>,
+        /// Optional path, remote ref, or other locator from which another actor can obtain the object
+        #[arg(long)]
+        object_source: Option<String>,
         #[arg(long)]
         idempotency_key: String,
     },
@@ -507,6 +616,39 @@ pub enum CandidateCmd {
         evidence_refs: Vec<String>,
         #[arg(long)]
         expect: Option<String>,
+        /// Consume one quorum slot from this exact role using the actor's active assignment
+        #[arg(long = "from-role")]
+        from_role: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Amend the named-reviewer set as the proposal authorizer, preserving remaining reviews
+    AmendReviewers {
+        candidate_id: String,
+        /// Complete replacement named-reviewer set; repeat for each reviewer
+        #[arg(long = "reviewer")]
+        reviewers: Vec<String>,
+        #[arg(long)]
+        expect_phase: String,
+        #[arg(long = "expect-policy")]
+        expect_review_policy: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Bind a pending candidate to the Git repository backing the shared store
+    BindLandingRepository {
+        candidate_id: String,
+        #[arg(long)]
+        expect_phase: String,
+        #[arg(long = "expect-repository")]
+        expect_landing_repository: String,
+        /// Optional path, remote ref, or other explicit object locator
+        #[arg(long)]
+        object_source: Option<String>,
+        #[arg(long)]
+        reason: String,
         #[arg(long)]
         idempotency_key: String,
     },
@@ -538,6 +680,9 @@ pub enum CandidateCmd {
         successor_id: String,
         #[arg(long)]
         expect_phase: String,
+        /// Recover ownerless work as the successor authorizer using recorded containment evidence
+        #[arg(long)]
+        containment_recovery: bool,
         #[arg(long)]
         idempotency_key: String,
     },
@@ -565,12 +710,29 @@ pub enum CandidateCmd {
         #[arg(long)]
         idempotency_key: String,
     },
+    /// Record a candidate already reachable from Git as landed outside governance
+    Reconcile {
+        candidate_id: String,
+        /// Explicit Git ref whose resolved commit contains the candidate
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        expect_phase: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum CandidateEvidenceCmd {
     /// Refresh built-in Git ancestry evidence for the immutable proposal
     Refresh {
+        candidate_id: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Refresh object visibility in the repository backing the shared store
+    Availability {
         candidate_id: String,
         #[arg(long)]
         idempotency_key: String,
@@ -684,6 +846,93 @@ pub enum SessionCmd {
     End {
         /// Session id (default: `MOTE_SESSION`)
         id: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RoleCmd {
+    /// Define one immutable role policy
+    Define {
+        name: String,
+        /// Role remit; pass - to read literal UTF-8 from stdin
+        #[arg(long)]
+        remit: String,
+        #[arg(long = "assigner", num_args = 1..)]
+        assignment_authorities: Vec<String>,
+        #[arg(long, default_value_t = 1)]
+        capacity: u32,
+        #[arg(long, default_value_t = 1)]
+        minimum_active: u32,
+        /// Typed exclusion code, optionally `concurrent_role:ROLE`
+        #[arg(long = "exclude")]
+        exclusions: Vec<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Assign a role to one actor through one exact live session
+    Assign {
+        role: String,
+        holder: String,
+        /// Holder session; defaults to MOTE_SESSION only for self-assignment
+        #[arg(long)]
+        session: Option<String>,
+        /// Exact current holder-session lease op; derived when omitted
+        #[arg(long)]
+        expect_session: Option<String>,
+        #[arg(long, value_parser = parse_duration_seconds)]
+        ttl: u32,
+        /// Exact active assignment as ASSIGNMENT:CLOCK; derived when omitted
+        #[arg(long = "expect-active")]
+        expect_active: Vec<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Renew an active role assignment without changing its holder or session
+    Renew {
+        assignment_id: String,
+        #[arg(long, value_parser = parse_duration_seconds)]
+        ttl: u32,
+        #[arg(long)]
+        expect: String,
+        /// Exact current holder-session lease op; derived when omitted
+        #[arg(long)]
+        expect_session: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Relinquish or revoke a role assignment using its current clock
+    Release {
+        assignment_id: String,
+        #[arg(long)]
+        expect: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Retire an unstaffed role; its id and name remain reserved
+    Retire {
+        role: String,
+        #[arg(long)]
+        expect_definition: String,
+        /// Exact assignment clock as ASSIGNMENT:CLOCK; derived when omitted
+        #[arg(long = "expect-assignment")]
+        expect_assignments: Vec<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Show one role policy, assignments, and coverage
+    Show { role: String },
+    /// List roles and their current coverage
+    List {
+        #[arg(long)]
+        vacant: bool,
+        #[arg(long)]
+        holder: Option<String>,
+        #[arg(long)]
+        retired: bool,
     },
 }
 
@@ -971,6 +1220,40 @@ pub enum DiscussCmd {
         #[arg(long)]
         idempotency_key: Option<String>,
     },
+    /// Create or show a cited decision with tracked open questions
+    Decide {
+        #[arg(long, default_value = "general")]
+        topic: String,
+        /// Show derived cited decisions and questions without publishing
+        #[arg(long)]
+        show: bool,
+        /// Active same-topic post establishing one agreed clause; repeatable
+        #[arg(long = "agreed")]
+        agreed_post_ids: Vec<String>,
+        /// Open question text; repeatable
+        #[arg(long = "open")]
+        open_questions: Vec<String>,
+        /// Typed reference: topic:, post:, issue:, candidate:, or url:
+        #[arg(long = "cite")]
+        references: Vec<String>,
+        /// Existing issue to cite and route the decision to; repeatable
+        #[arg(long = "issue")]
+        issues: Vec<String>,
+        /// Optional decision context; pass - to read literal UTF-8 from stdin
+        #[arg(long)]
+        body: Option<String>,
+        /// Optional decision context (positional; alternatively use --body)
+        text: Option<String>,
+        #[arg(long = "notify")]
+        notify: Vec<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Inspect or transition a tracked decision question
+    Question {
+        #[command(subcommand)]
+        cmd: DiscussQuestionCmd,
+    },
     /// Set or show a topic's pinned current-state summary
     Summary {
         #[arg(long, default_value = "general")]
@@ -1034,6 +1317,60 @@ pub enum DiscussCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum DiscussQuestionCmd {
+    /// Show one question and its append-only transitions
+    Show { question_id: String },
+    /// Add an explicit candidate answer while leaving the question open
+    Answer {
+        question_id: String,
+        /// Same-topic answer post; repeatable
+        #[arg(long = "post", required = true)]
+        posts: Vec<String>,
+        #[arg(long = "cite")]
+        references: Vec<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        expect: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Defer an open question (decision author only)
+    Defer {
+        question_id: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        expect: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Replace an unresolved question with another in the same topic
+    Supersede {
+        question_id: String,
+        successor_question_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        expect: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Close an unresolved question with an explicit resolution
+    Close {
+        question_id: String,
+        #[arg(long)]
+        resolution: String,
+        #[arg(long = "cite")]
+        references: Vec<String>,
+        #[arg(long)]
+        expect: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum DiscussTopicCmd {
     /// Create a topic before any posts exist
     New {
@@ -1089,6 +1426,10 @@ impl Command {
                         | DiscussCmd::Search { .. }
                         | DiscussCmd::Topics
                         | DiscussCmd::Unrouted { .. }
+                        | DiscussCmd::Decide { show: true, .. }
+                        | DiscussCmd::Question {
+                            cmd: DiscussQuestionCmd::Show { .. },
+                        }
                         | DiscussCmd::Summary {
                             body: None,
                             text: None,
@@ -1105,6 +1446,9 @@ impl Command {
                             ..
                         },
                 }
+                | Command::Role {
+                    cmd: RoleCmd::Show { .. } | RoleCmd::List { .. },
+                }
                 | Command::Candidate {
                     cmd: CandidateCmd::Show { .. } | CandidateCmd::List { .. },
                 }
@@ -1115,6 +1459,7 @@ impl Command {
                 | Command::Ui
                 | Command::Serve { .. }
                 | Command::Doctor
+                | Command::Audit { .. }
                 | Command::Fsck { .. }
                 | Command::Skills { .. }
         )
@@ -1152,8 +1497,40 @@ fn guard_concurrent_local_identity(cli: &Cli) -> MoteResult<()> {
     )))
 }
 
+/// Put aging request state in front of the recipient while they are already
+/// changing tracker state. This is a read-only projection: it never
+/// acknowledges, answers, declines, or resolves a request.
+fn warn_stale_requests_for_stateful_invocation(cli: &Cli) -> MoteResult<()> {
+    if !cli.command.publishes_as_resolved_actor() {
+        return Ok(());
+    }
+    let store = open_store(cli.store.as_deref())?;
+    let actor = store.resolve_actor(cli.actor.as_deref())?;
+    let state = reducer::replay_store(&store)?;
+    let now = ids::format_rfc3339(Timestamp::now());
+    for request in
+        crate::events::stale_open_requests(&state, Some(&actor), &now, cli.request_stale_after)
+    {
+        eprintln!(
+            "warning: request {} from {} has remained open since {} \
+             (threshold={}s, acknowledged={}); acknowledgement records receipt only; \
+             respond with `mote msg reply {} --stdin` or decline with \
+             `mote msg reply {} --kind decline --stdin`",
+            request.msg_id,
+            request.from,
+            request.sent_ts,
+            request.stale_after_s,
+            request.acknowledged,
+            request.msg_id,
+            request.msg_id,
+        );
+    }
+    Ok(())
+}
+
 pub fn run(cli: Cli) -> MoteResult<i32> {
     guard_concurrent_local_identity(&cli)?;
+    warn_stale_requests_for_stateful_invocation(&cli)?;
     match cli.command {
         Command::Init => cmd_init(cli.quiet),
         Command::Actor { cmd } => {
@@ -1185,6 +1562,13 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             cli.json,
             id,
             fields,
+        ),
+        Command::Assign { id, assignee } => cmd_set(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            id,
+            vec![format!("assignee={assignee}")],
         ),
         Command::Show { id } => cmd_show(cli.store.as_deref(), cli.json, id),
         Command::Parents { id } => cmd_parents(cli.store.as_deref(), cli.json, id),
@@ -1233,6 +1617,32 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             cmd_claim(cli.actor.as_deref(), cli.store.as_deref(), id, ttl)
         }
         Command::Release { id } => cmd_release(cli.actor.as_deref(), cli.store.as_deref(), id),
+        Command::Send {
+            to,
+            issue,
+            reservation,
+            msg_kind,
+            idempotency_key,
+            require_live,
+            answers,
+            text,
+            stdin,
+        } => cmd_msg(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            MsgCmd::Send {
+                to,
+                issue,
+                reservation,
+                msg_kind,
+                idempotency_key,
+                require_live,
+                answers,
+                text,
+                stdin,
+            },
+        ),
         Command::Msg { cmd } => cmd_msg(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd),
         Command::Discuss { cmd } => {
             cmd_discuss(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
@@ -1331,6 +1741,9 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         Command::Session { cmd } => {
             cmd_session(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
         }
+        Command::Role { cmd } => {
+            cmd_role(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
+        }
         Command::Candidate { cmd } => {
             cmd_candidate(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
         }
@@ -1357,12 +1770,14 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             after,
             follow,
             interval,
+            cli.request_stale_after,
         ),
         Command::Watch { interval } => cmd_watch(
             cli.actor.as_deref(),
             cli.store.as_deref(),
             cli.json,
             interval,
+            cli.request_stale_after,
         ),
         Command::Ui => cmd_ui(cli.actor.as_deref(), cli.store.as_deref()),
         Command::Serve { port } => {
@@ -1371,6 +1786,17 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             Ok(0)
         }
         Command::Doctor => cmd_doctor(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
+        Command::Audit {
+            target_ref,
+            stale_after,
+            fail_on,
+        } => cmd_audit(
+            cli.store.as_deref(),
+            cli.json,
+            target_ref.as_deref(),
+            stale_after,
+            &fail_on,
+        ),
         Command::Fsck { clean_tmp } => cmd_fsck(cli.store.as_deref(), cli.json, clean_tmp),
         Command::Batch { input } => {
             cmd_batch(cli.actor.as_deref(), cli.store.as_deref(), cli.json, input)
@@ -1440,9 +1866,144 @@ fn known_candidates(state: &crate::state::State) -> Vec<crate::candidate::KnownC
             candidate_id: candidate.candidate_id.clone(),
             proposal_op_id: candidate.proposal_op_id.clone(),
             repository_id: candidate.repository_id.clone(),
+            landing_repository_id: candidate.landing_repository_id.clone(),
+            object_format: candidate.object_format.clone(),
             commit_oid: candidate.commit_oid.clone(),
+            base_oid: candidate.base_oid.clone(),
         })
         .collect()
+}
+
+fn store_repository_cwd(store: &Store) -> MoteResult<PathBuf> {
+    let parent = store.root().parent().ok_or_else(|| {
+        MoteError::Invalid("the configured Mote store has no containing repository path".into())
+    })?;
+    std::fs::canonicalize(parent).map_err(MoteError::Io)
+}
+
+fn object_availability_observation(
+    repository_cwd: &Path,
+    landing_repository_id: &str,
+    object_format: &str,
+    candidate_oid: &str,
+    parent_oids: &[String],
+) -> (
+    crate::candidate::GitObjectAvailabilityReceipt,
+    crate::candidate::EvidenceOutcome,
+) {
+    match crate::candidate::probe_object_availability(
+        repository_cwd,
+        landing_repository_id,
+        object_format,
+        candidate_oid,
+        parent_oids,
+    ) {
+        Ok(receipt) => {
+            let outcome = match receipt.object_available {
+                Some(true) => crate::candidate::EvidenceOutcome::Pass,
+                Some(false) => crate::candidate::EvidenceOutcome::Fail,
+                None => crate::candidate::EvidenceOutcome::Unavailable,
+            };
+            (receipt, outcome)
+        }
+        Err(error) => (
+            crate::candidate::GitObjectAvailabilityReceipt {
+                repository_id: landing_repository_id.to_string(),
+                object_format: object_format.to_string(),
+                candidate_oid: candidate_oid.to_string(),
+                observed_parent_oids: Vec::new(),
+                object_available: None,
+                git_version: "unavailable".into(),
+                detail: Some(error),
+            },
+            crate::candidate::EvidenceOutcome::Unavailable,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn object_availability_evidence_op(
+    repository_cwd: &Path,
+    actor: String,
+    candidate_id: String,
+    landing_repository_id: &str,
+    object_format: &str,
+    candidate_oid: &str,
+    parent_oids: &[String],
+    idempotency_key: String,
+) -> MoteResult<(op::Op, crate::candidate::EvidenceOutcome, Option<String>)> {
+    let (receipt, outcome) = object_availability_observation(
+        repository_cwd,
+        landing_repository_id,
+        object_format,
+        candidate_oid,
+        parent_oids,
+    );
+    let detail = receipt.detail.clone();
+    let producer_tool = receipt.git_version.clone();
+    let payload = crate::candidate::CandidateEvidencePayload::GitObjectAvailability(receipt);
+    let evidence_id = crate::candidate::evidence_id(&payload)?;
+    Ok((
+        op::Op::CandidateEvidence(op::CandidateEvidenceOp {
+            v: crate::candidate::CANDIDATE_PROTOCOL_VERSION,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor,
+            candidate_id,
+            candidate_oid: candidate_oid.to_string(),
+            evidence_id,
+            name: crate::candidate::GIT_OBJECT_AVAILABILITY_EVIDENCE.into(),
+            evidence_kind: "git".into(),
+            producer_tool,
+            outcome,
+            payload,
+            refs: Vec::new(),
+            idempotency_key,
+        }),
+        outcome,
+        detail,
+    ))
+}
+
+fn candidate_snapshot_provenance(
+    store: &Store,
+    state: &crate::state::State,
+) -> MoteResult<crate::candidate::CandidateSnapshotProvenance> {
+    let format = store.read_format()?;
+    let op_filenames = store.list_op_filenames()?;
+    let op_ids: Vec<&str> = op_filenames
+        .iter()
+        .map(|name| name.strip_suffix(".json").unwrap_or(name))
+        .collect();
+    let replayed_op_ids_digest = blake3::hash(&serde_json::to_vec(&op_ids)?)
+        .to_hex()
+        .to_string();
+    let mut observed_candidates: Vec<(String, String)> = state
+        .candidates
+        .values()
+        .map(|candidate| {
+            (
+                candidate.candidate_id.clone(),
+                candidate.proposal_op_id.clone(),
+            )
+        })
+        .collect();
+    observed_candidates.sort();
+    let git_backing = crate::audit::inspect_git_backing(store, Timestamp::now());
+    let uncommitted_op_count = matches!(
+        git_backing.mode,
+        crate::audit::GitBackingMode::GitBacked | crate::audit::GitBackingMode::LocalUntracked
+    )
+    .then_some(git_backing.uncommitted_op_count as u64);
+
+    Ok(crate::candidate::CandidateSnapshotProvenance {
+        store_id: format.store_id,
+        observed_candidates,
+        replayed_op_count: op_ids.len() as u64,
+        replayed_op_ids_digest,
+        store_git_head: git_backing.head,
+        uncommitted_op_count,
+    })
 }
 
 pub(crate) fn candidate_json(
@@ -1450,6 +2011,14 @@ pub(crate) fn candidate_json(
     candidate: &crate::state::CandidateRecord,
 ) -> serde_json::Value {
     let now = ids::format_rfc3339(Timestamp::now());
+    candidate_json_at(state, candidate, &now)
+}
+
+pub(crate) fn candidate_json_at(
+    state: &crate::state::State,
+    candidate: &crate::state::CandidateRecord,
+    now: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "candidate_id": candidate.candidate_id,
         "entity": candidate.entity,
@@ -1457,7 +2026,13 @@ pub(crate) fn candidate_json(
         "proposal_op_id": candidate.proposal_op_id,
         "identity": {
             "store_id": candidate.store_id,
+            "proposal_repository_id": candidate.repository_id,
             "repository_id": candidate.repository_id,
+            "landing_repository_id": candidate.landing_repository_id,
+            "landing_repository_op_id": candidate.landing_repository_op_id,
+            "landing_repository_bindings": candidate.landing_repository_bindings,
+            "object_source": candidate.object_source,
+            "object_availability_required": candidate.object_availability_required,
             "object_format": candidate.object_format,
             "commit_oid": candidate.commit_oid,
             "base_oid": candidate.base_oid,
@@ -1470,23 +2045,32 @@ pub(crate) fn candidate_json(
         "policy": {
             "paths": candidate.paths,
             "authorizer": candidate.authorizer,
+            "review_policy_version": candidate.review_policy_version,
+            "op_id": candidate.review_policy_op_id,
             "reviewers": candidate.reviewers,
+            "role_review_requirements": candidate.role_review_requirements,
+            "amendments": candidate.review_policy_amendments,
             "evidence_requirements": candidate.evidence_requirements,
             "evidence_refs": candidate.evidence_refs,
         },
         "reviews": candidate.reviews,
+        "review_status": state.candidate_review_status(&candidate.candidate_id, now),
         "evidence": candidate.evidence.values().collect::<Vec<_>>(),
         "authorization": candidate.authorization,
-        "supersession": { "successor_id": candidate.successor_id },
+        "supersession": {
+            "successor_id": candidate.successor_id,
+            "record": candidate.supersession,
+        },
         "landing": candidate.landed,
+        "reconciliation": candidate.reconciled,
         "reservations": state.candidate_reservations(&candidate.candidate_id).iter().map(|reservation| serde_json::json!({
             "reservation_id": reservation.reservation_id,
             "actor": reservation.actor,
             "paths": reservation.live_paths(),
             "lease_until_ts": reservation.lease_until_ts,
-            "disposition": state.reservation_disposition(reservation, &now),
+            "disposition": state.reservation_disposition(reservation, now),
         })).collect::<Vec<_>>(),
-        "landability": state.candidate_landability(&candidate.candidate_id, None),
+        "landability": state.candidate_landability_at(&candidate.candidate_id, None, now),
     })
 }
 
@@ -1499,7 +2083,8 @@ fn print_candidate(
     if json_mode {
         println!("{}", serde_json::to_string(&value)?);
     } else {
-        let landability = state.candidate_landability(&candidate.candidate_id, None);
+        let now = ids::format_rfc3339(Timestamp::now());
+        let landability = state.candidate_landability_at(&candidate.candidate_id, None, &now);
         println!(
             "{}  {}  {}  issue={}  commit={}",
             candidate.candidate_id,
@@ -1512,11 +2097,98 @@ fn print_candidate(
             candidate.entity,
             candidate.commit_oid,
         );
-        for reason in landability.reasons {
-            println!("  {}: {}", reason.code, reason.detail);
+        println!(
+            "  repositories: proposal={} landing={} binding={}",
+            candidate.repository_id,
+            candidate.landing_repository_id,
+            candidate.landing_repository_op_id
+        );
+        if let Some(source) = &candidate.object_source {
+            println!(
+                "  object source: repo={} ref={} locator={}",
+                source.repository_id,
+                source.commit_ref,
+                source.locator.as_deref().unwrap_or("unrecorded")
+            );
         }
+        if let Some(supersession) = &candidate.supersession {
+            println!(
+                "  supersession: successor={} actor={} authority={} evidence=[{}]",
+                supersession.successor_id,
+                supersession.actor,
+                supersession.authority.as_str(),
+                supersession.containment_evidence_op_ids.join(",")
+            );
+            if !supersession.reviews_not_carried.is_empty() {
+                let approvals = supersession
+                    .reviews_not_carried
+                    .iter()
+                    .filter(|review| review.verdict == crate::candidate::ReviewVerdict::Approve)
+                    .map(|review| review.reviewer.as_str())
+                    .collect::<Vec<_>>();
+                println!(
+                    "  reviews not carried: {} total; {} approval(s) [{}]",
+                    supersession.reviews_not_carried.len(),
+                    approvals.len(),
+                    approvals.join(",")
+                );
+            }
+        }
+        if let Some(reconciliation) = &candidate.reconciled {
+            println!(
+                "  reconciliation: actor={} authority={} target={} oid={} evidence={}",
+                reconciliation.actor,
+                reconciliation.authority.as_str(),
+                reconciliation.target_ref,
+                reconciliation.target_oid,
+                reconciliation.evidence_id,
+            );
+            println!("  governance: formal review/authorization did not govern this landing");
+            if !reconciliation
+                .policy_snapshot
+                .pre_transition_landability
+                .reason_codes
+                .is_empty()
+            {
+                println!(
+                    "  preserved pre-transition blockers: {}",
+                    reconciliation
+                        .policy_snapshot
+                        .pre_transition_landability
+                        .reason_codes
+                        .join(",")
+                );
+            }
+        }
+        print_candidate_reason_groups(&landability.reasons);
     }
     Ok(())
+}
+
+fn print_candidate_reason_groups(reasons: &[crate::candidate::LandabilityReason]) {
+    for blocking in [true, false] {
+        for class in crate::candidate::LandabilityReasonClass::ALL {
+            let group = reasons
+                .iter()
+                .filter(|reason| reason.blocking == blocking && reason.class == class)
+                .collect::<Vec<_>>();
+            if group.is_empty() {
+                continue;
+            }
+            println!(
+                "  {} — {}:",
+                if blocking { "BLOCKED" } else { "INFORMATIONAL" },
+                class.as_str()
+            );
+            for reason in group {
+                if let Some(subject) = &reason.subject {
+                    println!("    {} [{}]: {}", reason.code, subject, reason.detail);
+                } else {
+                    println!("    {}: {}", reason.code, reason.detail);
+                }
+            }
+        }
+    }
 }
 
 fn publish_candidate_op(store: &Store, op: &op::Op) -> MoteResult<String> {
@@ -1576,20 +2248,23 @@ fn ancestry_outcome(
     if receipt.base_is_ancestor == Some(false) {
         crate::candidate::EvidenceOutcome::Fail
     } else if receipt.base_is_ancestor.is_none()
-        || receipt.candidate_relations.iter().any(|relation| {
-            matches!(
-                relation.relation,
-                crate::candidate::GitRelationKind::Unavailable
-                    | crate::candidate::GitRelationKind::Ambiguous
-            ) || matches!(
-                relation.base_relation,
-                None | Some(
+        || receipt.relation_schema >= crate::candidate::GIT_RELATION_SCHEMA_V2
+            && receipt.producer_snapshot.is_none()
+        || receipt.relation_schema < crate::candidate::GIT_RELATION_SCHEMA_V2
+            && receipt.candidate_relations.iter().any(|relation| {
+                matches!(
+                    relation.relation,
                     crate::candidate::GitRelationKind::Unavailable
                         | crate::candidate::GitRelationKind::Ambiguous
-                )
-            ) || relation.base_relation == Some(crate::candidate::GitRelationKind::Ancestor)
-                && relation.relation == crate::candidate::GitRelationKind::NotAncestor
-        })
+                ) || matches!(
+                    relation.base_relation,
+                    None | Some(
+                        crate::candidate::GitRelationKind::Unavailable
+                            | crate::candidate::GitRelationKind::Ambiguous
+                    )
+                ) || relation.base_relation == Some(crate::candidate::GitRelationKind::Ancestor)
+                    && relation.relation == crate::candidate::GitRelationKind::NotAncestor
+            })
     {
         crate::candidate::EvidenceOutcome::Ambiguous
     } else {
@@ -1620,6 +2295,7 @@ fn cmd_candidate(
                     "superseded" => Ok(crate::candidate::CandidatePhase::Superseded),
                     "abandoned" => Ok(crate::candidate::CandidatePhase::Abandoned),
                     "landed" => Ok(crate::candidate::CandidatePhase::Landed),
+                    "landed_out_of_band" => Ok(crate::candidate::CandidatePhase::LandedOutOfBand),
                     _ => Err(MoteError::Invalid(format!(
                         "invalid candidate phase `{value}`"
                     ))),
@@ -1650,8 +2326,11 @@ fn cmd_candidate(
             mut paths,
             authorizer,
             mut reviewers,
+            required_review_counts,
+            review_roles,
             requirements,
             evidence_refs,
+            object_source: object_source_locator,
             idempotency_key,
         } => {
             let actor = store.resolve_actor(actor_flag)?;
@@ -1672,6 +2351,16 @@ fn cmd_candidate(
                             actor.clone(),
                         ))
                     });
+            let had_initial_availability =
+                initial
+                    .candidates
+                    .get(&candidate_id)
+                    .is_some_and(|existing| {
+                        existing.evidence.contains_key(&(
+                            crate::candidate::GIT_OBJECT_AVAILABILITY_EVIDENCE.into(),
+                            actor.clone(),
+                        ))
+                    });
             paths = paths
                 .iter()
                 .map(|path| crate::paths::normalize(path).map_err(MoteError::Invalid))
@@ -1680,11 +2369,96 @@ fn cmd_candidate(
             paths.dedup();
             reviewers.sort();
             reviewers.dedup();
+            if required_review_counts.len() != review_roles.len() {
+                return Err(MoteError::Invalid(
+                    "each --require-reviews value must have one paired --from-role value".into(),
+                ));
+            }
+            let mut role_review_requirements = required_review_counts
+                .into_iter()
+                .zip(review_roles)
+                .map(|(required_approvals, role)| {
+                    if required_approvals == 0 {
+                        return Err(MoteError::Invalid(
+                            "--require-reviews must be positive".into(),
+                        ));
+                    }
+                    let role = initial.resolve_role(&role).ok_or_else(|| {
+                        MoteError::Invalid(format!("review role `{role}` does not exist"))
+                    })?;
+                    if required_approvals > role.capacity {
+                        return Err(MoteError::Invalid(format!(
+                            "review role `{}` has capacity {}, below required approval count {}",
+                            role.name, role.capacity, required_approvals
+                        )));
+                    }
+                    Ok(crate::candidate::RoleReviewRequirement {
+                        role_id: role.role_id.clone(),
+                        definition_op_id: role.definition_op_id.clone(),
+                        required_approvals,
+                    })
+                })
+                .collect::<MoteResult<Vec<_>>>()?;
+            role_review_requirements.sort_by(|left, right| left.role_id.cmp(&right.role_id));
+            if role_review_requirements
+                .windows(2)
+                .any(|pair| pair[0].role_id == pair[1].role_id)
+            {
+                return Err(MoteError::Invalid(
+                    "a candidate may declare each review role only once".into(),
+                ));
+            }
+            if reviewers.is_empty() && role_review_requirements.is_empty() {
+                return Err(MoteError::Invalid(
+                    "candidate requires at least one named reviewer or role review quorum".into(),
+                ));
+            }
+            let review_policy = crate::candidate::CandidateReviewPolicy {
+                named_reviewers: reviewers,
+                role_requirements: role_review_requirements,
+            };
+            if object_source_locator
+                .as_ref()
+                .is_some_and(|locator| locator.trim().is_empty())
+            {
+                return Err(MoteError::Invalid(
+                    "--object-source must be non-empty when supplied".into(),
+                ));
+            }
             let cwd = std::env::current_dir()?;
+            let landing_cwd = store_repository_cwd(&store)?;
+            let (landing_repository_id, landing_object_format, _) =
+                crate::candidate::repository_identity(&landing_cwd)
+                    .map_err(crate::candidate::git_probe_error)?;
             let mut known = known_candidates(&initial);
             known.retain(|candidate| candidate.candidate_id != candidate_id);
-            let receipt = crate::candidate::probe_ancestry(&cwd, &commit, &base, &known)
-                .map_err(crate::candidate::git_probe_error)?;
+            let mut receipt = crate::candidate::probe_ancestry_for_landing_repository(
+                &cwd,
+                &commit,
+                &base,
+                &known,
+                &landing_repository_id,
+            )
+            .map_err(crate::candidate::git_probe_error)?;
+            if receipt.object_format != landing_object_format {
+                return Err(MoteError::Invalid(format!(
+                    "proposal object format {} does not match landing repository format {}",
+                    receipt.object_format, landing_object_format
+                )));
+            }
+            receipt.producer_snapshot =
+                Some(Box::new(candidate_snapshot_provenance(&store, &initial)?));
+            let object_source = crate::candidate::CandidateObjectSource {
+                repository_id: receipt.repository_id.clone(),
+                commit_ref: commit.clone(),
+                locator: object_source_locator,
+            };
+            if receipt.repository_id != landing_repository_id && object_source.locator.is_none() {
+                eprintln!(
+                    "warning: proposal originates outside the shared landing repository; pass --object-source with a path or pushed ref so other actors can obtain {}",
+                    receipt.commit_oid
+                );
+            }
             let mut evidence_requirements = vec![crate::candidate::EvidenceRequirement {
                 name: crate::candidate::GIT_ANCESTRY_EVIDENCE.into(),
                 kind: "git".into(),
@@ -1696,7 +2470,7 @@ fn cmd_candidate(
             evidence_requirements
                 .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.kind.cmp(&b.kind)));
             let proposal = op::Op::CandidatePropose(op::CandidateProposeOp {
-                v: crate::candidate::CANDIDATE_PROTOCOL_VERSION,
+                v: crate::candidate::CANDIDATE_PORTABLE_PROTOCOL_VERSION,
                 op: String::new(),
                 ts: ids::format_rfc3339(Timestamp::now()),
                 actor: actor.clone(),
@@ -1704,44 +2478,73 @@ fn cmd_candidate(
                 entity: issue,
                 store_id: format.store_id,
                 repository_id: receipt.repository_id.clone(),
+                landing_repository_id: Some(landing_repository_id.clone()),
+                object_source: Some(object_source),
                 object_format: receipt.object_format.clone(),
                 commit_oid: receipt.commit_oid.clone(),
                 base_oid: receipt.base_oid.clone(),
                 parent_oids: receipt.parent_oids.clone(),
                 paths,
                 authorizer,
-                reviewers,
+                reviewers: Vec::new(),
+                review_policy: Some(review_policy),
                 evidence_requirements,
                 evidence_refs,
                 idempotency_key: idempotency_key.clone(),
             });
             publish_candidate_op(&store, &proposal)?;
-            if had_initial_ancestry {
-                let state = reducer::replay_store(&store)?;
-                print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
-                return Ok(0);
+            if !had_initial_ancestry {
+                let payload =
+                    crate::candidate::CandidateEvidencePayload::GitAncestry(receipt.clone());
+                let evidence = op::Op::CandidateEvidence(op::CandidateEvidenceOp {
+                    v: crate::candidate::CANDIDATE_PROTOCOL_VERSION,
+                    op: String::new(),
+                    ts: ids::format_rfc3339(Timestamp::now()),
+                    actor: actor.clone(),
+                    candidate_id: candidate_id.clone(),
+                    candidate_oid: receipt.commit_oid.clone(),
+                    evidence_id: crate::candidate::evidence_id(&payload)?,
+                    name: crate::candidate::GIT_ANCESTRY_EVIDENCE.into(),
+                    evidence_kind: "git".into(),
+                    producer_tool: receipt.git_version.clone(),
+                    outcome: ancestry_outcome(&receipt),
+                    payload,
+                    refs: Vec::new(),
+                    idempotency_key: format!(
+                        "initial-{}",
+                        blake3::hash(idempotency_key.as_bytes()).to_hex()
+                    ),
+                });
+                publish_candidate_op(&store, &evidence)?;
             }
-            let payload = crate::candidate::CandidateEvidencePayload::GitAncestry(receipt.clone());
-            let evidence = op::Op::CandidateEvidence(op::CandidateEvidenceOp {
-                v: crate::candidate::CANDIDATE_PROTOCOL_VERSION,
-                op: String::new(),
-                ts: ids::format_rfc3339(Timestamp::now()),
-                actor,
-                candidate_id: candidate_id.clone(),
-                candidate_oid: receipt.commit_oid.clone(),
-                evidence_id: crate::candidate::evidence_id(&payload)?,
-                name: crate::candidate::GIT_ANCESTRY_EVIDENCE.into(),
-                evidence_kind: "git".into(),
-                producer_tool: receipt.git_version.clone(),
-                outcome: ancestry_outcome(&receipt),
-                payload,
-                refs: Vec::new(),
-                idempotency_key: format!(
-                    "initial-{}",
+            if !had_initial_availability {
+                let availability_key = format!(
+                    "initial-object-{}",
                     blake3::hash(idempotency_key.as_bytes()).to_hex()
-                ),
-            });
-            publish_candidate_op(&store, &evidence)?;
+                );
+                let (availability, outcome, detail) = object_availability_evidence_op(
+                    &landing_cwd,
+                    actor,
+                    candidate_id.clone(),
+                    &landing_repository_id,
+                    &receipt.object_format,
+                    &receipt.commit_oid,
+                    &receipt.parent_oids,
+                    availability_key,
+                )?;
+                publish_candidate_op(&store, &availability)?;
+                if outcome != crate::candidate::EvidenceOutcome::Pass {
+                    eprintln!(
+                        "warning: candidate object {} is not readable from the shared landing repository {}{}",
+                        receipt.commit_oid,
+                        landing_repository_id,
+                        detail
+                            .as_deref()
+                            .map(|detail| format!(": {detail}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
             let state = reducer::replay_store(&store)?;
             print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
         }
@@ -1754,26 +2557,297 @@ fn cmd_candidate(
             body,
             evidence_refs,
             expect,
+            from_role,
             idempotency_key,
         } => {
             let actor = store.resolve_actor(actor_flag)?;
             let verdict = crate::candidate::ReviewVerdict::parse(&verdict).ok_or_else(|| {
                 MoteError::Invalid("verdict must be approve|block|comment".into())
             })?;
+            let state = reducer::replay_store(&store)?;
+            let resolved_role = from_role
+                .as_deref()
+                .map(|role| {
+                    state
+                        .resolve_role(role)
+                        .ok_or_else(|| {
+                            MoteError::Invalid(format!("review role `{role}` does not exist"))
+                        })
+                        .map(|role| role.role_id.clone())
+                })
+                .transpose()?;
+            if let Some(previous) = state
+                .candidate_idempotency
+                .get(&(actor.clone(), idempotency_key.clone()))
+            {
+                let bytes = fs::read(store.ops_dir().join(format!("{}.json", previous.op_id)))?;
+                let previous_op: op::Op = serde_json::from_slice(&bytes)?;
+                let same = matches!(
+                    previous_op,
+                    op::Op::CandidateReview(ref review)
+                        if review.candidate_id == candidate_id
+                            && review.verdict == verdict
+                            && review.body == body
+                            && review.evidence_refs == evidence_refs
+                            && review.expect_review == expect
+                            && match (&review.role, &resolved_role) {
+                                (None, None) => true,
+                                (Some(binding), Some(role_id)) => &binding.role_id == role_id,
+                                _ => false,
+                            }
+                );
+                if !same || previous.candidate_id != candidate_id {
+                    return Err(MoteError::Rejected(format!(
+                        "idempotency key already used by op {} for a different action",
+                        previous.op_id
+                    )));
+                }
+                let candidate = state.candidates.get(&candidate_id).ok_or_else(|| {
+                    MoteError::Invalid(format!("candidate `{candidate_id}` does not exist"))
+                })?;
+                print_candidate(&state, candidate, json_mode)?;
+                return Ok(0);
+            }
+            let now_ts = ids::format_rfc3339(Timestamp::now());
+            let role = if let Some(role_id) = resolved_role {
+                let assignments = state
+                    .role_active_assignments(&role_id, &now_ts)
+                    .into_iter()
+                    .filter(|assignment| assignment.holder_actor == actor)
+                    .collect::<Vec<_>>();
+                let [assignment] = assignments.as_slice() else {
+                    return Err(MoteError::Invalid(format!(
+                        "actor {actor} must have exactly one active assignment to role {role_id}"
+                    )));
+                };
+                if let Err((code, detail)) = state.candidate_role_review_eligibility(
+                    &candidate_id,
+                    &actor,
+                    &role_id,
+                    &assignment.assignment_id,
+                    &now_ts,
+                ) {
+                    return Err(MoteError::Invalid(format!(
+                        "role review ineligible ({code}): {detail}"
+                    )));
+                }
+                Some(crate::candidate::CandidateRoleReviewBinding {
+                    role_id,
+                    assignment_id: assignment.assignment_id.clone(),
+                    expect_assignment: assignment.clock_op_id.clone(),
+                })
+            } else {
+                None
+            };
             let candidate_id_for_op = candidate_id.clone();
             let mutation = op::Op::CandidateReview(op::CandidateReviewOp {
-                v: 1,
+                v: if role.is_some() {
+                    crate::candidate::CANDIDATE_ROLE_REVIEW_VERSION
+                } else {
+                    crate::candidate::CANDIDATE_PROTOCOL_VERSION
+                },
                 op: String::new(),
-                ts: ids::format_rfc3339(Timestamp::now()),
+                ts: now_ts,
                 actor,
                 candidate_id: candidate_id_for_op,
                 verdict,
                 body,
                 evidence_refs,
                 expect_review: expect,
+                role,
                 idempotency_key,
             });
             publish_candidate_op(&store, &mutation)?;
+            let state = reducer::replay_store(&store)?;
+            print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
+        CandidateCmd::AmendReviewers {
+            candidate_id,
+            mut reviewers,
+            expect_phase,
+            expect_review_policy,
+            reason,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            if !op::validate_idempotency_key(&idempotency_key) {
+                return Err(MoteError::Invalid("invalid idempotency key".into()));
+            }
+            reviewers.sort();
+            reviewers.dedup();
+            let state = reducer::replay_store(&store)?;
+            if let Some(previous) = state
+                .candidate_idempotency
+                .get(&(actor.clone(), idempotency_key.clone()))
+            {
+                let bytes = fs::read(store.ops_dir().join(format!("{}.json", previous.op_id)))?;
+                let previous_op: op::Op = serde_json::from_slice(&bytes)?;
+                let same = matches!(
+                    previous_op,
+                    op::Op::CandidateReviewPolicyAmend(ref amendment)
+                        if amendment.actor == actor
+                            && amendment.candidate_id == candidate_id
+                            && amendment.named_reviewers == reviewers
+                            && amendment.expect_phase == expect_phase
+                            && amendment.expect_review_policy == expect_review_policy
+                            && amendment.reason == reason
+                );
+                if !same || previous.candidate_id != candidate_id {
+                    return Err(MoteError::Rejected(format!(
+                        "idempotency key already used by op {} for a different action",
+                        previous.op_id
+                    )));
+                }
+                let candidate = state.candidates.get(&candidate_id).ok_or_else(|| {
+                    MoteError::Invalid(format!("candidate `{candidate_id}` does not exist"))
+                })?;
+                print_candidate(&state, candidate, json_mode)?;
+                return Ok(0);
+            }
+            let mutation = op::Op::CandidateReviewPolicyAmend(op::CandidateReviewPolicyAmendOp {
+                v: crate::candidate::CANDIDATE_PROTOCOL_VERSION,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                candidate_id: candidate_id.clone(),
+                named_reviewers: reviewers,
+                expect_phase,
+                expect_review_policy,
+                reason,
+                idempotency_key,
+            });
+            publish_candidate_op(&store, &mutation)?;
+            let state = reducer::replay_store(&store)?;
+            print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
+        CandidateCmd::BindLandingRepository {
+            candidate_id,
+            expect_phase,
+            expect_landing_repository,
+            object_source: object_source_locator,
+            reason,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            if !op::validate_idempotency_key(&idempotency_key) {
+                return Err(MoteError::Invalid("invalid idempotency key".into()));
+            }
+            if reason.trim().is_empty()
+                || object_source_locator
+                    .as_ref()
+                    .is_some_and(|locator| locator.trim().is_empty())
+            {
+                return Err(MoteError::Invalid(
+                    "binding requires a non-empty reason and non-empty --object-source when supplied"
+                        .into(),
+                ));
+            }
+            let repository_cwd = store_repository_cwd(&store)?;
+            let (landing_repository_id, landing_object_format, _) =
+                crate::candidate::repository_identity(&repository_cwd)
+                    .map_err(crate::candidate::git_probe_error)?;
+            let initial = reducer::replay_store(&store)?;
+            let candidate = initial.candidates.get(&candidate_id).ok_or_else(|| {
+                MoteError::Invalid(format!("candidate `{candidate_id}` does not exist"))
+            })?;
+            if candidate.object_format != landing_object_format {
+                return Err(MoteError::Invalid(format!(
+                    "candidate object format {} does not match shared repository format {}",
+                    candidate.object_format, landing_object_format
+                )));
+            }
+            let object_source = Some(crate::candidate::CandidateObjectSource {
+                repository_id: candidate.repository_id.clone(),
+                commit_ref: candidate
+                    .object_source
+                    .as_ref()
+                    .map(|source| source.commit_ref.clone())
+                    .unwrap_or_else(|| candidate.commit_oid.clone()),
+                locator: object_source_locator.or_else(|| {
+                    candidate
+                        .object_source
+                        .as_ref()
+                        .and_then(|source| source.locator.clone())
+                }),
+            });
+            let mut binding_already_published = false;
+            if let Some(previous) = initial
+                .candidate_idempotency
+                .get(&(actor.clone(), idempotency_key.clone()))
+            {
+                let bytes = fs::read(store.ops_dir().join(format!("{}.json", previous.op_id)))?;
+                let previous_op: op::Op = serde_json::from_slice(&bytes)?;
+                let same = matches!(
+                    previous_op,
+                    op::Op::CandidateLandingRepositoryBind(ref binding)
+                        if binding.actor == actor
+                            && binding.candidate_id == candidate_id
+                            && binding.landing_repository_id == landing_repository_id
+                            && binding.object_source == object_source
+                            && binding.expect_phase == expect_phase
+                            && binding.expect_landing_repository
+                                == expect_landing_repository
+                            && binding.reason == reason
+                );
+                if !same || previous.candidate_id != candidate_id {
+                    return Err(MoteError::Rejected(format!(
+                        "idempotency key already used by op {} for a different action",
+                        previous.op_id
+                    )));
+                }
+                binding_already_published = true;
+            }
+            if !binding_already_published {
+                let binding =
+                    op::Op::CandidateLandingRepositoryBind(op::CandidateLandingRepositoryBindOp {
+                        v: crate::candidate::CANDIDATE_PROTOCOL_VERSION,
+                        op: String::new(),
+                        ts: ids::format_rfc3339(Timestamp::now()),
+                        actor: actor.clone(),
+                        candidate_id: candidate_id.clone(),
+                        landing_repository_id: landing_repository_id.clone(),
+                        object_source,
+                        expect_phase,
+                        expect_landing_repository,
+                        reason,
+                        idempotency_key: idempotency_key.clone(),
+                    });
+                publish_candidate_op(&store, &binding)?;
+            }
+
+            let availability_key = format!(
+                "binding-object-{}",
+                blake3::hash(idempotency_key.as_bytes()).to_hex()
+            );
+            let current = reducer::replay_store(&store)?;
+            let candidate = &current.candidates[&candidate_id];
+            if !current
+                .candidate_idempotency
+                .contains_key(&(actor.clone(), availability_key.clone()))
+            {
+                let (availability, outcome, detail) = object_availability_evidence_op(
+                    &repository_cwd,
+                    actor,
+                    candidate_id.clone(),
+                    &candidate.landing_repository_id,
+                    &candidate.object_format,
+                    &candidate.commit_oid,
+                    &candidate.parent_oids,
+                    availability_key,
+                )?;
+                publish_candidate_op(&store, &availability)?;
+                if outcome != crate::candidate::EvidenceOutcome::Pass {
+                    eprintln!(
+                        "warning: candidate object {} is not readable from the shared landing repository {}{}",
+                        candidate.commit_oid,
+                        candidate.landing_repository_id,
+                        detail
+                            .as_deref()
+                            .map(|detail| format!(": {detail}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
             let state = reducer::replay_store(&store)?;
             print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
         }
@@ -1835,9 +2909,60 @@ fn cmd_candidate(
             candidate_id,
             successor_id,
             expect_phase,
+            containment_recovery,
             idempotency_key,
         } => {
             let actor = store.resolve_actor(actor_flag)?;
+            let recovery = if containment_recovery {
+                let state = reducer::replay_store(&store)?;
+                if let Some(previous) = state
+                    .candidate_idempotency
+                    .get(&(actor.clone(), idempotency_key.clone()))
+                {
+                    let bytes = fs::read(store.ops_dir().join(format!("{}.json", previous.op_id)))?;
+                    let previous_op: op::Op = serde_json::from_slice(&bytes)?;
+                    let same_recovery = matches!(
+                        previous_op,
+                        op::Op::CandidateSupersede(ref supersede)
+                            if supersede.actor == actor
+                                && supersede.candidate_id == candidate_id
+                                && supersede.successor_id == successor_id
+                                && supersede.expect_phase == expect_phase
+                                && supersede.recovery.is_some()
+                    );
+                    if !same_recovery || previous.candidate_id != candidate_id {
+                        return Err(MoteError::Rejected(format!(
+                            "idempotency key already used by op {} for a different action",
+                            previous.op_id
+                        )));
+                    }
+                    let candidate = state.candidates.get(&candidate_id).ok_or_else(|| {
+                        MoteError::Invalid(format!("candidate `{candidate_id}` does not exist"))
+                    })?;
+                    print_candidate(&state, candidate, json_mode)?;
+                    return Ok(0);
+                }
+                let successor = state.candidates.get(&successor_id).ok_or_else(|| {
+                    MoteError::Invalid(format!(
+                        "successor candidate `{successor_id}` does not exist"
+                    ))
+                })?;
+                let containment = state
+                    .candidate_containment_basis(&candidate_id, &successor_id)
+                    .ok_or_else(|| {
+                        MoteError::Invalid(
+                            "containment recovery is unavailable: publish complete exact pair ancestry evidence proving predecessor-to-successor containment"
+                                .into(),
+                        )
+                    })?;
+                Some(crate::candidate::CandidateSupersedeRecovery {
+                    authority: crate::candidate::CandidateSupersessionAuthority::SuccessorAuthorizerContainment,
+                    expect_successor_phase: successor.phase_op_id.clone(),
+                    containment_evidence_op_ids: containment.evidence_op_ids,
+                })
+            } else {
+                None
+            };
             let mutation = op::Op::CandidateSupersede(op::CandidateSupersedeOp {
                 v: 1,
                 op: String::new(),
@@ -1846,6 +2971,7 @@ fn cmd_candidate(
                 candidate_id: candidate_id.clone(),
                 successor_id,
                 expect_phase,
+                recovery,
                 idempotency_key,
             });
             publish_candidate_op(&store, &mutation)?;
@@ -1902,7 +3028,7 @@ fn cmd_candidate(
             basis.dedup();
             let receipt = crate::candidate::probe_landing(
                 &std::env::current_dir()?,
-                &candidate.repository_id,
+                &candidate.landing_repository_id,
                 &candidate.object_format,
                 &candidate.commit_oid,
                 &target,
@@ -1959,6 +3085,122 @@ fn cmd_candidate(
             let state = reducer::replay_store(&store)?;
             print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
         }
+        CandidateCmd::Reconcile {
+            candidate_id,
+            target,
+            expect_phase,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            if !op::validate_idempotency_key(&idempotency_key) {
+                return Err(MoteError::Invalid("invalid idempotency key".into()));
+            }
+            let initial = reducer::replay_store(&store)?;
+            if let Some(previous) = initial
+                .candidate_idempotency
+                .get(&(actor.clone(), idempotency_key.clone()))
+            {
+                let bytes = fs::read(store.ops_dir().join(format!("{}.json", previous.op_id)))?;
+                let previous_op: op::Op = serde_json::from_slice(&bytes)?;
+                let same_reconciliation = matches!(
+                    previous_op,
+                    op::Op::CandidateReconcile(ref reconcile)
+                        if reconcile.actor == actor
+                            && reconcile.candidate_id == candidate_id
+                            && reconcile.target_ref == target
+                            && reconcile.expect_phase == expect_phase
+                            && reconcile.authority
+                                == crate::candidate::CandidateReconciliationAuthority::ProposalAuthorizer
+                );
+                if !same_reconciliation || previous.candidate_id != candidate_id {
+                    return Err(MoteError::Rejected(format!(
+                        "idempotency key already used by op {} for a different action",
+                        previous.op_id
+                    )));
+                }
+                let candidate = initial.candidates.get(&candidate_id).ok_or_else(|| {
+                    MoteError::Invalid(format!("candidate `{candidate_id}` does not exist"))
+                })?;
+                print_candidate(&initial, candidate, json_mode)?;
+                return Ok(0);
+            }
+
+            let candidate = initial.candidates.get(&candidate_id).ok_or_else(|| {
+                MoteError::Invalid(format!("candidate `{candidate_id}` does not exist"))
+            })?;
+            if candidate.phase != crate::candidate::CandidatePhase::Pending
+                || candidate.phase_op_id != expect_phase
+            {
+                return Err(MoteError::Rejected(
+                    "out-of-band reconciliation requires the current pending phase CAS".into(),
+                ));
+            }
+            if candidate.authorizer != actor {
+                return Err(MoteError::Rejected(
+                    "only the proposal's immutable authorizer may reconcile an out-of-band landing"
+                        .into(),
+                ));
+            }
+            let candidate_oid = candidate.commit_oid.clone();
+            let receipt = crate::candidate::probe_reachability(
+                &std::env::current_dir()?,
+                &candidate.landing_repository_id,
+                &candidate.object_format,
+                &candidate.commit_oid,
+                &target,
+            )
+            .map_err(crate::candidate::git_probe_error)?;
+            let outcome = match receipt.candidate_reachable {
+                Some(true) => crate::candidate::EvidenceOutcome::Pass,
+                Some(false) => crate::candidate::EvidenceOutcome::Fail,
+                None => crate::candidate::EvidenceOutcome::Ambiguous,
+            };
+            let producer_tool = receipt.git_version.clone();
+            let payload = crate::candidate::CandidateEvidencePayload::GitReachability(receipt);
+            let evidence_id = crate::candidate::evidence_id(&payload)?;
+            let evidence = op::Op::CandidateEvidence(op::CandidateEvidenceOp {
+                v: crate::candidate::CANDIDATE_PROTOCOL_VERSION,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor: actor.clone(),
+                candidate_id: candidate_id.clone(),
+                candidate_oid,
+                evidence_id: evidence_id.clone(),
+                name: crate::candidate::GIT_REACHABILITY_EVIDENCE.into(),
+                evidence_kind: "git".into(),
+                producer_tool,
+                outcome,
+                payload,
+                refs: Vec::new(),
+                idempotency_key: format!(
+                    "reachability-evidence-{}",
+                    blake3::hash(idempotency_key.as_bytes()).to_hex()
+                ),
+            });
+            publish_candidate_op(&store, &evidence)?;
+
+            let current = reducer::replay_store(&store)?;
+            let reconcile_ts = ids::format_rfc3339(Timestamp::now());
+            let policy_snapshot = current
+                .candidate_policy_snapshot_at(&candidate_id, &reconcile_ts)
+                .expect("candidate existed before evidence publication");
+            let reconcile = op::Op::CandidateReconcile(op::CandidateReconcileOp {
+                v: crate::candidate::CANDIDATE_PROTOCOL_VERSION,
+                op: String::new(),
+                ts: reconcile_ts,
+                actor,
+                candidate_id: candidate_id.clone(),
+                evidence_id,
+                target_ref: target,
+                expect_phase,
+                authority: crate::candidate::CandidateReconciliationAuthority::ProposalAuthorizer,
+                policy_snapshot,
+                idempotency_key,
+            });
+            publish_candidate_op(&store, &reconcile)?;
+            let state = reducer::replay_store(&store)?;
+            print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
     }
     Ok(0)
 }
@@ -1973,12 +3215,68 @@ fn cmd_candidate_evidence(
     let state = reducer::replay_store(store)?;
     let candidate_id = match &cmd {
         CandidateEvidenceCmd::Refresh { candidate_id, .. }
+        | CandidateEvidenceCmd::Availability { candidate_id, .. }
         | CandidateEvidenceCmd::Record { candidate_id, .. } => candidate_id.clone(),
     };
     let candidate = state
         .candidates
         .get(&candidate_id)
         .ok_or_else(|| MoteError::Invalid(format!("candidate `{candidate_id}` does not exist")))?;
+
+    if let CandidateEvidenceCmd::Refresh {
+        idempotency_key, ..
+    }
+    | CandidateEvidenceCmd::Availability {
+        idempotency_key, ..
+    } = &cmd
+    {
+        if !op::validate_idempotency_key(idempotency_key) {
+            return Err(MoteError::Invalid("invalid idempotency key".into()));
+        }
+        if let Some(previous) = state
+            .candidate_idempotency
+            .get(&(actor.clone(), idempotency_key.clone()))
+        {
+            let bytes = fs::read(store.ops_dir().join(format!("{}.json", previous.op_id)))?;
+            let previous_op: op::Op = serde_json::from_slice(&bytes)?;
+            let same_refresh = match &cmd {
+                CandidateEvidenceCmd::Refresh { .. } => matches!(
+                    previous_op,
+                    op::Op::CandidateEvidence(ref evidence)
+                        if evidence.actor == actor
+                            && evidence.candidate_id == candidate_id
+                            && evidence.name == crate::candidate::GIT_ANCESTRY_EVIDENCE
+                            && evidence.evidence_kind == "git"
+                            && matches!(
+                                &evidence.payload,
+                                crate::candidate::CandidateEvidencePayload::GitAncestry(_)
+                            )
+                ),
+                CandidateEvidenceCmd::Availability { .. } => matches!(
+                    previous_op,
+                    op::Op::CandidateEvidence(ref evidence)
+                        if evidence.actor == actor
+                            && evidence.candidate_id == candidate_id
+                            && evidence.name
+                                == crate::candidate::GIT_OBJECT_AVAILABILITY_EVIDENCE
+                            && evidence.evidence_kind == "git"
+                            && matches!(
+                                &evidence.payload,
+                                crate::candidate::CandidateEvidencePayload::GitObjectAvailability(_)
+                            )
+                ),
+                CandidateEvidenceCmd::Record { .. } => false,
+            };
+            if !same_refresh || previous.candidate_id != candidate_id {
+                return Err(MoteError::Rejected(format!(
+                    "idempotency key already used by op {} for a different action",
+                    previous.op_id
+                )));
+            }
+            print_candidate(&state, candidate, json_mode)?;
+            return Ok(0);
+        }
+    }
 
     let mutation = match cmd {
         CandidateEvidenceCmd::Refresh {
@@ -1987,14 +3285,17 @@ fn cmd_candidate_evidence(
         } => {
             let mut known = known_candidates(&state);
             known.retain(|known| known.candidate_id != candidate.candidate_id);
-            let probe = crate::candidate::probe_ancestry(
+            let producer_snapshot = candidate_snapshot_provenance(store, &state)?;
+            let probe = crate::candidate::probe_ancestry_for_landing_repository(
                 &std::env::current_dir()?,
                 &candidate.commit_oid,
                 &candidate.base_oid,
                 &known,
+                &candidate.landing_repository_id,
             );
             let (receipt, outcome) = match probe {
-                Ok(receipt) => {
+                Ok(mut receipt) => {
+                    receipt.producer_snapshot = Some(Box::new(producer_snapshot.clone()));
                     let outcome = ancestry_outcome(&receipt);
                     (receipt, outcome)
                 }
@@ -2003,20 +3304,29 @@ fn cmd_candidate_evidence(
                     let mut covered_candidates = Vec::new();
                     for other in state.candidates.values().filter(|other| {
                         other.candidate_id != candidate.candidate_id
-                            && other.repository_id == candidate.repository_id
+                            && other.landing_repository_id == candidate.landing_repository_id
+                            && other.object_format == candidate.object_format
                     }) {
                         candidate_relations.push(crate::candidate::GitCandidateRelation {
                             candidate_id: other.candidate_id.clone(),
                             proposal_op_id: other.proposal_op_id.clone(),
                             commit_oid: other.commit_oid.clone(),
+                            base_oid: Some(other.base_oid.clone()),
                             base_relation: Some(crate::candidate::GitRelationKind::Unavailable),
                             relation: crate::candidate::GitRelationKind::Unavailable,
+                            subject_to_known_base: Some(
+                                crate::candidate::GitRelationKind::Unavailable,
+                            ),
+                            subject_to_known_tip: Some(
+                                crate::candidate::GitRelationKind::Unavailable,
+                            ),
                         });
                         covered_candidates
                             .push((other.candidate_id.clone(), other.proposal_op_id.clone()));
                     }
                     (
                         crate::candidate::GitAncestryReceipt {
+                            relation_schema: crate::candidate::GIT_RELATION_SCHEMA_V2,
                             repository_id: candidate.repository_id.clone(),
                             object_format: candidate.object_format.clone(),
                             common_dir_hash: String::new(),
@@ -2026,6 +3336,7 @@ fn cmd_candidate_evidence(
                             base_is_ancestor: None,
                             candidate_relations,
                             covered_candidates,
+                            producer_snapshot: Some(Box::new(producer_snapshot)),
                             git_version: "unavailable".into(),
                             detail: Some(error),
                         },
@@ -2055,6 +3366,34 @@ fn cmd_candidate_evidence(
                 refs: Vec::new(),
                 idempotency_key,
             })
+        }
+        CandidateEvidenceCmd::Availability {
+            candidate_id,
+            idempotency_key,
+        } => {
+            let repository_cwd = store_repository_cwd(store)?;
+            let (operation, outcome, detail) = object_availability_evidence_op(
+                &repository_cwd,
+                actor,
+                candidate_id,
+                &candidate.landing_repository_id,
+                &candidate.object_format,
+                &candidate.commit_oid,
+                &candidate.parent_oids,
+                idempotency_key,
+            )?;
+            if outcome != crate::candidate::EvidenceOutcome::Pass {
+                eprintln!(
+                    "warning: candidate object {} is not readable from the shared landing repository {}{}",
+                    candidate.commit_oid,
+                    candidate.landing_repository_id,
+                    detail
+                        .as_deref()
+                        .map(|detail| format!(": {detail}"))
+                        .unwrap_or_default()
+                );
+            }
+            operation
         }
         CandidateEvidenceCmd::Record {
             candidate_id,
@@ -4363,7 +5702,7 @@ fn cmd_discuss(
             if let Some(limit) = limit {
                 posts = limit_board_posts_preserving_stickies(posts, limit);
             }
-            print_board_posts(posts, json_mode)
+            print_board_posts(&state, posts, json_mode)
         }
         DiscussCmd::Unread {
             topic,
@@ -4461,14 +5800,14 @@ fn cmd_discuss(
             if !state.board_posts.contains_key(&post_id) {
                 return Err(MoteError::Invalid(format!("no such post {post_id}")));
             }
-            print_board_posts(state.replies_to(&post_id), json_mode)
+            print_board_posts(&state, state.replies_to(&post_id), json_mode)
         }
         DiscussCmd::Thread { post_id } => {
             let state = reducer::replay_store(&store)?;
             if !state.board_posts.contains_key(&post_id) {
                 return Err(MoteError::Invalid(format!("no such post {post_id}")));
             }
-            print_thread_posts(state.thread_posts(&post_id), json_mode)
+            print_thread_posts(&state, state.thread_posts(&post_id), json_mode)
         }
         DiscussCmd::Topic { cmd } => match cmd {
             DiscussTopicCmd::New {
@@ -4620,7 +5959,7 @@ fn cmd_discuss(
         }
         DiscussCmd::Topics => {
             let state = reducer::replay_store(&store)?;
-            print_discussion_topics(state.board_topics_by_activity(), json_mode)
+            print_discussion_topics(&state, state.board_topics_by_activity(), json_mode)
         }
         DiscussCmd::Decision {
             topic,
@@ -4653,6 +5992,33 @@ fn cmd_discuss(
             }
             Ok(code)
         }
+        DiscussCmd::Decide {
+            topic,
+            show,
+            agreed_post_ids,
+            open_questions,
+            references,
+            issues,
+            body,
+            text,
+            notify,
+            idempotency_key,
+        } => cmd_discuss_decide(
+            &store,
+            actor_flag,
+            json_mode,
+            topic,
+            show,
+            agreed_post_ids,
+            open_questions,
+            references,
+            issues,
+            body,
+            text,
+            notify,
+            idempotency_key,
+        ),
+        DiscussCmd::Question { cmd } => cmd_discuss_question(&store, actor_flag, json_mode, cmd),
         DiscussCmd::Summary {
             topic,
             body,
@@ -4801,8 +6167,8 @@ fn cmd_discuss(
             let topics = state.unrouted_topics(normalized_topic.as_deref());
             if json_mode {
                 let v = serde_json::json!({
-                    "topics": topics.iter().map(|t| topic_json(t)).collect::<Vec<_>>(),
-                    "posts": posts.iter().map(|p| board_post_json(p)).collect::<Vec<_>>(),
+                    "topics": topics.iter().map(|t| topic_json(&state, t)).collect::<Vec<_>>(),
+                    "posts": posts.iter().map(|p| board_post_json_with_state(&state, p)).collect::<Vec<_>>(),
                 });
                 println!("{}", serde_json::to_string(&v)?);
             } else {
@@ -4926,6 +6292,7 @@ fn print_discussion_attention_page(
         }
     }
     print_unread_board_posts(
+        &state,
         posts,
         &all_posts,
         UnreadPageMeta {
@@ -5224,6 +6591,773 @@ fn print_route_result(
     Ok(())
 }
 
+fn parse_discussion_reference(raw: &str) -> MoteResult<crate::op::DiscussionReference> {
+    let (kind, target) = raw.split_once(':').ok_or_else(|| {
+        MoteError::Invalid(format!(
+            "discussion reference `{raw}` must use topic:, post:, issue:, candidate:, or url:"
+        ))
+    })?;
+    if target.is_empty() || target.trim() != target {
+        return Err(MoteError::Invalid(format!(
+            "discussion reference `{raw}` has an empty or untrimmed target"
+        )));
+    }
+    match kind {
+        "topic" => Ok(crate::op::DiscussionReference::Topic {
+            topic: normalize_discussion_topic(target)?,
+        }),
+        "post" => Ok(crate::op::DiscussionReference::Post {
+            post_id: target.to_string(),
+        }),
+        "issue" => Ok(crate::op::DiscussionReference::Issue {
+            issue_id: target.to_string(),
+        }),
+        "candidate" => Ok(crate::op::DiscussionReference::Candidate {
+            candidate_id: target.to_string(),
+        }),
+        "url" => Ok(crate::op::DiscussionReference::Url {
+            url: target.to_string(),
+        }),
+        _ => Err(MoteError::Invalid(format!(
+            "unknown discussion reference kind `{kind}`"
+        ))),
+    }
+}
+
+fn resolve_decision_body(text: Option<String>, body: Option<String>) -> MoteResult<String> {
+    let value = match (text, body) {
+        (Some(_), Some(_)) => {
+            return Err(MoteError::Invalid(
+                "provide decision context either positionally or with --body, not both".into(),
+            ));
+        }
+        (Some(text), None) => text,
+        (None, Some(body)) => TextInput::option(body).read()?,
+        (None, None) => "Cited decision record".into(),
+    };
+    if value.trim().is_empty() {
+        return Err(MoteError::Invalid(
+            "decision context must be non-empty when supplied".into(),
+        ));
+    }
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_discuss_decide(
+    store: &Store,
+    actor_flag: Option<&str>,
+    json_mode: bool,
+    topic: String,
+    show: bool,
+    mut agreed_post_ids: Vec<String>,
+    open_questions: Vec<String>,
+    raw_references: Vec<String>,
+    issues: Vec<String>,
+    body: Option<String>,
+    text: Option<String>,
+    notify: Vec<String>,
+    idempotency_key: Option<String>,
+) -> MoteResult<i32> {
+    let topic = normalize_discussion_topic(&topic)?;
+    if show {
+        if !agreed_post_ids.is_empty()
+            || !open_questions.is_empty()
+            || !raw_references.is_empty()
+            || !issues.is_empty()
+            || body.is_some()
+            || text.is_some()
+            || !notify.is_empty()
+            || idempotency_key.is_some()
+        {
+            return Err(MoteError::Invalid(
+                "--show cannot be combined with decision creation options".into(),
+            ));
+        }
+        let state = reducer::replay_store(store)?;
+        return print_topic_decisions(&state, &topic, json_mode);
+    }
+    if agreed_post_ids.is_empty() {
+        return Err(MoteError::Invalid(
+            "a cited decision requires at least one --agreed post".into(),
+        ));
+    }
+    let actor = store.resolve_actor(actor_flag)?;
+    let body = resolve_decision_body(text, body)?;
+    agreed_post_ids.sort();
+    agreed_post_ids.dedup();
+
+    let mut references = raw_references
+        .iter()
+        .map(|reference| parse_discussion_reference(reference))
+        .collect::<MoteResult<Vec<_>>>()?;
+    references.extend(
+        issues
+            .into_iter()
+            .map(|issue_id| crate::op::DiscussionReference::Issue { issue_id }),
+    );
+    references.sort();
+    references.dedup();
+
+    let question_texts = open_questions
+        .into_iter()
+        .map(|question| {
+            let question = question.trim().to_string();
+            if question.is_empty()
+                || question
+                    .chars()
+                    .any(|character| matches!(character, '\0' | '\n' | '\r'))
+            {
+                Err(MoteError::Invalid(
+                    "--open question text must be non-empty and single-line".into(),
+                ))
+            } else {
+                Ok(question)
+            }
+        })
+        .collect::<MoteResult<Vec<_>>>()?;
+    let expected_notify = normalize_notification_recipients(&actor, &notify)?;
+    if let Some(key) = idempotency_key.as_deref() {
+        if !op::validate_idempotency_key(key) {
+            return Err(MoteError::Invalid(
+                "--idempotency-key must be 1..=128 trimmed printable characters".into(),
+            ));
+        }
+    }
+    let state = reducer::replay_store(store)?;
+    if !state.board_topics.contains_key(&topic) {
+        return Err(MoteError::Invalid(format!(
+            "discussion topic {topic} does not exist"
+        )));
+    }
+    if let Some(key) = idempotency_key.as_deref() {
+        if let Some(existing) = state.board_post_by_idempotency(&actor, key) {
+            if structured_decision_matches(
+                &state,
+                existing,
+                &topic,
+                &body,
+                &agreed_post_ids,
+                &references,
+                &question_texts,
+                &expected_notify,
+            ) {
+                print_structured_decision_result(&state, &existing.post_id, json_mode, true)?;
+                return Ok(0);
+            }
+            return Err(MoteError::Invalid(format!(
+                "idempotency key `{key}` is already used by {} with different decision content",
+                existing.post_id
+            )));
+        }
+    }
+
+    let format = store.read_format()?;
+    let post_id = idempotency_key
+        .as_deref()
+        .map(|key| ids::decision_post_id_for_retry(&format.store_id, &actor, key))
+        .unwrap_or_else(ids::new_post_id);
+    let open_questions = question_texts
+        .iter()
+        .enumerate()
+        .map(|(position, text)| crate::op::DecisionQuestionDraft {
+            question_id: idempotency_key
+                .as_deref()
+                .map(|key| {
+                    ids::decision_question_id_for_retry(&format.store_id, &actor, key, position)
+                })
+                .unwrap_or_else(ids::new_question_id),
+            text: text.clone(),
+        })
+        .collect::<Vec<_>>();
+    let decision = op::Op::BoardDecision(op::BoardDecisionOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(Timestamp::now()),
+        actor: actor.clone(),
+        post_id: post_id.clone(),
+        topic: topic.clone(),
+        body: body.clone(),
+        agreed_post_ids: agreed_post_ids.clone(),
+        references: references.clone(),
+        open_questions,
+        notify,
+        idempotency_key: idempotency_key.clone(),
+    });
+    let name = publish::publish_op(store, &decision)?;
+    let state = reducer::replay_store(store)?;
+    if !state.was_accepted(name.as_str()) {
+        if let Some(key) = idempotency_key.as_deref() {
+            if let Some(existing) = state.board_post_by_idempotency(&actor, key) {
+                if structured_decision_matches(
+                    &state,
+                    existing,
+                    &topic,
+                    &body,
+                    &agreed_post_ids,
+                    &references,
+                    &question_texts,
+                    &expected_notify,
+                ) {
+                    print_structured_decision_result(&state, &existing.post_id, json_mode, true)?;
+                    return Ok(0);
+                }
+            }
+        }
+        eprintln!(
+            "rejected: {}",
+            state
+                .rejection_reason(name.as_str())
+                .unwrap_or_else(|| "unknown".into())
+        );
+        return Ok(2);
+    }
+    print_structured_decision_result(&state, &post_id, json_mode, false)?;
+    Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn structured_decision_matches(
+    state: &crate::state::State,
+    post: &crate::state::BoardPostRecord,
+    topic: &str,
+    body: &str,
+    agreed_post_ids: &[String],
+    references: &[crate::op::DiscussionReference],
+    question_texts: &[String],
+    expected_notify: &[String],
+) -> bool {
+    let Some(decision) = state.board_decisions.get(&post.post_id) else {
+        return false;
+    };
+    let existing_question_texts = decision
+        .question_ids
+        .iter()
+        .filter_map(|question_id| state.board_questions.get(question_id))
+        .map(|question| question.text.as_str())
+        .collect::<Vec<_>>();
+    post.topic == topic
+        && post.body == body
+        && post.explicit_notify == expected_notify
+        && decision.agreed_post_ids == agreed_post_ids
+        && decision.references == references
+        && existing_question_texts == question_texts
+}
+
+pub(crate) fn decision_question_json(
+    question: &crate::state::DecisionQuestionRecord,
+) -> serde_json::Value {
+    let answers = question
+        .transitions
+        .iter()
+        .filter(|transition| transition.action == crate::op::DecisionQuestionAction::Answer)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "question_id": question.question_id,
+        "decision_id": question.decision_id,
+        "topic": question.topic,
+        "text": question.text,
+        "opened_by": question.opened_by,
+        "opened_op_id": question.opened_op_id,
+        "opened_ts": question.opened_ts,
+        "position": question.position,
+        "status": question.status,
+        "unresolved": question.status.unresolved(),
+        "clock_op_id": question.clock_op_id,
+        "successor_question_id": question.successor_question_id,
+        "answer_count": answers.len(),
+        "candidate_answers": answers,
+        "transitions": question.transitions,
+    })
+}
+
+pub(crate) fn structured_decision_json(
+    state: &crate::state::State,
+    decision: &crate::state::BoardDecisionRecord,
+) -> serde_json::Value {
+    let post = state
+        .board_posts
+        .get(&decision.post_id)
+        .expect("decision references a missing post");
+    let agreed = decision
+        .agreed_post_ids
+        .iter()
+        .filter_map(|post_id| state.board_posts.get(post_id))
+        .map(|post| {
+            serde_json::json!({
+                "post_id": post.post_id,
+                "from": post.from,
+                "body": post.body,
+                "disposition": post.disposition(),
+                "sent_op_id": post.sent_op_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let questions = state
+        .board_questions_for_decision(&decision.decision_id)
+        .into_iter()
+        .map(decision_question_json)
+        .collect::<Vec<_>>();
+    let resolved_references = decision
+        .references
+        .iter()
+        .map(|reference| resolved_discussion_reference_json(state, reference))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "decision_id": decision.decision_id,
+        "post": board_post_json(post),
+        "agreed": agreed,
+        "agreed_post_ids": decision.agreed_post_ids,
+        "references": decision.references,
+        "resolved_references": resolved_references,
+        "questions": questions,
+        "actor": decision.actor,
+        "op_id": decision.op_id,
+        "ts": decision.ts,
+    })
+}
+
+fn resolved_discussion_reference_json(
+    state: &crate::state::State,
+    reference: &crate::op::DiscussionReference,
+) -> serde_json::Value {
+    match reference {
+        crate::op::DiscussionReference::Topic { topic } => {
+            let record = state.board_topics.get(topic);
+            serde_json::json!({
+                "reference": reference,
+                "exists": record.is_some(),
+                "disposition": record.map_or("missing", |_| "active"),
+                "title": record.map(|record| record.title.as_str()),
+                "route_state": record.map(|record| record.route.state.as_str()),
+            })
+        }
+        crate::op::DiscussionReference::Post { post_id } => {
+            let post = state.board_posts.get(post_id);
+            serde_json::json!({
+                "reference": reference,
+                "exists": post.is_some(),
+                "disposition": post.map_or("missing", |post| post.disposition()),
+                "topic": post.map(|post| post.topic.as_str()),
+                "from": post.map(|post| post.from.as_str()),
+                "body": post.map(|post| post.body.as_str()),
+            })
+        }
+        crate::op::DiscussionReference::Issue { issue_id } => {
+            let issue = state.beads.get(issue_id);
+            serde_json::json!({
+                "reference": reference,
+                "exists": issue.is_some(),
+                "disposition": issue.map_or("missing", |issue| if issue.is_deleted() { "deleted" } else { "active" }),
+                "title": issue.map(|issue| issue.title.as_str()),
+                "status": issue.map(|issue| issue.status.as_str()),
+            })
+        }
+        crate::op::DiscussionReference::Candidate { candidate_id } => {
+            let candidate = state.candidates.get(candidate_id);
+            serde_json::json!({
+                "reference": reference,
+                "exists": candidate.is_some(),
+                "disposition": candidate.map_or("missing", |candidate| candidate.phase.as_str()),
+                "issue": candidate.map(|candidate| candidate.entity.as_str()),
+                "commit_oid": candidate.map(|candidate| candidate.commit_oid.as_str()),
+            })
+        }
+        crate::op::DiscussionReference::Url { url } => serde_json::json!({
+            "reference": reference,
+            "exists": null,
+            "disposition": "external_unverified",
+            "url": url,
+        }),
+    }
+}
+
+pub(crate) fn discussion_decisions_json(
+    state: &crate::state::State,
+    topic: Option<&str>,
+) -> serde_json::Value {
+    let decisions = match topic {
+        Some(topic) => state.board_decisions_for_topic(topic),
+        None => {
+            let mut decisions = state.board_decisions.values().collect::<Vec<_>>();
+            decisions.sort_by(|left, right| {
+                left.op_id
+                    .cmp(&right.op_id)
+                    .then_with(|| left.decision_id.cmp(&right.decision_id))
+            });
+            decisions
+        }
+    };
+    let counts = state.board_question_counts(topic);
+    let legacy_decision_count = match topic {
+        Some(topic) => state
+            .board_topics
+            .get(topic)
+            .map(|record| record.decision_count.saturating_sub(decisions.len()))
+            .unwrap_or(0),
+        None => state
+            .board_topics
+            .values()
+            .map(|record| record.decision_count)
+            .sum::<usize>()
+            .saturating_sub(decisions.len()),
+    };
+    serde_json::json!({
+        "structured_decision_count": decisions.len(),
+        "legacy_decision_count": legacy_decision_count,
+        "question_count": counts.total,
+        "open_question_count": counts.open,
+        "deferred_question_count": counts.deferred,
+        "superseded_question_count": counts.superseded,
+        "closed_question_count": counts.closed,
+        "unresolved_question_count": counts.unresolved,
+        "decisions": decisions.into_iter().map(|decision| structured_decision_json(state, decision)).collect::<Vec<_>>(),
+    })
+}
+
+fn print_structured_decision_result(
+    state: &crate::state::State,
+    decision_id: &str,
+    json_mode: bool,
+    idempotent_retry: bool,
+) -> MoteResult<()> {
+    let decision = state
+        .board_decisions
+        .get(decision_id)
+        .expect("accepted structured decision is absent from state");
+    if json_mode {
+        let mut value = structured_decision_json(state, decision);
+        value["idempotent_retry"] = serde_json::json!(idempotent_retry);
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        println!("{}", decision.decision_id);
+        eprintln!(
+            "recorded cited decision in topic {} agreements={} questions={}{}",
+            decision.topic,
+            decision.agreed_post_ids.len(),
+            decision.question_ids.len(),
+            if idempotent_retry {
+                " idempotent-retry=true"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+fn print_topic_decisions(
+    state: &crate::state::State,
+    topic: &str,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    let Some(topic_record) = state.board_topics.get(topic) else {
+        return Err(MoteError::Invalid(format!(
+            "no such discussion topic {topic}"
+        )));
+    };
+    let decisions = state.board_decisions_for_topic(topic);
+    let counts = state.board_question_counts(Some(topic));
+    if json_mode {
+        let mut value = discussion_decisions_json(state, Some(topic));
+        value["topic"] = serde_json::json!(topic);
+        value["decision_count"] = serde_json::json!(topic_record.decision_count);
+        println!("{}", serde_json::to_string(&value)?);
+        return Ok(0);
+    }
+    println!(
+        "topic {topic}: decisions={} structured={} unresolved={} (open={} deferred={})",
+        topic_record.decision_count,
+        decisions.len(),
+        counts.unresolved,
+        counts.open,
+        counts.deferred,
+    );
+    for decision in decisions {
+        let post = &state.board_posts[&decision.post_id];
+        println!(
+            "\nDECISION {}  {}  by {}",
+            decision.decision_id, decision.ts, decision.actor
+        );
+        println!("{}", post.body);
+        println!("AGREED — cited posts:");
+        for agreed_id in &decision.agreed_post_ids {
+            let agreed = &state.board_posts[agreed_id];
+            println!(
+                "  {}  from={}  status={}  {}",
+                agreed.post_id,
+                agreed.from,
+                agreed.disposition(),
+                agreed.body.replace('\n', " ")
+            );
+        }
+        if !decision.references.is_empty() {
+            println!("REFERENCES:");
+            for reference in &decision.references {
+                println!("  {}", serde_json::to_string(reference)?);
+            }
+        }
+        for question in state.board_questions_for_decision(&decision.decision_id) {
+            let answer_count = question
+                .transitions
+                .iter()
+                .filter(|transition| transition.action == crate::op::DecisionQuestionAction::Answer)
+                .count();
+            println!(
+                "QUESTION [{}] {}  answers={}  clock={}",
+                question.status.as_str().to_ascii_uppercase(),
+                question.question_id,
+                answer_count,
+                question.clock_op_id
+            );
+            println!("  {}", question.text);
+        }
+    }
+    Ok(0)
+}
+
+fn question_transition_matches(
+    question_id: &str,
+    transition: &crate::state::DecisionQuestionTransitionRecord,
+    action: crate::op::DecisionQuestionAction,
+    expect: &str,
+    references: &[crate::op::DiscussionReference],
+    note: Option<&str>,
+    successor_question_id: Option<&str>,
+) -> bool {
+    let _ = question_id;
+    transition.action == action
+        && transition.expect_question == expect
+        && transition.references == references
+        && transition.note.as_deref() == note
+        && transition.successor_question_id.as_deref() == successor_question_id
+}
+
+fn print_question_result(
+    question: &crate::state::DecisionQuestionRecord,
+    json_mode: bool,
+    idempotent_retry: bool,
+) -> MoteResult<()> {
+    if json_mode {
+        let mut value = decision_question_json(question);
+        value["idempotent_retry"] = serde_json::json!(idempotent_retry);
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        println!("{}", question.question_id);
+        eprintln!(
+            "question status={} answers={} clock={}{}",
+            question.status.as_str(),
+            question
+                .transitions
+                .iter()
+                .filter(|transition| transition.action == crate::op::DecisionQuestionAction::Answer)
+                .count(),
+            question.clock_op_id,
+            if idempotent_retry {
+                " idempotent-retry=true"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_question_transition(
+    store: &Store,
+    actor: String,
+    json_mode: bool,
+    question_id: String,
+    action: crate::op::DecisionQuestionAction,
+    expect: String,
+    mut references: Vec<crate::op::DiscussionReference>,
+    note: Option<String>,
+    successor_question_id: Option<String>,
+    idempotency_key: String,
+) -> MoteResult<i32> {
+    if !op::validate_idempotency_key(&idempotency_key) {
+        return Err(MoteError::Invalid(
+            "--idempotency-key must be 1..=128 trimmed printable characters".into(),
+        ));
+    }
+    references.sort();
+    references.dedup();
+    let state = reducer::replay_store(store)?;
+    if let Some((existing_question, transition)) =
+        state.board_question_transition_by_idempotency(&actor, &idempotency_key)
+    {
+        if existing_question.question_id == question_id
+            && question_transition_matches(
+                &question_id,
+                transition,
+                action,
+                &expect,
+                &references,
+                note.as_deref(),
+                successor_question_id.as_deref(),
+            )
+        {
+            print_question_result(existing_question, json_mode, true)?;
+            return Ok(0);
+        }
+        return Err(MoteError::Invalid(format!(
+            "idempotency key `{idempotency_key}` is already used by op {} for a different question action",
+            transition.op_id
+        )));
+    }
+    let operation = op::Op::BoardQuestion(op::BoardQuestionOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(Timestamp::now()),
+        actor: actor.clone(),
+        question_id: question_id.clone(),
+        action,
+        expect_question: expect.clone(),
+        references: references.clone(),
+        note: note.clone(),
+        successor_question_id: successor_question_id.clone(),
+        idempotency_key: Some(idempotency_key.clone()),
+    });
+    let name = publish::publish_op(store, &operation)?;
+    let state = reducer::replay_store(store)?;
+    if !state.was_accepted(name.as_str()) {
+        if let Some((existing_question, transition)) =
+            state.board_question_transition_by_idempotency(&actor, &idempotency_key)
+        {
+            if existing_question.question_id == question_id
+                && question_transition_matches(
+                    &question_id,
+                    transition,
+                    action,
+                    &expect,
+                    &references,
+                    note.as_deref(),
+                    successor_question_id.as_deref(),
+                )
+            {
+                print_question_result(existing_question, json_mode, true)?;
+                return Ok(0);
+            }
+        }
+        eprintln!(
+            "rejected: {}",
+            state
+                .rejection_reason(name.as_str())
+                .unwrap_or_else(|| "unknown".into())
+        );
+        return Ok(2);
+    }
+    print_question_result(&state.board_questions[&question_id], json_mode, false)?;
+    Ok(0)
+}
+
+fn cmd_discuss_question(
+    store: &Store,
+    actor_flag: Option<&str>,
+    json_mode: bool,
+    cmd: DiscussQuestionCmd,
+) -> MoteResult<i32> {
+    if let DiscussQuestionCmd::Show { question_id } = &cmd {
+        let state = reducer::replay_store(store)?;
+        let question = state.board_questions.get(question_id).ok_or_else(|| {
+            MoteError::Invalid(format!("decision question {question_id} does not exist"))
+        })?;
+        print_question_result(question, json_mode, false)?;
+        return Ok(0);
+    }
+    let actor = store.resolve_actor(actor_flag)?;
+    match cmd {
+        DiscussQuestionCmd::Show { .. } => unreachable!(),
+        DiscussQuestionCmd::Answer {
+            question_id,
+            posts,
+            references,
+            note,
+            expect,
+            idempotency_key,
+        } => {
+            let mut references = references
+                .iter()
+                .map(|reference| parse_discussion_reference(reference))
+                .collect::<MoteResult<Vec<_>>>()?;
+            references.extend(
+                posts
+                    .into_iter()
+                    .map(|post_id| crate::op::DiscussionReference::Post { post_id }),
+            );
+            publish_question_transition(
+                store,
+                actor,
+                json_mode,
+                question_id,
+                crate::op::DecisionQuestionAction::Answer,
+                expect,
+                references,
+                resolve_optional_text(note)?,
+                None,
+                idempotency_key,
+            )
+        }
+        DiscussQuestionCmd::Defer {
+            question_id,
+            reason,
+            expect,
+            idempotency_key,
+        } => publish_question_transition(
+            store,
+            actor,
+            json_mode,
+            question_id,
+            crate::op::DecisionQuestionAction::Defer,
+            expect,
+            Vec::new(),
+            Some(TextInput::option(reason).read()?),
+            None,
+            idempotency_key,
+        ),
+        DiscussQuestionCmd::Supersede {
+            question_id,
+            successor_question_id,
+            reason,
+            expect,
+            idempotency_key,
+        } => publish_question_transition(
+            store,
+            actor,
+            json_mode,
+            question_id,
+            crate::op::DecisionQuestionAction::Supersede,
+            expect,
+            Vec::new(),
+            resolve_optional_text(reason)?,
+            Some(successor_question_id),
+            idempotency_key,
+        ),
+        DiscussQuestionCmd::Close {
+            question_id,
+            resolution,
+            references,
+            expect,
+            idempotency_key,
+        } => publish_question_transition(
+            store,
+            actor,
+            json_mode,
+            question_id,
+            crate::op::DecisionQuestionAction::Close,
+            expect,
+            references
+                .iter()
+                .map(|reference| parse_discussion_reference(reference))
+                .collect::<MoteResult<Vec<_>>>()?,
+            Some(TextInput::option(resolution).read()?),
+            None,
+            idempotency_key,
+        ),
+    }
+}
+
 fn print_topic_summary(
     state: &crate::state::State,
     topic: &str,
@@ -5246,9 +7380,18 @@ fn print_topic_summary(
             "decision_count": record.decision_count,
             "route_state": record.route.state.as_str(),
             "issues": record.route.issues.iter().collect::<Vec<_>>(),
+            "discussion": discussion_decisions_json(state, Some(topic)),
         });
         println!("{}", serde_json::to_string(&v)?);
     } else {
+        let counts = state.board_question_counts(Some(topic));
+        println!(
+            "decisions={} structured={} questions={} unresolved={}",
+            record.decision_count,
+            state.board_decisions_for_topic(topic).len(),
+            counts.total,
+            counts.unresolved,
+        );
         match summary {
             Some(post) => {
                 println!("{}  {}  from={}", post.post_id, post.sent_ts, post.from);
@@ -5424,14 +7567,19 @@ fn first_line_title(body: &str) -> String {
 }
 
 fn print_discussion_topics(
+    state: &crate::state::State,
     topics: Vec<&crate::state::BoardTopicRecord>,
     json_mode: bool,
 ) -> MoteResult<i32> {
     if json_mode {
-        let arr: Vec<_> = topics.iter().map(|t| topic_json(t)).collect();
+        let arr: Vec<_> = topics
+            .iter()
+            .map(|topic| topic_json(state, topic))
+            .collect();
         println!("{}", serde_json::to_string(&arr)?);
     } else {
         for t in &topics {
+            let counts = state.board_question_counts(Some(&t.topic));
             let explicit = if t.explicit { "explicit" } else { "implicit" };
             let summary = if t.summary_post_id.is_some() {
                 "  summary=yes"
@@ -5439,11 +7587,14 @@ fn print_discussion_topics(
                 ""
             };
             println!(
-                "{}  posts={}  sticky={}  decisions={}{}  created={}  last={}  {}{}  {}",
+                "{}  posts={}  sticky={}  decisions={} structured={} questions={} unresolved={}{}  created={}  last={}  {}{}  {}",
                 t.topic,
                 t.post_count,
                 t.sticky_count,
                 t.decision_count,
+                state.board_decisions_for_topic(&t.topic).len(),
+                counts.total,
+                counts.unresolved,
                 summary,
                 t.created_ts,
                 t.last_activity_ts,
@@ -5456,7 +7607,12 @@ fn print_discussion_topics(
     Ok(0)
 }
 
-pub(crate) fn topic_json(t: &crate::state::BoardTopicRecord) -> serde_json::Value {
+pub(crate) fn topic_json(
+    state: &crate::state::State,
+    t: &crate::state::BoardTopicRecord,
+) -> serde_json::Value {
+    let counts = state.board_question_counts(Some(&t.topic));
+    let structured_decision_count = state.board_decisions_for_topic(&t.topic).len();
     serde_json::json!({
         "topic": t.topic,
         "title": t.title,
@@ -5470,6 +7626,14 @@ pub(crate) fn topic_json(t: &crate::state::BoardTopicRecord) -> serde_json::Valu
         "post_count": t.post_count,
         "sticky_count": t.sticky_count,
         "decision_count": t.decision_count,
+        "structured_decision_count": structured_decision_count,
+        "legacy_decision_count": t.decision_count.saturating_sub(structured_decision_count),
+        "question_count": counts.total,
+        "open_question_count": counts.open,
+        "deferred_question_count": counts.deferred,
+        "superseded_question_count": counts.superseded,
+        "closed_question_count": counts.closed,
+        "unresolved_question_count": counts.unresolved,
         "summary_post_id": t.summary_post_id,
         "route_state": t.route.state.as_str(),
         "issues": t.route.issues.iter().collect::<Vec<_>>(),
@@ -5512,8 +7676,8 @@ fn print_discussion_search(
 
     if json_mode {
         let v = serde_json::json!({
-            "topics": topics.iter().map(|t| topic_json(t)).collect::<Vec<_>>(),
-            "posts": posts.iter().map(|p| board_post_json(p)).collect::<Vec<_>>(),
+            "topics": topics.iter().map(|t| topic_json(state, t)).collect::<Vec<_>>(),
+            "posts": posts.iter().map(|p| board_post_json_with_state(state, p)).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string(&v)?);
     } else {
@@ -5543,11 +7707,15 @@ fn print_discussion_search(
 }
 
 fn print_board_posts(
+    state: &crate::state::State,
     posts: Vec<&crate::state::BoardPostRecord>,
     json_mode: bool,
 ) -> MoteResult<i32> {
     if json_mode {
-        let arr: Vec<_> = posts.iter().map(|p| board_post_json(p)).collect();
+        let arr: Vec<_> = posts
+            .iter()
+            .map(|post| board_post_json_with_state(state, post))
+            .collect();
         println!("{}", serde_json::to_string(&arr)?);
     } else {
         for p in &posts {
@@ -5583,6 +7751,7 @@ struct UnreadPageMeta<'a> {
 }
 
 fn print_unread_board_posts(
+    state: &crate::state::State,
     posts: Vec<&crate::state::BoardPostRecord>,
     all_posts: &[&crate::state::BoardPostRecord],
     meta: UnreadPageMeta<'_>,
@@ -5590,7 +7759,7 @@ fn print_unread_board_posts(
     json_mode: bool,
 ) -> MoteResult<i32> {
     if !json_mode || !page_metadata {
-        return print_board_posts(posts, json_mode);
+        return print_board_posts(state, posts, json_mode);
     }
 
     let first = posts.first().copied();
@@ -5602,7 +7771,7 @@ fn print_unread_board_posts(
             .any(|post| post.sent_op_id.as_str() >= boundary)
     });
     let value = serde_json::json!({
-        "posts": posts.iter().map(|post| board_post_json(post)).collect::<Vec<_>>(),
+        "posts": posts.iter().map(|post| board_post_json_with_state(state, post)).collect::<Vec<_>>(),
         "page": {
             "order": "chronological",
             "window": "newest",
@@ -5714,6 +7883,7 @@ pub(crate) fn limit_board_posts_preserving_stickies(
 }
 
 fn print_thread_posts(
+    state: &crate::state::State,
     posts: Vec<(usize, &crate::state::BoardPostRecord)>,
     json_mode: bool,
 ) -> MoteResult<i32> {
@@ -5721,7 +7891,7 @@ fn print_thread_posts(
         let arr: Vec<_> = posts
             .iter()
             .map(|(depth, post)| {
-                let mut v = board_post_json(post);
+                let mut v = board_post_json_with_state(state, post);
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("depth".into(), serde_json::json!(depth));
                 }
@@ -5779,6 +7949,19 @@ pub(crate) fn board_post_json(p: &crate::state::BoardPostRecord) -> serde_json::
         "sent_ts": p.sent_ts,
         "sent_op_id": p.sent_op_id,
     })
+}
+
+pub(crate) fn board_post_json_with_state(
+    state: &crate::state::State,
+    post: &crate::state::BoardPostRecord,
+) -> serde_json::Value {
+    let mut value = board_post_json(post);
+    value["decision"] = state
+        .board_decisions
+        .get(&post.post_id)
+        .map(|decision| structured_decision_json(state, decision))
+        .unwrap_or(serde_json::Value::Null);
+    value
 }
 
 pub(crate) fn normalize_discussion_topic(topic: &str) -> MoteResult<String> {
@@ -6706,6 +8889,622 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
+fn parse_role_assignment_clock(raw: &str) -> MoteResult<crate::role::RoleAssignmentClock> {
+    let Some((assignment_id, clock_op_id)) = raw.split_once(':') else {
+        return Err(MoteError::Invalid(format!(
+            "invalid assignment clock `{raw}`; expected ASSIGNMENT:CLOCK"
+        )));
+    };
+    if assignment_id.trim().is_empty() || clock_op_id.trim().is_empty() {
+        return Err(MoteError::Invalid(format!(
+            "invalid assignment clock `{raw}`; expected ASSIGNMENT:CLOCK"
+        )));
+    }
+    Ok(crate::role::RoleAssignmentClock {
+        assignment_id: assignment_id.to_string(),
+        clock_op_id: clock_op_id.to_string(),
+    })
+}
+
+fn parse_role_assignment_clocks(
+    values: &[String],
+) -> MoteResult<Vec<crate::role::RoleAssignmentClock>> {
+    let mut clocks = values
+        .iter()
+        .map(|value| parse_role_assignment_clock(value))
+        .collect::<MoteResult<Vec<_>>>()?;
+    clocks.sort();
+    clocks.dedup();
+    Ok(clocks)
+}
+
+fn parse_role_exclusions(
+    state: &crate::state::State,
+    values: &[String],
+) -> MoteResult<Vec<crate::role::RoleExclusion>> {
+    let mut exclusions = Vec::new();
+    for value in values {
+        let (code, target) = value
+            .split_once(':')
+            .map_or((value.as_str(), None), |(code, target)| {
+                (code, Some(target))
+            });
+        let code = crate::role::RoleExclusionCode::parse(code).ok_or_else(|| {
+            MoteError::Invalid(format!(
+                "invalid role exclusion `{value}`; expected concurrent_role:ROLE|candidate_proposer|candidate_authorizer|candidate_named_reviewer|candidate_evidence_producer|candidate_path_reservation"
+            ))
+        })?;
+        let target_role_id = match (code, target) {
+            (crate::role::RoleExclusionCode::ConcurrentRole, Some(target)) => Some(
+                state
+                    .resolve_role(target)
+                    .ok_or_else(|| {
+                        MoteError::Invalid(format!("excluded role `{target}` does not exist"))
+                    })?
+                    .role_id
+                    .clone(),
+            ),
+            (crate::role::RoleExclusionCode::ConcurrentRole, None) => {
+                return Err(MoteError::Invalid(
+                    "concurrent_role exclusion requires concurrent_role:ROLE".into(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(MoteError::Invalid(format!(
+                    "{} exclusion does not take a role target",
+                    code.as_str()
+                )));
+            }
+            (_, None) => None,
+        };
+        exclusions.push(crate::role::RoleExclusion {
+            code,
+            target_role_id,
+        });
+    }
+    exclusions.sort();
+    exclusions.dedup();
+    Ok(exclusions)
+}
+
+fn existing_role_retry(
+    store: &Store,
+    state: &crate::state::State,
+    actor: &str,
+    key: &str,
+) -> MoteResult<Option<(String, op::Op)>> {
+    let Some(previous) = state
+        .role_idempotency
+        .get(&(actor.to_string(), key.to_string()))
+    else {
+        return Ok(None);
+    };
+    let bytes = fs::read(store.ops_dir().join(format!("{}.json", previous.op_id)))?;
+    Ok(Some((
+        previous.op_id.clone(),
+        serde_json::from_slice(&bytes)?,
+    )))
+}
+
+pub(crate) fn role_json(
+    state: &crate::state::State,
+    role: &crate::state::RoleRecord,
+    as_of_ts: &str,
+) -> serde_json::Value {
+    let assignments = state
+        .role_assignments_for(&role.role_id)
+        .into_iter()
+        .map(|assignment| {
+            let session = state.sessions.get(&assignment.holder_session_id);
+            serde_json::json!({
+                "assignment_id": assignment.assignment_id,
+                "role_id": assignment.role_id,
+                "holder_actor": assignment.holder_actor,
+                "holder_session_id": assignment.holder_session_id,
+                "session_lease_op_id": assignment.session_lease_op_id,
+                "current_session_lease_op_id": session.map(|session| &session.last_heartbeat_op_id),
+                "current_session_lease_until_ts": session.map(|session| &session.lease_until_ts),
+                "assigned_by": assignment.assigned_by,
+                "assigned_op_id": assignment.assigned_op_id,
+                "assigned_ts": assignment.assigned_ts,
+                "ttl_s": assignment.ttl_s,
+                "lease_until_ts": assignment.lease_until_ts,
+                "clock_op_id": assignment.clock_op_id,
+                "last_updated_by": assignment.last_updated_by,
+                "last_updated_ts": assignment.last_updated_ts,
+                "released_by": assignment.released_by,
+                "release_reason": assignment.release_reason,
+                "released_op_id": assignment.released_op_id,
+                "released_ts": assignment.released_ts,
+                "disposition": state.role_assignment_disposition(assignment, as_of_ts),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "role_id": role.role_id,
+        "name": role.name,
+        "remit": role.remit,
+        "exclusions": role.exclusions,
+        "assignment_authorities": role.assignment_authorities,
+        "capacity": role.capacity,
+        "minimum_active": role.minimum_active,
+        "defined_by": role.defined_by,
+        "definition_op_id": role.definition_op_id,
+        "defined_ts": role.defined_ts,
+        "retired": role.retired,
+        "assignments": assignments,
+        "coverage": state.role_coverage(&role.role_id, as_of_ts),
+    })
+}
+
+fn print_role(
+    state: &crate::state::State,
+    role: &crate::state::RoleRecord,
+    as_of_ts: &str,
+    json_mode: bool,
+) -> MoteResult<()> {
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string(&role_json(state, role, as_of_ts))?
+        );
+        return Ok(());
+    }
+    let coverage = state
+        .role_coverage(&role.role_id, as_of_ts)
+        .expect("known role has coverage");
+    println!(
+        "{}  {}  {}  active={}/{} demand={} shortfall={}",
+        role.role_id,
+        role.name,
+        if role.retired.is_some() {
+            "retired"
+        } else if coverage.vacant {
+            "vacant"
+        } else {
+            "staffed"
+        },
+        coverage.active_count,
+        coverage.capacity,
+        coverage.demanded_count,
+        coverage.coverage_shortfall,
+    );
+    println!("  remit: {}", role.remit);
+    println!(
+        "  assignment authorities: {}",
+        role.assignment_authorities.join(",")
+    );
+    for assignment in state.role_assignments_for(&role.role_id) {
+        println!(
+            "  {}  {}  session={}  until={}  {}",
+            assignment.assignment_id,
+            assignment.holder_actor,
+            assignment.holder_session_id,
+            assignment.lease_until_ts,
+            state
+                .role_assignment_disposition(assignment, as_of_ts)
+                .as_str(),
+        );
+    }
+    Ok(())
+}
+
+fn publish_role_op(store: &Store, operation: &op::Op) -> MoteResult<String> {
+    let name = publish::publish_op(store, operation)?;
+    let state = reducer::replay_store(store)?;
+    if !state.was_accepted(name.as_str()) {
+        return Err(MoteError::Rejected(
+            state
+                .rejection_reason(name.as_str())
+                .unwrap_or_else(|| "unknown reducer rejection".into()),
+        ));
+    }
+    Ok(name.into_string())
+}
+
+fn cmd_role(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    cmd: RoleCmd,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    match cmd {
+        RoleCmd::Show { role } => {
+            let state = reducer::replay_store(&store)?;
+            let role = state
+                .resolve_role(&role)
+                .ok_or_else(|| MoteError::Invalid(format!("role `{role}` does not exist")))?;
+            let as_of_ts = ids::format_rfc3339(Timestamp::now());
+            print_role(&state, role, &as_of_ts, json_mode)?;
+        }
+        RoleCmd::List {
+            vacant,
+            holder,
+            retired,
+        } => {
+            let state = reducer::replay_store(&store)?;
+            let as_of_ts = ids::format_rfc3339(Timestamp::now());
+            let roles = state.roles.values().filter(|role| {
+                let coverage = state
+                    .role_coverage(&role.role_id, &as_of_ts)
+                    .expect("known role has coverage");
+                (!vacant || coverage.vacant)
+                    && (retired || role.retired.is_none())
+                    && holder.as_deref().is_none_or(|holder| {
+                        state
+                            .role_active_assignments(&role.role_id, &as_of_ts)
+                            .iter()
+                            .any(|assignment| assignment.holder_actor == holder)
+                    })
+            });
+            if json_mode {
+                let roles = roles
+                    .map(|role| role_json(&state, role, &as_of_ts))
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string(&roles)?);
+            } else {
+                for role in roles {
+                    print_role(&state, role, &as_of_ts, false)?;
+                }
+            }
+        }
+        RoleCmd::Define {
+            name,
+            remit,
+            mut assignment_authorities,
+            capacity,
+            minimum_active,
+            exclusions,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let state = reducer::replay_store(&store)?;
+            let remit = TextInput::option(remit).read()?;
+            assignment_authorities.sort();
+            assignment_authorities.dedup();
+            let exclusions = parse_role_exclusions(&state, &exclusions)?;
+            let role_id =
+                ids::role_id_for_retry(&store.read_format()?.store_id, &actor, &idempotency_key);
+            if let Some((previous_id, previous_op)) =
+                existing_role_retry(&store, &state, &actor, &idempotency_key)?
+            {
+                let same = matches!(
+                    previous_op,
+                    op::Op::RoleDefine(ref previous)
+                        if previous.role_id == role_id
+                            && previous.name == name
+                            && previous.remit == remit
+                            && previous.exclusions == exclusions
+                            && previous.assignment_authorities == assignment_authorities
+                            && previous.capacity == capacity
+                            && previous.minimum_active == minimum_active
+                );
+                if !same {
+                    return Err(MoteError::Rejected(format!(
+                        "idempotency key already used by op {previous_id} for a different role action"
+                    )));
+                }
+                let role = state.roles.get(&role_id).ok_or_else(|| {
+                    MoteError::Rejected("accepted role retry has no materialized role".into())
+                })?;
+                print_role(
+                    &state,
+                    role,
+                    &ids::format_rfc3339(Timestamp::now()),
+                    json_mode,
+                )?;
+                return Ok(0);
+            }
+            let operation = op::Op::RoleDefine(op::RoleDefineOp {
+                v: crate::role::ROLE_PROTOCOL_VERSION,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                role_id: role_id.clone(),
+                name,
+                remit,
+                exclusions,
+                assignment_authorities,
+                capacity,
+                minimum_active,
+                idempotency_key,
+            });
+            publish_role_op(&store, &operation)?;
+            let state = reducer::replay_store(&store)?;
+            print_role(
+                &state,
+                &state.roles[&role_id],
+                &ids::format_rfc3339(Timestamp::now()),
+                json_mode,
+            )?;
+        }
+        RoleCmd::Assign {
+            role,
+            holder,
+            session,
+            expect_session,
+            ttl,
+            expect_active,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let holder = normalize_actor(&holder)?;
+            let state = reducer::replay_store(&store)?;
+            let role = state
+                .resolve_role(&role)
+                .ok_or_else(|| MoteError::Invalid(format!("role `{role}` does not exist")))?
+                .clone();
+            let holder_session_id = match session {
+                Some(session) => session,
+                None if holder == actor => env_session_id().ok_or_else(|| {
+                    MoteError::Invalid("self-assignment requires --session or MOTE_SESSION".into())
+                })?,
+                None => {
+                    return Err(MoteError::Invalid(
+                        "assigning another actor requires an explicit --session".into(),
+                    ));
+                }
+            };
+            let explicit_active = parse_role_assignment_clocks(&expect_active)?;
+            if let Some((previous_id, previous_op)) =
+                existing_role_retry(&store, &state, &actor, &idempotency_key)?
+            {
+                let same = matches!(
+                    previous_op,
+                    op::Op::RoleAssign(ref previous)
+                        if previous.role_id == role.role_id
+                            && previous.holder_actor == holder
+                            && previous.holder_session_id == holder_session_id
+                            && previous.ttl_s == ttl
+                            && expect_session.as_ref().is_none_or(|expect| expect == &previous.expect_session)
+                            && (expect_active.is_empty() || previous.expect_active == explicit_active)
+                );
+                if !same {
+                    return Err(MoteError::Rejected(format!(
+                        "idempotency key already used by op {previous_id} for a different role action"
+                    )));
+                }
+                print_role(
+                    &state,
+                    &role,
+                    &ids::format_rfc3339(Timestamp::now()),
+                    json_mode,
+                )?;
+                return Ok(0);
+            }
+            let session_record = state.sessions.get(&holder_session_id).ok_or_else(|| {
+                MoteError::Invalid(format!("session `{holder_session_id}` does not exist"))
+            })?;
+            let expect_session =
+                expect_session.unwrap_or_else(|| session_record.last_heartbeat_op_id.clone());
+            let ts = ids::format_rfc3339(Timestamp::now());
+            let expect_active = if expect_active.is_empty() {
+                state.role_active_assignment_clocks(&role.role_id, &ts)
+            } else {
+                explicit_active
+            };
+            let assignment_id = ids::role_assignment_id_for_retry(
+                &store.read_format()?.store_id,
+                &actor,
+                &idempotency_key,
+            );
+            let operation = op::Op::RoleAssign(op::RoleAssignOp {
+                v: crate::role::ROLE_PROTOCOL_VERSION,
+                op: String::new(),
+                ts,
+                actor,
+                role_id: role.role_id.clone(),
+                expect_definition: role.definition_op_id.clone(),
+                assignment_id,
+                holder_actor: holder,
+                holder_session_id,
+                expect_session,
+                ttl_s: ttl,
+                expect_active,
+                idempotency_key,
+            });
+            publish_role_op(&store, &operation)?;
+            let state = reducer::replay_store(&store)?;
+            print_role(
+                &state,
+                &state.roles[&role.role_id],
+                &ids::format_rfc3339(Timestamp::now()),
+                json_mode,
+            )?;
+        }
+        RoleCmd::Renew {
+            assignment_id,
+            ttl,
+            expect,
+            expect_session,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let state = reducer::replay_store(&store)?;
+            let assignment = state
+                .role_assignments
+                .get(&assignment_id)
+                .ok_or_else(|| {
+                    MoteError::Invalid(format!("assignment `{assignment_id}` does not exist"))
+                })?
+                .clone();
+            if let Some((previous_id, previous_op)) =
+                existing_role_retry(&store, &state, &actor, &idempotency_key)?
+            {
+                let same = matches!(
+                    previous_op,
+                    op::Op::RoleRenew(ref previous)
+                        if previous.assignment_id == assignment_id
+                            && previous.ttl_s == ttl
+                            && previous.expect_assignment == expect
+                            && expect_session.as_ref().is_none_or(|clock| clock == &previous.expect_session)
+                );
+                if !same {
+                    return Err(MoteError::Rejected(format!(
+                        "idempotency key already used by op {previous_id} for a different role action"
+                    )));
+                }
+                print_role(
+                    &state,
+                    &state.roles[&assignment.role_id],
+                    &ids::format_rfc3339(Timestamp::now()),
+                    json_mode,
+                )?;
+                return Ok(0);
+            }
+            let session = state
+                .sessions
+                .get(&assignment.holder_session_id)
+                .ok_or_else(|| MoteError::Invalid("holder session does not exist".into()))?;
+            let operation = op::Op::RoleRenew(op::RoleRenewOp {
+                v: crate::role::ROLE_PROTOCOL_VERSION,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                role_id: assignment.role_id.clone(),
+                assignment_id,
+                expect_assignment: expect,
+                expect_session: expect_session
+                    .unwrap_or_else(|| session.last_heartbeat_op_id.clone()),
+                ttl_s: ttl,
+                idempotency_key,
+            });
+            publish_role_op(&store, &operation)?;
+            let state = reducer::replay_store(&store)?;
+            print_role(
+                &state,
+                &state.roles[&assignment.role_id],
+                &ids::format_rfc3339(Timestamp::now()),
+                json_mode,
+            )?;
+        }
+        RoleCmd::Release {
+            assignment_id,
+            expect,
+            reason,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let state = reducer::replay_store(&store)?;
+            let assignment = state
+                .role_assignments
+                .get(&assignment_id)
+                .ok_or_else(|| {
+                    MoteError::Invalid(format!("assignment `{assignment_id}` does not exist"))
+                })?
+                .clone();
+            if let Some((previous_id, previous_op)) =
+                existing_role_retry(&store, &state, &actor, &idempotency_key)?
+            {
+                let same = matches!(
+                    previous_op,
+                    op::Op::RoleRelease(ref previous)
+                        if previous.assignment_id == assignment_id
+                            && previous.expect_assignment == expect
+                            && previous.reason == reason
+                );
+                if !same {
+                    return Err(MoteError::Rejected(format!(
+                        "idempotency key already used by op {previous_id} for a different role action"
+                    )));
+                }
+                print_role(
+                    &state,
+                    &state.roles[&assignment.role_id],
+                    &ids::format_rfc3339(Timestamp::now()),
+                    json_mode,
+                )?;
+                return Ok(0);
+            }
+            let operation = op::Op::RoleRelease(op::RoleReleaseOp {
+                v: crate::role::ROLE_PROTOCOL_VERSION,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                role_id: assignment.role_id.clone(),
+                assignment_id,
+                expect_assignment: expect,
+                reason,
+                idempotency_key,
+            });
+            publish_role_op(&store, &operation)?;
+            let state = reducer::replay_store(&store)?;
+            print_role(
+                &state,
+                &state.roles[&assignment.role_id],
+                &ids::format_rfc3339(Timestamp::now()),
+                json_mode,
+            )?;
+        }
+        RoleCmd::Retire {
+            role,
+            expect_definition,
+            expect_assignments,
+            reason,
+            idempotency_key,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let state = reducer::replay_store(&store)?;
+            let role = state
+                .resolve_role(&role)
+                .ok_or_else(|| MoteError::Invalid(format!("role `{role}` does not exist")))?
+                .clone();
+            let explicit_assignments = parse_role_assignment_clocks(&expect_assignments)?;
+            if let Some((previous_id, previous_op)) =
+                existing_role_retry(&store, &state, &actor, &idempotency_key)?
+            {
+                let same = matches!(
+                    previous_op,
+                    op::Op::RoleRetire(ref previous)
+                        if previous.role_id == role.role_id
+                            && previous.expect_definition == expect_definition
+                            && previous.reason == reason
+                            && (expect_assignments.is_empty()
+                                || previous.expect_assignments == explicit_assignments)
+                );
+                if !same {
+                    return Err(MoteError::Rejected(format!(
+                        "idempotency key already used by op {previous_id} for a different role action"
+                    )));
+                }
+                print_role(
+                    &state,
+                    &role,
+                    &ids::format_rfc3339(Timestamp::now()),
+                    json_mode,
+                )?;
+                return Ok(0);
+            }
+            let expect_assignments = if expect_assignments.is_empty() {
+                state.role_assignment_clocks(&role.role_id)
+            } else {
+                explicit_assignments
+            };
+            let operation = op::Op::RoleRetire(op::RoleRetireOp {
+                v: crate::role::ROLE_PROTOCOL_VERSION,
+                op: String::new(),
+                ts: ids::format_rfc3339(Timestamp::now()),
+                actor,
+                role_id: role.role_id.clone(),
+                expect_definition,
+                expect_assignments,
+                reason,
+                idempotency_key,
+            });
+            publish_role_op(&store, &operation)?;
+            let state = reducer::replay_store(&store)?;
+            print_role(
+                &state,
+                &state.roles[&role.role_id],
+                &ids::format_rfc3339(Timestamp::now()),
+                json_mode,
+            )?;
+        }
+    }
+    Ok(0)
+}
+
 /// Session id for this invocation, from `MOTE_SESSION`.
 fn env_session_id() -> Option<String> {
     std::env::var("MOTE_SESSION")
@@ -7275,8 +10074,10 @@ fn cmd_board(
                 "binding_kind": state.reservation_binding_kind(r), "paths": r.live_paths(),
                 "deadline": r.lease_until_ts, "reason": "ttl_elapsed",
             })).collect::<Vec<_>>(),
+            "roles": state.roles.values().map(|role| role_json(&state, role, &now)).collect::<Vec<_>>(),
             "inbox_unacked": inbox_count,
             "discussion_unread": discussion_unread_count,
+            "discussion": discussion_decisions_json(&state, None),
             "actors": actors,
         });
         println!("{}", serde_json::to_string(&v)?);
@@ -7305,6 +10106,21 @@ fn cmd_board(
                 r.reservation_id, r.actor, r.entity, live
             );
         }
+        println!("roles:        {} defined", state.roles.len());
+        for role in state.roles.values().filter(|role| role.retired.is_none()) {
+            let coverage = state
+                .role_coverage(&role.role_id, &now)
+                .expect("known role has coverage");
+            println!(
+                "  {} ({}) active={}/{} demand={} shortfall={}",
+                role.name,
+                role.role_id,
+                coverage.active_count,
+                coverage.capacity,
+                coverage.demanded_count,
+                coverage.coverage_shortfall,
+            );
+        }
         println!(
             "orphans:      {} claims, {} reservations",
             orphaned_claims.len(),
@@ -7327,7 +10143,12 @@ fn cmd_board(
             );
         }
         println!("inbox:        {inbox_count} unacked");
-        println!("discussion:   {discussion_unread_count} unread");
+        let question_counts = state.board_question_counts(None);
+        println!(
+            "discussion:   {discussion_unread_count} unread, {} cited decisions, {} unresolved questions",
+            state.board_decisions.len(),
+            question_counts.unresolved,
+        );
         println!("actors:       {} known", actors.len());
         for status in &actors {
             println!(
@@ -7482,7 +10303,7 @@ fn cmd_in_flight(
                 "deadline": r.lease_until_ts, "reason": "ttl_elapsed",
             })).collect::<Vec<_>>(),
             "topics": topics.iter().map(|t| {
-                let mut v = topic_json(t);
+                let mut v = topic_json(&state, t);
                 if let Some(obj) = v.as_object_mut() {
                     let unread = actor.as_deref().map(|a| {
                         state.unread_board_posts_for(a, Some(&t.topic)).len()
@@ -7492,12 +10313,17 @@ fn cmd_in_flight(
                 v
             }).collect::<Vec<_>>(),
             "candidates": candidates.iter().map(|candidate| {
-                let mut value = candidate_json(&state, candidate);
+                let mut value = candidate_json_at(&state, candidate, &now_ts);
                 value["landability"] = serde_json::json!(
-                    state.candidate_landability(&candidate.candidate_id, actor.as_deref())
+                    state.candidate_landability_at(
+                        &candidate.candidate_id,
+                        actor.as_deref(),
+                        &now_ts,
+                    )
                 );
                 value
             }).collect::<Vec<_>>(),
+            "roles": state.roles.values().map(|role| role_json(&state, role, &now_ts)).collect::<Vec<_>>(),
             "recent_commits_advisory": commits.iter().map(|(sha, subject)| serde_json::json!({
                 "sha": sha, "subject": subject,
             })).collect::<Vec<_>>(),
@@ -7637,7 +10463,8 @@ fn cmd_in_flight(
 
     println!("\nCANDIDATES ({}):", candidates.len());
     for candidate in &candidates {
-        let landability = state.candidate_landability(&candidate.candidate_id, actor.as_deref());
+        let landability =
+            state.candidate_landability_at(&candidate.candidate_id, actor.as_deref(), &now_ts);
         let disposition = if landability.landable {
             "landable".to_string()
         } else {
@@ -7649,6 +10476,27 @@ fn cmd_in_flight(
             candidate.phase.as_str(),
             candidate.entity,
             disposition
+        );
+    }
+
+    println!("\nROLES ({}):", state.roles.len());
+    for role in state.roles.values() {
+        let coverage = state
+            .role_coverage(&role.role_id, &now_ts)
+            .expect("known role has coverage");
+        println!(
+            "  {}  {}  active={}/{} demand={} shortfall={}{}",
+            role.role_id,
+            role.name,
+            coverage.active_count,
+            coverage.capacity,
+            coverage.demanded_count,
+            coverage.coverage_shortfall,
+            if role.retired.is_some() {
+                " retired"
+            } else {
+                ""
+            },
         );
     }
 
@@ -7701,13 +10549,15 @@ fn cmd_events(
     after: Option<String>,
     follow: bool,
     interval: u64,
+    request_stale_after_s: u32,
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     // An explicit global --actor is a convenient shorthand for --for-actor on
     // this read-only command. Persisted/env actor identity does not silently
     // filter oversight output.
     let actor_filter = for_actor.or_else(|| actor_flag.map(str::to_string));
-    let filter = crate::events::EventFilter::new(&kinds, actor_filter)?;
+    let filter = crate::events::EventFilter::new(&kinds, actor_filter)?
+        .with_request_stale_after(request_stale_after_s);
 
     if follow {
         let mut tailer = crate::events::EventTailer::new(&store, after.as_deref(), interval)?;
@@ -7736,10 +10586,17 @@ fn cmd_watch(
     store_flag: Option<&Path>,
     json_mode: bool,
     interval: u64,
+    request_stale_after_s: u32,
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag).ok();
-    crate::watch::run(&store, actor.as_deref(), json_mode, interval)
+    crate::watch::run(
+        &store,
+        actor.as_deref(),
+        json_mode,
+        interval,
+        request_stale_after_s,
+    )
 }
 
 fn cmd_ui(actor_flag: Option<&str>, store_flag: Option<&Path>) -> MoteResult<i32> {
@@ -7870,6 +10727,69 @@ fn overlapping_same_actor_reservations(
     out
 }
 
+fn cmd_audit(
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    target_ref: Option<&str>,
+    stale_after_s: Option<u32>,
+    fail_on: &str,
+) -> MoteResult<i32> {
+    let fail_on = crate::audit::AuditFailOn::parse(fail_on)
+        .ok_or_else(|| MoteError::Invalid("--fail-on must be error | warning | never".into()))?;
+    let store = open_store(store_flag)?;
+    let state = reducer::replay_store(&store)?;
+    let report = crate::audit::run_audit(
+        &store,
+        &state,
+        &std::env::current_dir()?,
+        Timestamp::now(),
+        target_ref,
+        stale_after_s,
+        fail_on,
+    )?;
+    let exit_code = report.exit_code();
+
+    if json_mode {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!(
+            "audit: {} (errors={}, warnings={}, info={}, skipped={}, as-of={})",
+            if report.ok { "ok" } else { "findings" },
+            report.summary.error,
+            report.summary.warning,
+            report.summary.info,
+            report.summary.skipped,
+            report.as_of_ts
+        );
+        println!(
+            "git-store: {} tracked={} working={} uncommitted={}",
+            report.git_backing.mode.as_str(),
+            report.git_backing.tracked_op_count,
+            report.git_backing.working_op_count,
+            report.git_backing.uncommitted_op_count
+        );
+        if report.findings.is_empty() {
+            println!("findings: none");
+        } else {
+            for finding in &report.findings {
+                println!(
+                    "{} {} [{}:{}]: {}",
+                    finding.severity.as_str().to_ascii_uppercase(),
+                    finding.code,
+                    finding.scope,
+                    finding.subject,
+                    finding.message
+                );
+                println!(
+                    "  remedy ({}): {}",
+                    finding.remediation.responsible_surface, finding.remediation.text
+                );
+            }
+        }
+    }
+    Ok(exit_code)
+}
+
 fn cmd_doctor(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
@@ -7912,11 +10832,15 @@ fn cmd_doctor(
     let fsck_clean = fsck_report.as_ref().is_some_and(|r| r.is_clean());
     let storage_ok = layout_ok && format_ok && fsck_error.is_none() && fsck_clean;
     let actor_ok = actor.is_some();
+    let git_backing = crate::audit::inspect_git_backing(&store, Timestamp::now());
 
-    let identity_warnings = match (&actor, storage_ok) {
+    let mut warnings = match (&actor, storage_ok) {
         (Some(actor), true) => identity_warnings(&store, actor)?,
         _ => Vec::new(),
     };
+    if let Some(warning) = git_backing.warning() {
+        warnings.push(warning);
+    }
     // Warnings describe a coordination hazard, not a broken store, so they do
     // not change the exit code — a shared identity still works, it is just
     // ambiguous.
@@ -7925,8 +10849,9 @@ fn cmd_doctor(
     if json_mode {
         let v = serde_json::json!({
             "ok": ok,
-            "warnings": identity_warnings,
+            "warnings": warnings,
             "store_root": store.root().display().to_string(),
+            "git_backing": git_backing,
             "layout": {
                 "root": root_ok,
                 "ops": ops_ok,
@@ -7985,11 +10910,18 @@ fn cmd_doctor(
             (_, Some(error)) => println!("fsck:   not run ({error})"),
             _ => println!("fsck:   not run"),
         }
-        if identity_warnings.is_empty() {
+        println!(
+            "git:    {} ({} tracked, {} working, {} uncommitted)",
+            git_backing.mode.as_str(),
+            git_backing.tracked_op_count,
+            git_backing.working_op_count,
+            git_backing.uncommitted_op_count
+        );
+        if warnings.is_empty() {
             println!("warn:   none");
         } else {
-            println!("warn:   {} identity warning(s)", identity_warnings.len());
-            for warning in &identity_warnings {
+            println!("warn:   {} warning(s)", warnings.len());
+            for warning in &warnings {
                 println!("  - {warning}");
             }
         }

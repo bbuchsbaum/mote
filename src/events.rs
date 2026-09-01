@@ -18,9 +18,10 @@ use crate::errors::{MoteError, MoteResult};
 use crate::op::Op;
 use crate::reducer;
 use crate::repo::Store;
-use crate::state::State;
+use crate::state::{RequestState, State};
 
 pub const EVENT_SCHEMA: &str = "mote.event.v1";
+pub const DEFAULT_REQUEST_STALE_AFTER_S: u32 = 60 * 60;
 pub const VALID_EVENT_CATEGORIES: &[&str] = &[
     "issue",
     "claim",
@@ -29,6 +30,7 @@ pub const VALID_EVENT_CATEGORIES: &[&str] = &[
     "discussion",
     "session",
     "presence",
+    "role",
     "candidate",
 ];
 
@@ -49,10 +51,21 @@ pub struct EventEnvelope {
     pub data: Value,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EventFilter {
     categories: BTreeSet<String>,
     actor: Option<String>,
+    request_stale_after_s: u32,
+}
+
+impl Default for EventFilter {
+    fn default() -> Self {
+        Self {
+            categories: BTreeSet::new(),
+            actor: None,
+            request_stale_after_s: DEFAULT_REQUEST_STALE_AFTER_S,
+        }
+    }
 }
 
 impl EventFilter {
@@ -77,6 +90,7 @@ impl EventFilter {
             actor: actor
                 .map(|a| a.trim().to_string())
                 .filter(|a| !a.is_empty()),
+            request_stale_after_s: DEFAULT_REQUEST_STALE_AFTER_S,
         })
     }
 
@@ -84,7 +98,13 @@ impl EventFilter {
         Self {
             categories: BTreeSet::from(["message".to_string()]),
             actor: Some(actor.to_string()),
+            request_stale_after_s: DEFAULT_REQUEST_STALE_AFTER_S,
         }
+    }
+
+    pub fn with_request_stale_after(mut self, seconds: u32) -> Self {
+        self.request_stale_after_s = seconds;
+        self
     }
 
     fn matches(&self, op: &Op, state: &State) -> bool {
@@ -101,6 +121,73 @@ impl EventFilter {
         (self.categories.is_empty() || self.categories.contains(category))
             && self.actor.as_deref().is_none_or(|wanted| wanted == actor)
     }
+}
+
+/// Current, replay-derived attention record for a request that remains
+/// explicitly open at or beyond its configured age threshold.
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleRequestWarning {
+    pub msg_id: String,
+    pub from: String,
+    pub to: String,
+    pub entity: Option<String>,
+    pub reservation: Option<String>,
+    pub body: String,
+    pub sent_op_id: String,
+    pub sent_ts: String,
+    pub ack_ts: Option<String>,
+    pub acknowledged: bool,
+    pub request_state: &'static str,
+    pub stale_after_s: u32,
+    pub stale_since_ts: String,
+    pub as_of_ts: String,
+}
+
+pub fn stale_open_requests(
+    state: &State,
+    recipient: Option<&str>,
+    now_ts: &str,
+    stale_after_s: u32,
+) -> Vec<StaleRequestWarning> {
+    let Ok(now) = now_ts.parse::<jiff::Timestamp>() else {
+        return Vec::new();
+    };
+    let mut warnings: Vec<_> = state
+        .messages
+        .values()
+        .filter(|message| {
+            message.request_state == Some(RequestState::Open)
+                && recipient.is_none_or(|actor| message.to == actor)
+        })
+        .filter_map(|message| {
+            let sent = message.sent_ts.parse::<jiff::Timestamp>().ok()?;
+            let stale_since = sent
+                .checked_add(jiff::SignedDuration::from_secs(stale_after_s.into()))
+                .ok()?;
+            (now >= stale_since).then(|| StaleRequestWarning {
+                msg_id: message.msg_id.clone(),
+                from: message.from.clone(),
+                to: message.to.clone(),
+                entity: message.entity.clone(),
+                reservation: message.reservation.clone(),
+                body: message.body.clone(),
+                sent_op_id: message.sent_op_id.clone(),
+                sent_ts: message.sent_ts.clone(),
+                ack_ts: message.ack_ts.clone(),
+                acknowledged: message.ack_ts.is_some(),
+                request_state: "open",
+                stale_after_s,
+                stale_since_ts: crate::ids::format_rfc3339(stale_since),
+                as_of_ts: crate::ids::format_rfc3339(now),
+            })
+        })
+        .collect();
+    warnings.sort_by(|a, b| {
+        a.stale_since_ts
+            .cmp(&b.stale_since_ts)
+            .then_with(|| a.msg_id.cmp(&b.msg_id))
+    });
+    warnings
 }
 
 /// Filesystem notification plus a periodic fallback tick. `mote watch`,
@@ -240,6 +327,7 @@ impl EventTailer {
             &state, &store_id, &now_ts, filter,
         ));
         projected.extend(derived_presence_events(&state, &store_id, &now_ts, filter));
+        projected.extend(derived_request_events(&state, &store_id, &now_ts, filter));
         for event in projected {
             let key = cursor_filename(&event.event_id)?;
             if self
@@ -304,6 +392,7 @@ pub fn accepted_events(
     let now_ts = crate::ids::format_rfc3339(jiff::Timestamp::now());
     let mut projected = derived_reservation_events(&state, &store_id, &now_ts, filter);
     projected.extend(derived_presence_events(&state, &store_id, &now_ts, filter));
+    projected.extend(derived_request_events(&state, &store_id, &now_ts, filter));
     for event in projected {
         let key = cursor_filename(&event.event_id)?;
         if cursor.as_ref().is_none_or(|cursor| key > *cursor) {
@@ -345,6 +434,7 @@ pub fn accepted_events_for_names(
                     | Op::CandidateSupersede(_)
                     | Op::CandidateAbandon(_)
                     | Op::CandidateLanded(_)
+                    | Op::CandidateReconcile(_)
             )
             .then(|| op.entity().map(str::to_string))
             .flatten();
@@ -360,7 +450,7 @@ pub fn accepted_events_for_names(
                     | Op::SessionEnd(_)
             );
             let message_delivery = matches!(&op, Op::MsgSend(_));
-            let discussion_notification = matches!(&op, Op::BoardPost(_));
+            let discussion_notification = matches!(&op, Op::BoardPost(_) | Op::BoardDecision(_));
             let mut event = event_from_op(&store_id, op)?;
             if invalidates_entity.is_some()
                 || reservation_transition
@@ -810,6 +900,60 @@ fn short_hash(value: &str) -> String {
     blake3::hash(value.as_bytes()).to_hex()[..12].to_string()
 }
 
+fn derived_request_events(
+    state: &State,
+    store_id: &str,
+    now_ts: &str,
+    filter: &EventFilter,
+) -> Vec<EventEnvelope> {
+    let mut events = Vec::new();
+    for warning in stale_open_requests(
+        state,
+        filter.actor.as_deref(),
+        now_ts,
+        filter.request_stale_after_s,
+    ) {
+        if !filter.categories.is_empty() && !filter.categories.contains("message") {
+            continue;
+        }
+        let compact_ts = warning.stale_since_ts.replace(['-', ':'], "");
+        events.push(EventEnvelope {
+            schema: EVENT_SCHEMA,
+            event_id: format!(
+                "{compact_ts}-d-request-stale-{}-{}",
+                warning.stale_after_s, warning.msg_id
+            ),
+            store_id: store_id.to_string(),
+            event_type: "request.stale".into(),
+            category: "message".into(),
+            op_id: warning.sent_op_id.clone(),
+            ts: warning.stale_since_ts.clone(),
+            actor: warning.to.clone(),
+            accepted: true,
+            data: serde_json::json!({
+                "derived": true,
+                "reason": "open_past_horizon",
+                "msg_id": warning.msg_id,
+                "from": warning.from,
+                "to": warning.to,
+                "entity": warning.entity,
+                "reservation": warning.reservation,
+                "body": warning.body,
+                "sent_ts": warning.sent_ts,
+                "ack_ts": warning.ack_ts,
+                "acknowledged": warning.acknowledged,
+                "acknowledgement_is_fulfillment": false,
+                "request_state": warning.request_state,
+                "stale_after_s": warning.stale_after_s,
+                "stale_since_ts": warning.stale_since_ts,
+                "as_of_ts": warning.as_of_ts,
+            }),
+        });
+    }
+    events.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    events
+}
+
 fn derived_reservation_events(
     state: &State,
     store_id: &str,
@@ -979,6 +1123,8 @@ fn event_category(op: &Op) -> &'static str {
         Op::Claim(_) | Op::Release(_) => "claim",
         Op::MsgSend(_) | Op::MsgAck(_) | Op::MsgResolve(_) => "message",
         Op::BoardPost(_)
+        | Op::BoardDecision(_)
+        | Op::BoardQuestion(_)
         | Op::BoardRead(_)
         | Op::BoardWatch(_)
         | Op::BoardTopic(_)
@@ -991,14 +1137,22 @@ fn event_category(op: &Op) -> &'static str {
         | Op::SessionStatus(_)
         | Op::SessionEnd(_) => "session",
         Op::ReserveOpen(_) | Op::ReserveClose(_) | Op::ReserveAdopt(_) => "reservation",
+        Op::RoleDefine(_)
+        | Op::RoleAssign(_)
+        | Op::RoleRenew(_)
+        | Op::RoleRelease(_)
+        | Op::RoleRetire(_) => "role",
         Op::CandidatePropose(_)
         | Op::CandidateEvidence(_)
         | Op::CandidateReview(_)
+        | Op::CandidateReviewPolicyAmend(_)
+        | Op::CandidateLandingRepositoryBind(_)
         | Op::CandidateAuthorize(_)
         | Op::CandidateRevoke(_)
         | Op::CandidateSupersede(_)
         | Op::CandidateAbandon(_)
-        | Op::CandidateLanded(_) => "candidate",
+        | Op::CandidateLanded(_)
+        | Op::CandidateReconcile(_) => "candidate",
         _ => "issue",
     }
 }
@@ -1026,6 +1180,13 @@ fn event_type(op: &Op) -> &'static str {
         Op::BoardPost(o) if o.post_kind.as_deref() == Some("decision") => "discussion.decided",
         Op::BoardPost(o) if o.post_kind.as_deref() == Some("summary") => "discussion.summarized",
         Op::BoardPost(_) => "discussion.posted",
+        Op::BoardDecision(_) => "discussion.decided",
+        Op::BoardQuestion(o) => match o.action {
+            crate::op::DecisionQuestionAction::Answer => "discussion.question_answered",
+            crate::op::DecisionQuestionAction::Defer => "discussion.question_deferred",
+            crate::op::DecisionQuestionAction::Supersede => "discussion.question_superseded",
+            crate::op::DecisionQuestionAction::Close => "discussion.question_closed",
+        },
         Op::BoardRead(_) => "discussion.read",
         Op::BoardWatch(o) if o.watching => "discussion.watched",
         Op::BoardWatch(_) => "discussion.unwatched",
@@ -1045,14 +1206,22 @@ fn event_type(op: &Op) -> &'static str {
         Op::ReserveOpen(_) => "reservation.opened",
         Op::ReserveClose(_) => "reservation.closed",
         Op::ReserveAdopt(_) => "reservation.adopted",
+        Op::RoleDefine(_) => "role.defined",
+        Op::RoleAssign(_) => "role.assigned",
+        Op::RoleRenew(_) => "role.renewed",
+        Op::RoleRelease(_) => "role.released",
+        Op::RoleRetire(_) => "role.retired",
         Op::CandidatePropose(_) => "candidate.proposed",
         Op::CandidateEvidence(_) => "candidate.evidence_recorded",
         Op::CandidateReview(_) => "candidate.reviewed",
+        Op::CandidateReviewPolicyAmend(_) => "candidate.review_policy_amended",
+        Op::CandidateLandingRepositoryBind(_) => "candidate.landing_repository_bound",
         Op::CandidateAuthorize(_) => "candidate.authorized",
         Op::CandidateRevoke(_) => "candidate.authorization_revoked",
         Op::CandidateSupersede(_) => "candidate.superseded",
         Op::CandidateAbandon(_) => "candidate.abandoned",
         Op::CandidateLanded(_) => "candidate.landed",
+        Op::CandidateReconcile(_) => "candidate.landed_out_of_band",
     }
 }
 
@@ -1076,22 +1245,121 @@ fn op_relates_to_actor(op: &Op, state: &State, actor: &str) -> bool {
                 .iter()
                 .any(|recipient| recipient == actor)
         }),
+        Op::BoardDecision(o) => state.board_posts.get(&o.post_id).is_some_and(|post| {
+            post.notification_recipients
+                .iter()
+                .any(|recipient| recipient == actor)
+        }),
+        Op::BoardQuestion(o) => state
+            .board_questions
+            .get(&o.question_id)
+            .and_then(|question| state.board_decisions.get(&question.decision_id))
+            .is_some_and(|decision| decision.actor == actor),
         Op::CandidatePropose(o) => {
-            o.authorizer == actor || o.reviewers.iter().any(|reviewer| reviewer == actor)
+            o.authorizer == actor
+                || o.reviewers.iter().any(|reviewer| reviewer == actor)
+                || state
+                    .candidates
+                    .get(&o.candidate_id)
+                    .is_some_and(|candidate| {
+                        candidate.reviewers.iter().any(|reviewer| reviewer == actor)
+                            || candidate
+                                .role_review_requirements
+                                .iter()
+                                .any(|requirement| {
+                                    state
+                                        .active_role_assignments_for_actor(actor, op.ts())
+                                        .into_iter()
+                                        .filter(|assignment| {
+                                            assignment.role_id == requirement.role_id
+                                        })
+                                        .any(|assignment| {
+                                            state
+                                                .candidate_role_review_eligibility(
+                                                    &candidate.candidate_id,
+                                                    actor,
+                                                    &requirement.role_id,
+                                                    &assignment.assignment_id,
+                                                    op.ts(),
+                                                )
+                                                .is_ok()
+                                        })
+                                })
+                    })
         }
+        Op::RoleDefine(o) => o
+            .assignment_authorities
+            .iter()
+            .any(|authority| authority == actor),
+        Op::RoleAssign(o) => {
+            o.holder_actor == actor
+                || state.roles.get(&o.role_id).is_some_and(|role| {
+                    role.assignment_authorities
+                        .iter()
+                        .any(|authority| authority == actor)
+                })
+        }
+        Op::RoleRenew(o) => {
+            state.roles.get(&o.role_id).is_some_and(|role| {
+                role.assignment_authorities
+                    .iter()
+                    .any(|authority| authority == actor)
+            }) || state
+                .role_assignments
+                .get(&o.assignment_id)
+                .is_some_and(|assignment| assignment.holder_actor == actor)
+        }
+        Op::RoleRelease(o) => {
+            state.roles.get(&o.role_id).is_some_and(|role| {
+                role.assignment_authorities
+                    .iter()
+                    .any(|authority| authority == actor)
+            }) || state
+                .role_assignments
+                .get(&o.assignment_id)
+                .is_some_and(|assignment| assignment.holder_actor == actor)
+        }
+        Op::RoleRetire(o) => state.roles.get(&o.role_id).is_some_and(|role| {
+            role.assignment_authorities
+                .iter()
+                .any(|authority| authority == actor)
+        }),
         Op::CandidateEvidence(_)
         | Op::CandidateReview(_)
+        | Op::CandidateReviewPolicyAmend(_)
+        | Op::CandidateLandingRepositoryBind(_)
         | Op::CandidateAuthorize(_)
         | Op::CandidateRevoke(_)
         | Op::CandidateSupersede(_)
         | Op::CandidateAbandon(_)
-        | Op::CandidateLanded(_) => op
+        | Op::CandidateLanded(_)
+        | Op::CandidateReconcile(_) => op
             .entity()
             .and_then(|candidate_id| state.candidates.get(candidate_id))
             .is_some_and(|candidate| {
                 candidate.proposer == actor
                     || candidate.authorizer == actor
                     || candidate.reviewers.iter().any(|reviewer| reviewer == actor)
+                    || candidate
+                        .role_review_requirements
+                        .iter()
+                        .any(|requirement| {
+                            state
+                                .active_role_assignments_for_actor(actor, op.ts())
+                                .into_iter()
+                                .filter(|assignment| assignment.role_id == requirement.role_id)
+                                .any(|assignment| {
+                                    state
+                                        .candidate_role_review_eligibility(
+                                            &candidate.candidate_id,
+                                            actor,
+                                            &requirement.role_id,
+                                            &assignment.assignment_id,
+                                            op.ts(),
+                                        )
+                                        .is_ok()
+                                })
+                        })
                     || candidate
                         .authorization
                         .as_ref()

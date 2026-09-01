@@ -4,6 +4,7 @@
 //! are layered in M2+.
 
 pub mod actor_status;
+pub mod audit;
 pub mod candidate;
 pub mod canonical;
 pub mod cli;
@@ -16,6 +17,7 @@ pub mod paths;
 pub mod publish;
 pub mod reducer;
 pub mod repo;
+pub mod role;
 pub mod server;
 pub mod state;
 pub mod tui;

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Post } from "../api/types";
+import type { DiscussionReference, Post, StructuredDecision } from "../api/types";
 import type { MoteClient } from "../api/client";
 import { relativeTime, shortId, useResource, useWrite } from "../store";
 import { BeadPicker, Empty, Modal, RouteChip } from "../components/ui";
@@ -61,6 +61,8 @@ export function DiscussionView({
               </span>
               <span className="topic-m">
                 <span>{t.post_count} posts</span>
+                {t.structured_decision_count > 0 && <span>{t.structured_decision_count} cited decision{t.structured_decision_count === 1 ? "" : "s"}</span>}
+                {t.unresolved_question_count > 0 && <span>{t.unresolved_question_count} unresolved question{t.unresolved_question_count === 1 ? "" : "s"}</span>}
                 <span>{relativeTime(t.last_activity_ts)}</span>
                 <RouteChip state={t.route_state} issues={t.issues} />
               </span>
@@ -90,6 +92,7 @@ export function DiscussionView({
               {ordered.map(({ post, depth }) => (
                 <div
                   key={post.post_id}
+                  id={`post-${post.post_id}`}
                   ref={post.post_id === focusPost ? focusRef : undefined}
                   data-nav-item
                   tabIndex={-1}
@@ -107,6 +110,7 @@ export function DiscussionView({
                     ))}
                   </div>
                   <div className="post-body">{post.body}</div>
+                  {post.decision && <DecisionRecord decision={post.decision} onOpenBead={onOpenBead} />}
                   <div className="post-acts">
                     <button className="btn link go" onClick={() => setReplyTo(post)}>Reply</button>
                     <button className="btn link" onClick={() => setPromoting(post)}>Promote to bead</button>
@@ -197,6 +201,103 @@ export function DiscussionView({
       )}
     </div>
   );
+}
+
+function DecisionRecord({
+  decision, onOpenBead,
+}: { decision: StructuredDecision; onOpenBead: (id: string) => void }) {
+  const revealPost = (postId: string) => {
+    document.getElementById(`post-${postId}`)?.scrollIntoView?.({ block: "center" });
+  };
+  return (
+    <section className="decision-record" aria-label={`Cited decision ${shortId(decision.decision_id)}`}>
+      <div className="decision-heading">
+        <span>Cited decision</span>
+        <span className="mono-id">{decision.agreed.length} agreed · {decision.questions.filter((q) => q.unresolved).length} unresolved</span>
+      </div>
+      <div className="decision-section-label">Agreed evidence</div>
+      <div className="decision-agreements">
+        {decision.agreed.map((agreed) => (
+          <div className="decision-agreed" key={agreed.post_id}>
+            <button className="btn link" onClick={() => revealPost(agreed.post_id)}>{shortId(agreed.post_id)}</button>
+            <span className={`decision-status ${agreed.disposition}`}>{agreed.disposition.toUpperCase()}</span>
+            <span className="decision-author">{agreed.from}</span>
+            <span className="decision-quote">{agreed.body}</span>
+          </div>
+        ))}
+      </div>
+      {decision.references.length > 0 && (
+        <div className="decision-references">
+          <span className="decision-section-label">References</span>
+          {decision.references.map((reference, index) => (
+            <DecisionReference
+              key={`${reference.kind}-${index}`}
+              reference={reference}
+              revealPost={revealPost}
+              onOpenBead={onOpenBead}
+            />
+          ))}
+        </div>
+      )}
+      {decision.questions.length > 0 && (
+        <div className="decision-questions">
+          <div className="decision-section-label">Tracked questions</div>
+          {decision.questions.map((question) => (
+            <article className="decision-question" key={question.question_id}>
+              <div className="decision-question-head">
+                <span className={`decision-status ${question.status}`}>{question.status.toUpperCase()}</span>
+                <span>{question.text}</span>
+                <span className="mono-id">{shortId(question.question_id)}</span>
+              </div>
+              {question.candidate_answers.map((answer) => (
+                <div className="decision-answer" key={answer.op_id}>
+                  <span className="decision-status answer">CANDIDATE ANSWER</span>
+                  <span>by {answer.actor}</span>
+                  {answer.note && <span>{answer.note}</span>}
+                  {answer.references.map((reference, index) => (
+                    <DecisionReference
+                      key={`${answer.op_id}-${index}`}
+                      reference={reference}
+                      revealPost={revealPost}
+                      onOpenBead={onOpenBead}
+                    />
+                  ))}
+                </div>
+              ))}
+              {question.transitions.filter((transition) => transition.action !== "answer").map((transition) => (
+                <div className="decision-answer" key={transition.op_id}>
+                  <span className={`decision-status ${transition.action}`}>{transition.action.toUpperCase()}</span>
+                  <span>by {transition.actor}</span>
+                  {transition.note && <span>{transition.note}</span>}
+                </div>
+              ))}
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DecisionReference({
+  reference, revealPost, onOpenBead,
+}: {
+  reference: DiscussionReference;
+  revealPost: (postId: string) => void;
+  onOpenBead: (id: string) => void;
+}) {
+  switch (reference.kind) {
+    case "post":
+      return <button className="decision-ref" onClick={() => revealPost(reference.post_id)}>post:{shortId(reference.post_id)}</button>;
+    case "issue":
+      return <button className="decision-ref" onClick={() => onOpenBead(reference.issue_id)}>issue:{shortId(reference.issue_id)}</button>;
+    case "url":
+      return <a className="decision-ref" href={reference.url} target="_blank" rel="noreferrer">url:{reference.url}</a>;
+    case "topic":
+      return <span className="decision-ref">topic:{reference.topic}</span>;
+    case "candidate":
+      return <span className="decision-ref">candidate:{shortId(reference.candidate_id)}</span>;
+  }
 }
 
 /** Depth-first ordering over `reply_to`, so a thread reads top to bottom. */

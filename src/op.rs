@@ -19,10 +19,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::{
-    AuthorizationStatus, CandidateEvidencePayload, EvidenceOutcome, EvidenceRequirement,
-    ReviewVerdict,
+    AuthorizationStatus, CandidateEvidencePayload, CandidatePolicySnapshot,
+    CandidateReconciliationAuthority, CandidateSupersedeRecovery, EvidenceOutcome,
+    EvidenceRequirement, ReviewVerdict,
 };
 use crate::ids;
+use crate::role::{RoleAssignmentClock, RoleExclusion};
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -314,6 +316,81 @@ pub struct BoardPostOp {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiscussionReference {
+    Topic { topic: String },
+    Post { post_id: String },
+    Issue { issue_id: String },
+    Candidate { candidate_id: String },
+    Url { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionQuestionDraft {
+    pub question_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardDecisionOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub post_id: String,
+    pub topic: String,
+    pub body: String,
+    pub agreed_post_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<DiscussionReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_questions: Vec<DecisionQuestionDraft>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionQuestionAction {
+    Answer,
+    Defer,
+    Supersede,
+    Close,
+}
+
+impl DecisionQuestionAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answer => "answer",
+            Self::Defer => "defer",
+            Self::Supersede => "supersede",
+            Self::Close => "close",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardQuestionOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub question_id: String,
+    pub action: DecisionQuestionAction,
+    pub expect_question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<DiscussionReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_question_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardWatchOp {
     pub v: u32,
@@ -507,6 +584,81 @@ pub struct ReserveAdoptOp {
     pub ttl_s: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleDefineOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub role_id: String,
+    pub name: String,
+    pub remit: String,
+    pub exclusions: Vec<RoleExclusion>,
+    pub assignment_authorities: Vec<String>,
+    pub capacity: u32,
+    pub minimum_active: u32,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleAssignOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub role_id: String,
+    pub expect_definition: String,
+    pub assignment_id: String,
+    pub holder_actor: String,
+    pub holder_session_id: String,
+    pub expect_session: String,
+    pub ttl_s: u32,
+    pub expect_active: Vec<RoleAssignmentClock>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleRenewOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub role_id: String,
+    pub assignment_id: String,
+    pub expect_assignment: String,
+    pub expect_session: String,
+    pub ttl_s: u32,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleReleaseOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub role_id: String,
+    pub assignment_id: String,
+    pub expect_assignment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleRetireOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub role_id: String,
+    pub expect_definition: String,
+    pub expect_assignments: Vec<RoleAssignmentClock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub idempotency_key: String,
+}
+
 /// Immutable proposal record. Git names have already been resolved to full
 /// object ids by the publishing CLI; replay never consults the repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,7 +670,14 @@ pub struct CandidateProposeOp {
     pub candidate_id: String,
     pub entity: BeadId,
     pub store_id: String,
+    /// Repository in which the proposal commit and ancestry were observed.
     pub repository_id: String,
+    /// Repository authorized for object-availability and landing checks. Legacy
+    /// proposals omit this and use `repository_id` for both roles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_source: Option<crate::candidate::CandidateObjectSource>,
     pub object_format: String,
     pub commit_oid: String,
     pub base_oid: String,
@@ -526,6 +685,8 @@ pub struct CandidateProposeOp {
     pub paths: Vec<String>,
     pub authorizer: String,
     pub reviewers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy: Option<crate::candidate::CandidateReviewPolicy>,
     pub evidence_requirements: Vec<EvidenceRequirement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_refs: Vec<String>,
@@ -565,6 +726,43 @@ pub struct CandidateReviewOp {
     pub evidence_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_review: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<crate::candidate::CandidateRoleReviewBinding>,
+    pub idempotency_key: String,
+}
+
+/// Authorizer-owned compare-and-set update to the named-reviewer portion of a
+/// pending candidate's review policy. Role/count requirements remain fixed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateReviewPolicyAmendOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub named_reviewers: Vec<String>,
+    pub expect_phase: String,
+    pub expect_review_policy: String,
+    pub reason: String,
+    pub idempotency_key: String,
+}
+
+/// Authorizer-owned binding of a pending candidate to the repository backing
+/// the shared store. It gives legacy and standalone-clone proposals an
+/// explicit landing domain without rewriting proposal provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateLandingRepositoryBindOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub landing_repository_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_source: Option<crate::candidate::CandidateObjectSource>,
+    pub expect_phase: String,
+    pub expect_landing_repository: String,
+    pub reason: String,
     pub idempotency_key: String,
 }
 
@@ -606,6 +804,8 @@ pub struct CandidateSupersedeOp {
     pub candidate_id: String,
     pub successor_id: String,
     pub expect_phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<CandidateSupersedeRecovery>,
     pub idempotency_key: String,
 }
 
@@ -637,6 +837,21 @@ pub struct CandidateLandedOp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateReconcileOp {
+    pub v: u32,
+    pub op: String,
+    pub ts: String,
+    pub actor: String,
+    pub candidate_id: String,
+    pub evidence_id: String,
+    pub target_ref: String,
+    pub expect_phase: String,
+    pub authority: CandidateReconciliationAuthority,
+    pub policy_snapshot: CandidatePolicySnapshot,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Op {
     Create(CreateOp),
@@ -656,6 +871,8 @@ pub enum Op {
     MsgAck(MsgAckOp),
     MsgResolve(MsgResolveOp),
     BoardPost(BoardPostOp),
+    BoardDecision(BoardDecisionOp),
+    BoardQuestion(BoardQuestionOp),
     BoardRead(BoardReadOp),
     BoardWatch(BoardWatchOp),
     BoardTopic(BoardTopicOp),
@@ -670,14 +887,22 @@ pub enum Op {
     ReserveOpen(ReserveOpenOp),
     ReserveClose(ReserveCloseOp),
     ReserveAdopt(ReserveAdoptOp),
+    RoleDefine(RoleDefineOp),
+    RoleAssign(RoleAssignOp),
+    RoleRenew(RoleRenewOp),
+    RoleRelease(RoleReleaseOp),
+    RoleRetire(RoleRetireOp),
     CandidatePropose(CandidateProposeOp),
     CandidateEvidence(CandidateEvidenceOp),
     CandidateReview(CandidateReviewOp),
+    CandidateReviewPolicyAmend(CandidateReviewPolicyAmendOp),
+    CandidateLandingRepositoryBind(CandidateLandingRepositoryBindOp),
     CandidateAuthorize(CandidateAuthorizeOp),
     CandidateRevoke(CandidateRevokeOp),
     CandidateSupersede(CandidateSupersedeOp),
     CandidateAbandon(CandidateAbandonOp),
     CandidateLanded(CandidateLandedOp),
+    CandidateReconcile(CandidateReconcileOp),
 }
 
 impl Op {
@@ -697,6 +922,8 @@ impl Op {
             Op::MsgAck(o) => &o.op,
             Op::MsgResolve(o) => &o.op,
             Op::BoardPost(o) => &o.op,
+            Op::BoardDecision(o) => &o.op,
+            Op::BoardQuestion(o) => &o.op,
             Op::BoardRead(o) => &o.op,
             Op::BoardWatch(o) => &o.op,
             Op::BoardTopic(o) => &o.op,
@@ -711,14 +938,22 @@ impl Op {
             Op::ReserveOpen(o) => &o.op,
             Op::ReserveClose(o) => &o.op,
             Op::ReserveAdopt(o) => &o.op,
+            Op::RoleDefine(o) => &o.op,
+            Op::RoleAssign(o) => &o.op,
+            Op::RoleRenew(o) => &o.op,
+            Op::RoleRelease(o) => &o.op,
+            Op::RoleRetire(o) => &o.op,
             Op::CandidatePropose(o) => &o.op,
             Op::CandidateEvidence(o) => &o.op,
             Op::CandidateReview(o) => &o.op,
+            Op::CandidateReviewPolicyAmend(o) => &o.op,
+            Op::CandidateLandingRepositoryBind(o) => &o.op,
             Op::CandidateAuthorize(o) => &o.op,
             Op::CandidateRevoke(o) => &o.op,
             Op::CandidateSupersede(o) => &o.op,
             Op::CandidateAbandon(o) => &o.op,
             Op::CandidateLanded(o) => &o.op,
+            Op::CandidateReconcile(o) => &o.op,
         }
     }
 
@@ -738,6 +973,8 @@ impl Op {
             Op::MsgAck(o) => &o.actor,
             Op::MsgResolve(o) => &o.actor,
             Op::BoardPost(o) => &o.actor,
+            Op::BoardDecision(o) => &o.actor,
+            Op::BoardQuestion(o) => &o.actor,
             Op::BoardRead(o) => &o.actor,
             Op::BoardWatch(o) => &o.actor,
             Op::BoardTopic(o) => &o.actor,
@@ -752,14 +989,22 @@ impl Op {
             Op::ReserveOpen(o) => &o.actor,
             Op::ReserveClose(o) => &o.actor,
             Op::ReserveAdopt(o) => &o.actor,
+            Op::RoleDefine(o) => &o.actor,
+            Op::RoleAssign(o) => &o.actor,
+            Op::RoleRenew(o) => &o.actor,
+            Op::RoleRelease(o) => &o.actor,
+            Op::RoleRetire(o) => &o.actor,
             Op::CandidatePropose(o) => &o.actor,
             Op::CandidateEvidence(o) => &o.actor,
             Op::CandidateReview(o) => &o.actor,
+            Op::CandidateReviewPolicyAmend(o) => &o.actor,
+            Op::CandidateLandingRepositoryBind(o) => &o.actor,
             Op::CandidateAuthorize(o) => &o.actor,
             Op::CandidateRevoke(o) => &o.actor,
             Op::CandidateSupersede(o) => &o.actor,
             Op::CandidateAbandon(o) => &o.actor,
             Op::CandidateLanded(o) => &o.actor,
+            Op::CandidateReconcile(o) => &o.actor,
         }
     }
 
@@ -779,6 +1024,8 @@ impl Op {
             Op::MsgAck(o) => &o.ts,
             Op::MsgResolve(o) => &o.ts,
             Op::BoardPost(o) => &o.ts,
+            Op::BoardDecision(o) => &o.ts,
+            Op::BoardQuestion(o) => &o.ts,
             Op::BoardRead(o) => &o.ts,
             Op::BoardWatch(o) => &o.ts,
             Op::BoardTopic(o) => &o.ts,
@@ -793,14 +1040,22 @@ impl Op {
             Op::ReserveOpen(o) => &o.ts,
             Op::ReserveClose(o) => &o.ts,
             Op::ReserveAdopt(o) => &o.ts,
+            Op::RoleDefine(o) => &o.ts,
+            Op::RoleAssign(o) => &o.ts,
+            Op::RoleRenew(o) => &o.ts,
+            Op::RoleRelease(o) => &o.ts,
+            Op::RoleRetire(o) => &o.ts,
             Op::CandidatePropose(o) => &o.ts,
             Op::CandidateEvidence(o) => &o.ts,
             Op::CandidateReview(o) => &o.ts,
+            Op::CandidateReviewPolicyAmend(o) => &o.ts,
+            Op::CandidateLandingRepositoryBind(o) => &o.ts,
             Op::CandidateAuthorize(o) => &o.ts,
             Op::CandidateRevoke(o) => &o.ts,
             Op::CandidateSupersede(o) => &o.ts,
             Op::CandidateAbandon(o) => &o.ts,
             Op::CandidateLanded(o) => &o.ts,
+            Op::CandidateReconcile(o) => &o.ts,
         }
     }
 
@@ -823,7 +1078,7 @@ impl Op {
             Op::Release(o) => Some(&o.entity),
             Op::MsgSend(o) => o.entity.as_deref(),
             Op::MsgAck(_) | Op::MsgResolve(_) => None,
-            Op::BoardPost(_) => None,
+            Op::BoardPost(_) | Op::BoardDecision(_) | Op::BoardQuestion(_) => None,
             Op::BoardRead(_) | Op::BoardWatch(_) => None,
             Op::BoardTopic(_) => None,
             Op::BoardSticky(_) => None,
@@ -836,14 +1091,22 @@ impl Op {
             Op::ReserveOpen(o) => Some(&o.entity),
             Op::ReserveClose(_) => None,
             Op::ReserveAdopt(o) => Some(&o.entity),
+            Op::RoleDefine(o) => Some(&o.role_id),
+            Op::RoleAssign(o) => Some(&o.role_id),
+            Op::RoleRenew(o) => Some(&o.role_id),
+            Op::RoleRelease(o) => Some(&o.role_id),
+            Op::RoleRetire(o) => Some(&o.role_id),
             Op::CandidatePropose(o) => Some(&o.candidate_id),
             Op::CandidateEvidence(o) => Some(&o.candidate_id),
             Op::CandidateReview(o) => Some(&o.candidate_id),
+            Op::CandidateReviewPolicyAmend(o) => Some(&o.candidate_id),
+            Op::CandidateLandingRepositoryBind(o) => Some(&o.candidate_id),
             Op::CandidateAuthorize(o) => Some(&o.candidate_id),
             Op::CandidateRevoke(o) => Some(&o.candidate_id),
             Op::CandidateSupersede(o) => Some(&o.candidate_id),
             Op::CandidateAbandon(o) => Some(&o.candidate_id),
             Op::CandidateLanded(o) => Some(&o.candidate_id),
+            Op::CandidateReconcile(o) => Some(&o.candidate_id),
         }
     }
 
@@ -866,6 +1129,8 @@ impl Op {
             Op::MsgAck(_) => "msg_ack",
             Op::MsgResolve(_) => "msg_resolve",
             Op::BoardPost(_) => "board_post",
+            Op::BoardDecision(_) => "board_decision",
+            Op::BoardQuestion(_) => "board_question",
             Op::BoardRead(_) => "board_read",
             Op::BoardWatch(_) => "board_watch",
             Op::BoardTopic(_) => "board_topic",
@@ -880,14 +1145,22 @@ impl Op {
             Op::ReserveOpen(_) => "reserve_open",
             Op::ReserveClose(_) => "reserve_close",
             Op::ReserveAdopt(_) => "reserve_adopt",
+            Op::RoleDefine(_) => "role_define",
+            Op::RoleAssign(_) => "role_assign",
+            Op::RoleRenew(_) => "role_renew",
+            Op::RoleRelease(_) => "role_release",
+            Op::RoleRetire(_) => "role_retire",
             Op::CandidatePropose(_) => "candidate_propose",
             Op::CandidateEvidence(_) => "candidate_evidence",
             Op::CandidateReview(_) => "candidate_review",
+            Op::CandidateReviewPolicyAmend(_) => "candidate_review_policy_amend",
+            Op::CandidateLandingRepositoryBind(_) => "candidate_landing_repository_bind",
             Op::CandidateAuthorize(_) => "candidate_authorize",
             Op::CandidateRevoke(_) => "candidate_revoke",
             Op::CandidateSupersede(_) => "candidate_supersede",
             Op::CandidateAbandon(_) => "candidate_abandon",
             Op::CandidateLanded(_) => "candidate_landed",
+            Op::CandidateReconcile(_) => "candidate_reconcile",
         }
     }
 
@@ -897,11 +1170,25 @@ impl Op {
             Op::CandidatePropose(o) => Some((&o.candidate_id, &o.idempotency_key)),
             Op::CandidateEvidence(o) => Some((&o.candidate_id, &o.idempotency_key)),
             Op::CandidateReview(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            Op::CandidateReviewPolicyAmend(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            Op::CandidateLandingRepositoryBind(o) => Some((&o.candidate_id, &o.idempotency_key)),
             Op::CandidateAuthorize(o) => Some((&o.candidate_id, &o.idempotency_key)),
             Op::CandidateRevoke(o) => Some((&o.candidate_id, &o.idempotency_key)),
             Op::CandidateSupersede(o) => Some((&o.candidate_id, &o.idempotency_key)),
             Op::CandidateAbandon(o) => Some((&o.candidate_id, &o.idempotency_key)),
             Op::CandidateLanded(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            Op::CandidateReconcile(o) => Some((&o.candidate_id, &o.idempotency_key)),
+            _ => None,
+        }
+    }
+
+    pub fn role_idempotency(&self) -> Option<(&str, &str)> {
+        match self {
+            Op::RoleDefine(o) => Some((&o.role_id, &o.idempotency_key)),
+            Op::RoleAssign(o) => Some((&o.role_id, &o.idempotency_key)),
+            Op::RoleRenew(o) => Some((&o.role_id, &o.idempotency_key)),
+            Op::RoleRelease(o) => Some((&o.role_id, &o.idempotency_key)),
+            Op::RoleRetire(o) => Some((&o.role_id, &o.idempotency_key)),
             _ => None,
         }
     }

@@ -123,6 +123,71 @@ export class FixtureClient implements MoteClient {
       "I can take tests. One question — does the warning need its own op kind, or is it derived at read time?", root.post_id);
     const reply2 = this.mkPost("planning", "alice", 160,
       "Derived. Nothing about a lapse is a decision anyone made, so there is nothing to record.", reply1.post_id);
+    const decisionOp = opId();
+    const answerOp = opId();
+    const closeOp = opId();
+    const { decision: _decisionProjection, ...decisionPost } = decision;
+    void _decisionProjection;
+    decision.decision = {
+      decision_id: decision.post_id,
+      post: decisionPost,
+      agreed: [root, reply2].map((post) => ({
+        post_id: post.post_id,
+        from: post.from,
+        body: post.body,
+        disposition: "active" as const,
+        sent_op_id: post.post_id.replace("post-", "op-"),
+      })),
+      agreed_post_ids: [root.post_id, reply2.post_id].sort(),
+      references: [{ kind: "issue", issue_id: parser.id }],
+      resolved_references: [{
+        reference: { kind: "issue", issue_id: parser.id }, exists: true,
+        disposition: "active", title: parser.title, status: parser.status,
+      }],
+      questions: [
+        {
+          question_id: ulid("question"), decision_id: decision.post_id, topic: "planning",
+          text: "Does the warning need its own recorded operation?", opened_by: "alice",
+          opened_op_id: decisionOp, opened_ts: decision.sent_ts, position: 0, status: "open",
+          unresolved: true, clock_op_id: answerOp, successor_question_id: null,
+          answer_count: 1,
+          candidate_answers: [{
+            action: "answer", actor: "alice", expect_question: decisionOp,
+            references: [{ kind: "post", post_id: reply2.post_id }],
+            note: "Derived state is not a user decision.", successor_question_id: null,
+            idempotency_key: "fixture-answer", op_id: answerOp, ts: reply2.sent_ts,
+          }],
+          transitions: [{
+            action: "answer", actor: "alice", expect_question: decisionOp,
+            references: [{ kind: "post", post_id: reply2.post_id }],
+            note: "Derived state is not a user decision.", successor_question_id: null,
+            idempotency_key: "fixture-answer", op_id: answerOp, ts: reply2.sent_ts,
+          }],
+        },
+        {
+          question_id: ulid("question"), decision_id: decision.post_id, topic: "planning",
+          text: "Which slice lands first?", opened_by: "alice", opened_op_id: decisionOp,
+          opened_ts: decision.sent_ts, position: 1, status: "closed", unresolved: false,
+          clock_op_id: closeOp, successor_question_id: null, answer_count: 0,
+          candidate_answers: [],
+          transitions: [{
+            action: "close", actor: "alice", expect_question: decisionOp,
+            references: [{ kind: "post", post_id: root.post_id }],
+            note: "Parser first; tests follow.", successor_question_id: null,
+            idempotency_key: "fixture-close", op_id: closeOp, ts: decision.sent_ts,
+          }],
+        },
+      ],
+      actor: "alice", op_id: decisionOp, ts: decision.sent_ts,
+    };
+    const planning = this.allTopics.find((candidate) => candidate.topic === "planning")!;
+    planning.sticky_count = 1;
+    planning.decision_count = 1;
+    planning.structured_decision_count = 1;
+    planning.question_count = 2;
+    planning.open_question_count = 1;
+    planning.closed_question_count = 1;
+    planning.unresolved_question_count = 1;
     const orphan = this.mkPost("planning", "parser-session", 3,
       "Reservation adoption after an orphan should carry provenance in the note, not just the op id. Nobody is tracking this yet.", root.post_id);
     orphan.route_state = "needs_bead";
@@ -151,7 +216,10 @@ export class FixtureClient implements MoteClient {
     return {
       topic, title, body, created_by: by, created_ts: ago(minutesAgo), created_op_id: opId(),
       last_activity_ts: ago(minutesAgo), last_activity_op_id: opId(),
-      post_count: 0, sticky_count: 0, decision_count: 0, explicit: true,
+      post_count: 0, sticky_count: 0, decision_count: 0, structured_decision_count: 0,
+      legacy_decision_count: 0, question_count: 0, open_question_count: 0,
+      deferred_question_count: 0, superseded_question_count: 0, closed_question_count: 0,
+      unresolved_question_count: 0, explicit: true,
       route_state: "open", issues: [], summary_post_id: null,
     };
   }
@@ -161,7 +229,7 @@ export class FixtureClient implements MoteClient {
       post_id: ulid("post"), topic, from, body, post_kind: "post",
       reply_to: replyTo, sent_ts: ago(minutesAgo), sticky: false, sticky_op_id: null,
       route_state: "open", issues: [], answers: [], explicit_notify: [],
-      notification_recipients: [], idempotency_key: null,
+      notification_recipients: [], idempotency_key: null, decision: null,
     };
     this.allPosts.push(post);
     const t = this.allTopics.find((x) => x.topic === topic);
@@ -255,6 +323,17 @@ export class FixtureClient implements MoteClient {
       }],
       orphaned_claims: [], orphaned_reservations: [],
       discussion_unread: this.unreadPosts(actor).length,
+      discussion: {
+        structured_decision_count: this.allTopics.reduce((sum, topic) => sum + topic.structured_decision_count, 0),
+        legacy_decision_count: this.allTopics.reduce((sum, topic) => sum + topic.legacy_decision_count, 0),
+        question_count: this.allTopics.reduce((sum, topic) => sum + topic.question_count, 0),
+        open_question_count: this.allTopics.reduce((sum, topic) => sum + topic.open_question_count, 0),
+        deferred_question_count: this.allTopics.reduce((sum, topic) => sum + topic.deferred_question_count, 0),
+        superseded_question_count: this.allTopics.reduce((sum, topic) => sum + topic.superseded_question_count, 0),
+        closed_question_count: this.allTopics.reduce((sum, topic) => sum + topic.closed_question_count, 0),
+        unresolved_question_count: this.allTopics.reduce((sum, topic) => sum + topic.unresolved_question_count, 0),
+        decisions: this.allPosts.flatMap((post) => post.decision ? [post.decision] : []),
+      },
       inbox_unacked: this.messages.filter((m) => m.to === actor && !m.ack_ts).length,
     };
   }

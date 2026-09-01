@@ -3,15 +3,18 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use mote::candidate::{
-    AuthorizationStatus, CandidateEvidencePayload, EvidenceOutcome, EvidenceRequirement,
-    GIT_ANCESTRY_EVIDENCE, GIT_LANDING_EVIDENCE, GitAncestryReceipt, GitCandidateRelation,
-    GitLandingReceipt, GitRelationKind, KnownCandidate, ReviewVerdict,
+    AuthorizationStatus, CandidateEvidencePayload, CandidatePolicySnapshot,
+    CandidateReconciliationAuthority, CandidateSnapshotProvenance, CandidateSupersedeRecovery,
+    CandidateSupersessionAuthority, EvidenceOutcome, EvidenceRequirement, GIT_ANCESTRY_EVIDENCE,
+    GIT_LANDING_EVIDENCE, GIT_REACHABILITY_EVIDENCE, GIT_RELATION_SCHEMA_V2, GitAncestryReceipt,
+    GitCandidateRelation, GitLandingReceipt, GitReachabilityReceipt, GitRelationKind,
+    KnownCandidate, ReviewVerdict,
 };
 use mote::ids;
 use mote::op::{
     CandidateAbandonOp, CandidateAuthorizeOp, CandidateEvidenceOp, CandidateLandedOp,
-    CandidateProposeOp, CandidateReviewOp, CandidateRevokeOp, CandidateSupersedeOp, Op, ScalarSet,
-    make_create, make_reserve_close, make_reserve_open,
+    CandidateProposeOp, CandidateReconcileOp, CandidateReviewOp, CandidateRevokeOp,
+    CandidateSupersedeOp, Op, ScalarSet, make_create, make_reserve_close, make_reserve_open,
 };
 use mote::state::LeaseDisposition;
 use mote::{publish, reducer, repo::Store};
@@ -52,6 +55,18 @@ fn publish_checked(store: &Store, op: &Op) -> String {
     name.into_string()
 }
 
+fn publish_rejected(store: &Store, op: &Op, reason_fragment: &str) -> String {
+    let name = publish::publish_op(store, op).unwrap();
+    let state = reducer::replay_store(store).unwrap();
+    assert!(!state.was_accepted(name.as_str()));
+    let reason = state.rejection_reason(name.as_str()).unwrap();
+    assert!(
+        reason.contains(reason_fragment),
+        "expected `{reason_fragment}` in `{reason}`"
+    );
+    name.into_string()
+}
+
 fn reserve_candidate(store: &Store, candidate_id: &str, actor: &str) -> String {
     let reservation_id = ids::new_reservation_id();
     publish_checked(
@@ -78,6 +93,8 @@ fn proposal(candidate_id: &str, issue: &str, commit: &str, key: &str) -> Op {
         entity: issue.into(),
         store_id: "st-test".into(),
         repository_id: REPO.into(),
+        landing_repository_id: None,
+        object_source: None,
         object_format: "sha1".into(),
         commit_oid: commit.into(),
         base_oid: BASE.into(),
@@ -85,6 +102,7 @@ fn proposal(candidate_id: &str, issue: &str, commit: &str, key: &str) -> Op {
         paths: vec!["src/lib.rs".into()],
         authorizer: "authorizer".into(),
         reviewers: vec!["reviewer".into()],
+        review_policy: None,
         evidence_requirements: vec![EvidenceRequirement {
             name: GIT_ANCESTRY_EVIDENCE.into(),
             kind: "git".into(),
@@ -95,6 +113,21 @@ fn proposal(candidate_id: &str, issue: &str, commit: &str, key: &str) -> Op {
     })
 }
 
+fn proposal_with_authorizer(
+    candidate_id: &str,
+    issue: &str,
+    commit: &str,
+    authorizer: &str,
+    key: &str,
+) -> Op {
+    let mut op = proposal(candidate_id, issue, commit, key);
+    let Op::CandidatePropose(proposal) = &mut op else {
+        unreachable!()
+    };
+    proposal.authorizer = authorizer.into();
+    op
+}
+
 fn ancestry_payload(
     candidate_id: &str,
     commit: &str,
@@ -103,6 +136,7 @@ fn ancestry_payload(
 ) -> CandidateEvidencePayload {
     let _ = candidate_id;
     CandidateEvidencePayload::GitAncestry(GitAncestryReceipt {
+        relation_schema: 1,
         repository_id: REPO.into(),
         object_format: "sha1".into(),
         common_dir_hash: "common".into(),
@@ -112,9 +146,61 @@ fn ancestry_payload(
         base_is_ancestor: Some(true),
         candidate_relations: relations,
         covered_candidates: covered,
+        producer_snapshot: None,
         git_version: "git version test".into(),
         detail: None,
     })
+}
+
+fn v2_ancestry_payload(
+    commit: &str,
+    observed: Vec<(String, String)>,
+    relations: Vec<GitCandidateRelation>,
+    snapshot_digest: &str,
+) -> CandidateEvidencePayload {
+    CandidateEvidencePayload::GitAncestry(GitAncestryReceipt {
+        relation_schema: GIT_RELATION_SCHEMA_V2,
+        repository_id: REPO.into(),
+        object_format: "sha1".into(),
+        common_dir_hash: "common".into(),
+        commit_oid: commit.into(),
+        base_oid: BASE.into(),
+        parent_oids: vec![BASE.into()],
+        base_is_ancestor: Some(true),
+        candidate_relations: relations,
+        covered_candidates: observed.clone(),
+        producer_snapshot: Some(Box::new(CandidateSnapshotProvenance {
+            store_id: "st-test".into(),
+            replayed_op_count: observed.len() as u64,
+            observed_candidates: observed,
+            replayed_op_ids_digest: snapshot_digest.into(),
+            store_git_head: None,
+            uncommitted_op_count: None,
+        })),
+        git_version: "git version test".into(),
+        detail: None,
+    })
+}
+
+fn v2_relation(
+    candidate_id: &str,
+    proposal_op_id: &str,
+    commit_oid: &str,
+    base_relation: GitRelationKind,
+    tip_relation: GitRelationKind,
+    reciprocal_base_relation: GitRelationKind,
+    reciprocal_tip_relation: GitRelationKind,
+) -> GitCandidateRelation {
+    GitCandidateRelation {
+        candidate_id: candidate_id.into(),
+        proposal_op_id: proposal_op_id.into(),
+        commit_oid: commit_oid.into(),
+        base_oid: Some(BASE.into()),
+        base_relation: Some(base_relation),
+        relation: tip_relation,
+        subject_to_known_base: Some(reciprocal_base_relation),
+        subject_to_known_tip: Some(reciprocal_tip_relation),
+    }
 }
 
 fn evidence(candidate_id: &str, payload: CandidateEvidencePayload, key: &str) -> Op {
@@ -139,6 +225,157 @@ fn evidence(candidate_id: &str, payload: CandidateEvidencePayload, key: &str) ->
     })
 }
 
+fn reachability_evidence(
+    candidate_id: &str,
+    actor: &str,
+    outcome: EvidenceOutcome,
+    reachable: Option<bool>,
+    repository_id: &str,
+    key: &str,
+) -> (Op, String) {
+    let payload = CandidateEvidencePayload::GitReachability(GitReachabilityReceipt {
+        repository_id: repository_id.into(),
+        object_format: "sha1".into(),
+        candidate_oid: COMMIT_A.into(),
+        target_ref: "refs/heads/main".into(),
+        observed_target_oid: COMMIT_A.into(),
+        candidate_reachable: reachable,
+        git_version: "git version test".into(),
+        detail: None,
+    });
+    let evidence_id = mote::candidate::evidence_id(&payload).unwrap();
+    (
+        Op::CandidateEvidence(CandidateEvidenceOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: actor.into(),
+            candidate_id: candidate_id.into(),
+            candidate_oid: COMMIT_A.into(),
+            evidence_id: evidence_id.clone(),
+            name: GIT_REACHABILITY_EVIDENCE.into(),
+            evidence_kind: "git".into(),
+            producer_tool: "git version test".into(),
+            outcome,
+            payload,
+            refs: Vec::new(),
+            idempotency_key: key.into(),
+        }),
+        evidence_id,
+    )
+}
+
+fn reconcile(
+    candidate_id: &str,
+    actor: &str,
+    evidence_id: &str,
+    expect_phase: &str,
+    policy_snapshot: CandidatePolicySnapshot,
+    key: &str,
+) -> Op {
+    Op::CandidateReconcile(CandidateReconcileOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(Timestamp::now()),
+        actor: actor.into(),
+        candidate_id: candidate_id.into(),
+        evidence_id: evidence_id.into(),
+        target_ref: "refs/heads/main".into(),
+        expect_phase: expect_phase.into(),
+        authority: CandidateReconciliationAuthority::ProposalAuthorizer,
+        policy_snapshot,
+        idempotency_key: key.into(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn containment_recovery(
+    predecessor_id: &str,
+    successor_id: &str,
+    actor: &str,
+    expect_phase: &str,
+    expect_successor_phase: &str,
+    evidence_op_ids: Vec<String>,
+    authority: CandidateSupersessionAuthority,
+    key: &str,
+) -> Op {
+    Op::CandidateSupersede(CandidateSupersedeOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(Timestamp::now()),
+        actor: actor.into(),
+        candidate_id: predecessor_id.into(),
+        successor_id: successor_id.into(),
+        expect_phase: expect_phase.into(),
+        recovery: Some(CandidateSupersedeRecovery {
+            authority,
+            expect_successor_phase: expect_successor_phase.into(),
+            containment_evidence_op_ids: evidence_op_ids,
+        }),
+        idempotency_key: key.into(),
+    })
+}
+
+#[test]
+fn legacy_git_ancestry_payload_defaults_to_one_directional_schema() {
+    let payload: CandidateEvidencePayload = serde_json::from_value(serde_json::json!({
+        "kind": "git_ancestry",
+        "repository_id": REPO,
+        "object_format": "sha1",
+        "common_dir_hash": "common",
+        "commit_oid": COMMIT_A,
+        "base_oid": BASE,
+        "parent_oids": [BASE],
+        "base_is_ancestor": true,
+        "candidate_relations": [{
+            "candidate_id": "cand-legacy",
+            "proposal_op_id": "op-legacy",
+            "commit_oid": COMMIT_B,
+            "base_relation": "not_ancestor",
+            "relation": "not_ancestor"
+        }],
+        "covered_candidates": [["cand-legacy", "op-legacy"]],
+        "git_version": "git version legacy"
+    }))
+    .unwrap();
+    let CandidateEvidencePayload::GitAncestry(receipt) = payload else {
+        unreachable!();
+    };
+    assert_eq!(receipt.relation_schema, 1);
+    assert!(receipt.producer_snapshot.is_none());
+    assert!(receipt.candidate_relations[0].base_oid.is_none());
+    assert!(
+        receipt.candidate_relations[0]
+            .subject_to_known_base
+            .is_none()
+    );
+    assert!(
+        receipt.candidate_relations[0]
+            .subject_to_known_tip
+            .is_none()
+    );
+}
+
+#[test]
+fn legacy_candidate_supersede_payload_defaults_to_owner_mode() {
+    let op: Op = serde_json::from_value(serde_json::json!({
+        "v": 1,
+        "op": "op-legacy",
+        "ts": "2026-08-30T00:00:00Z",
+        "actor": "proposer",
+        "kind": "candidate_supersede",
+        "candidate_id": "cand-01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "successor_id": "cand-01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "expect_phase": "op-proposal",
+        "idempotency_key": "legacy-supersede"
+    }))
+    .unwrap();
+    let Op::CandidateSupersede(supersede) = op else {
+        unreachable!()
+    };
+    assert!(supersede.recovery.is_none());
+}
+
 fn approve(candidate_id: &str, key: &str) -> Op {
     Op::CandidateReview(CandidateReviewOp {
         v: 1,
@@ -150,16 +387,21 @@ fn approve(candidate_id: &str, key: &str) -> Op {
         body: None,
         evidence_refs: Vec::new(),
         expect_review: None,
+        role: None,
         idempotency_key: key.into(),
     })
 }
 
 fn authorize(candidate_id: &str, key: &str) -> Op {
+    authorize_as(candidate_id, "authorizer", key)
+}
+
+fn authorize_as(candidate_id: &str, actor: &str, key: &str) -> Op {
     Op::CandidateAuthorize(CandidateAuthorizeOp {
         v: 1,
         op: String::new(),
         ts: ids::format_rfc3339(Timestamp::now()),
-        actor: "authorizer".into(),
+        actor: actor.into(),
         candidate_id: candidate_id.into(),
         status: AuthorizationStatus::Granted,
         grantees: vec!["lander".into()],
@@ -310,6 +552,314 @@ fn happy_path_consumes_authorization_and_is_replay_deterministic() {
 }
 
 #[test]
+fn out_of_band_reconciliation_preserves_policy_and_resolves_descendants() {
+    let (_temp, store, issue) = setup();
+    let candidate_id = ids::new_candidate_id();
+    let proposal_op = publish_checked(
+        &store,
+        &proposal(&candidate_id, &issue, COMMIT_A, "reconcile-proposal"),
+    );
+    let reservation_id = reserve_candidate(&store, &candidate_id, "proposer");
+    publish_checked(
+        &store,
+        &evidence(
+            &candidate_id,
+            ancestry_payload(&candidate_id, COMMIT_A, Vec::new(), Vec::new()),
+            "reconcile-ancestry",
+        ),
+    );
+
+    let (wrong_actor_evidence, _) = reachability_evidence(
+        &candidate_id,
+        "intruder",
+        EvidenceOutcome::Pass,
+        Some(true),
+        REPO,
+        "reconcile-wrong-producer",
+    );
+    publish_rejected(&store, &wrong_actor_evidence, "not a named producer");
+
+    let (failed_evidence, failed_id) = reachability_evidence(
+        &candidate_id,
+        "authorizer",
+        EvidenceOutcome::Fail,
+        Some(false),
+        REPO,
+        "reconcile-not-ancestor",
+    );
+    publish_checked(&store, &failed_evidence);
+    let state = reducer::replay_store(&store).unwrap();
+    let failed_snapshot = state.candidate_policy_snapshot(&candidate_id).unwrap();
+    publish_rejected(
+        &store,
+        &reconcile(
+            &candidate_id,
+            "authorizer",
+            &failed_id,
+            &proposal_op,
+            failed_snapshot,
+            "reconcile-failed-receipt",
+        ),
+        "passing exact-reachability receipt",
+    );
+
+    let (passing_evidence, evidence_id) = reachability_evidence(
+        &candidate_id,
+        "authorizer",
+        EvidenceOutcome::Pass,
+        Some(true),
+        REPO,
+        "reconcile-passing-receipt",
+    );
+    publish_checked(&store, &passing_evidence);
+    let state = reducer::replay_store(&store).unwrap();
+    let stale_snapshot = state.candidate_policy_snapshot(&candidate_id).unwrap();
+    assert!(
+        stale_snapshot
+            .pre_transition_landability
+            .reason_codes
+            .contains(&"review_missing".into())
+    );
+    assert!(
+        stale_snapshot
+            .pre_transition_landability
+            .reason_codes
+            .contains(&"authorization_absent".into())
+    );
+    publish_rejected(
+        &store,
+        &reconcile(
+            &candidate_id,
+            "intruder",
+            &evidence_id,
+            &proposal_op,
+            stale_snapshot.clone(),
+            "reconcile-wrong-authority",
+        ),
+        "proposal-authorizer authority",
+    );
+
+    publish_checked(&store, &approve(&candidate_id, "reconcile-review-race"));
+    publish_rejected(
+        &store,
+        &reconcile(
+            &candidate_id,
+            "authorizer",
+            &evidence_id,
+            &proposal_op,
+            stale_snapshot,
+            "reconcile-stale-policy",
+        ),
+        "stale reconciliation policy snapshot CAS",
+    );
+
+    let authorization_op =
+        publish_checked(&store, &authorize(&candidate_id, "reconcile-authorization"));
+    let landing_payload = CandidateEvidencePayload::GitLanding(GitLandingReceipt {
+        repository_id: REPO.into(),
+        object_format: "sha1".into(),
+        candidate_oid: COMMIT_A.into(),
+        target_ref: "refs/heads/main".into(),
+        before_tip: Some(BASE.into()),
+        after_tip: COMMIT_A.into(),
+        candidate_reachable: Some(true),
+        authorization_op_id: authorization_op.clone(),
+        basis_op_ids: Vec::new(),
+        git_version: "git version test".into(),
+        detail: None,
+    });
+    let landing_evidence_id = mote::candidate::evidence_id(&landing_payload).unwrap();
+    publish_checked(
+        &store,
+        &Op::CandidateEvidence(CandidateEvidenceOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "lander".into(),
+            candidate_id: candidate_id.clone(),
+            candidate_oid: COMMIT_A.into(),
+            evidence_id: landing_evidence_id.clone(),
+            name: GIT_LANDING_EVIDENCE.into(),
+            evidence_kind: "git".into(),
+            producer_tool: "git version test".into(),
+            outcome: EvidenceOutcome::Pass,
+            payload: landing_payload,
+            refs: Vec::new(),
+            idempotency_key: "reconcile-governed-landing-receipt".into(),
+        }),
+    );
+
+    let state = reducer::replay_store(&store).unwrap();
+    let current_snapshot = state.candidate_policy_snapshot(&candidate_id).unwrap();
+    assert!(current_snapshot.pre_transition_landability.landable);
+    let reconciliation_op = publish_checked(
+        &store,
+        &reconcile(
+            &candidate_id,
+            "authorizer",
+            &evidence_id,
+            &proposal_op,
+            current_snapshot.clone(),
+            "reconcile-success",
+        ),
+    );
+    let first = format!("{:?}", reducer::replay_store(&store).unwrap());
+    let second = format!("{:?}", reducer::replay_store(&store).unwrap());
+    assert_eq!(first, second);
+
+    let state = reducer::replay_store(&store).unwrap();
+    let candidate = &state.candidates[&candidate_id];
+    assert_eq!(candidate.phase.as_str(), "landed_out_of_band");
+    assert_eq!(candidate.phase_op_id, reconciliation_op);
+    assert!(candidate.landed.is_none());
+    let authorization = candidate.authorization.as_ref().unwrap();
+    assert_eq!(authorization.op_id, authorization_op);
+    assert_eq!(authorization.status, AuthorizationStatus::Granted);
+    let recorded = candidate.reconciled.as_ref().unwrap();
+    assert_eq!(recorded.policy_snapshot, current_snapshot);
+    assert_eq!(
+        recorded.policy_snapshot.authorization_op_id.as_deref(),
+        Some(authorization_op.as_str())
+    );
+    assert_eq!(
+        recorded.policy_snapshot.authorization_status,
+        Some(AuthorizationStatus::Granted)
+    );
+    assert_eq!(recorded.target_oid, COMMIT_A);
+    assert_eq!(
+        state.reservation_disposition(
+            &state.reservations[&reservation_id],
+            &ids::format_rfc3339(Timestamp::now())
+        ),
+        LeaseDisposition::Orphaned
+    );
+
+    publish_rejected(
+        &store,
+        &Op::CandidateRevoke(CandidateRevokeOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "authorizer".into(),
+            candidate_id: candidate_id.clone(),
+            expect_authorization: authorization_op.clone(),
+            reason: Some("lost terminal race".into()),
+            idempotency_key: "reconcile-late-revoke".into(),
+        }),
+        "pending phase",
+    );
+    publish_rejected(
+        &store,
+        &Op::CandidateLanded(CandidateLandedOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "lander".into(),
+            candidate_id: candidate_id.clone(),
+            evidence_id: landing_evidence_id,
+            expect_phase: proposal_op.clone(),
+            expect_authorization: authorization_op,
+            target_ref: "refs/heads/main".into(),
+            idempotency_key: "reconcile-late-governed-landing".into(),
+        }),
+        "current pending phase",
+    );
+
+    let descendant_id = ids::new_candidate_id();
+    let descendant_proposal = publish_checked(
+        &store,
+        &proposal(
+            &descendant_id,
+            &issue,
+            COMMIT_B,
+            "reconcile-descendant-proposal",
+        ),
+    );
+    let observed = vec![
+        (candidate_id.clone(), proposal_op.clone()),
+        (descendant_id.clone(), descendant_proposal.clone()),
+    ];
+    publish_checked(
+        &store,
+        &evidence(
+            &descendant_id,
+            v2_ancestry_payload(
+                COMMIT_B,
+                observed,
+                vec![v2_relation(
+                    &candidate_id,
+                    &proposal_op,
+                    COMMIT_A,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::Ancestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                )],
+                "reconcile-descendant-snapshot",
+            ),
+            "reconcile-descendant-ancestry",
+        ),
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    let descendant_landability = state.candidate_landability(&descendant_id, None);
+    assert!(
+        !descendant_landability
+            .reason_codes
+            .contains(&"ancestor_pending".into())
+    );
+    assert!(
+        !descendant_landability
+            .reason_codes
+            .contains(&"ancestor_supersession_unresolved".into())
+    );
+}
+
+#[test]
+fn reachability_probe_fails_closed_for_identity_ref_and_object_gaps() {
+    let temp = TempDir::new().unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "Test"]);
+    std::fs::write(temp.path().join("work.txt"), "root\n").unwrap();
+    run_git(temp.path(), &["add", "work.txt"]);
+    run_git(temp.path(), &["commit", "-qm", "root"]);
+    let head = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    let ancestry = mote::candidate::probe_ancestry(temp.path(), &head, &head, &[]).unwrap();
+
+    assert!(
+        mote::candidate::probe_reachability(
+            temp.path(),
+            "repo-wrong",
+            &ancestry.object_format,
+            &head,
+            "HEAD",
+        )
+        .unwrap_err()
+        .contains("identity")
+    );
+    assert!(
+        mote::candidate::probe_reachability(
+            temp.path(),
+            &ancestry.repository_id,
+            &ancestry.object_format,
+            &head,
+            "refs/heads/missing",
+        )
+        .is_err()
+    );
+    let missing_object = "ffffffffffffffffffffffffffffffffffffffff";
+    let receipt = mote::candidate::probe_reachability(
+        temp.path(),
+        &ancestry.repository_id,
+        &ancestry.object_format,
+        missing_object,
+        "HEAD",
+    )
+    .unwrap();
+    assert_eq!(receipt.candidate_reachable, None);
+}
+
+#[test]
 fn hidden_pending_ancestor_blocks_until_superseded_by_descendant() {
     let (_temp, store, issue) = setup();
     let old = ids::new_candidate_id();
@@ -344,8 +894,11 @@ fn hidden_pending_ancestor_blocks_until_superseded_by_descendant() {
                     candidate_id: old.clone(),
                     proposal_op_id: old_proposal,
                     commit_oid: COMMIT_A.into(),
+                    base_oid: None,
                     base_relation: Some(GitRelationKind::NotAncestor),
                     relation: GitRelationKind::Ancestor,
+                    subject_to_known_base: None,
+                    subject_to_known_tip: None,
                 }],
             ),
             "ancestry-new",
@@ -371,6 +924,7 @@ fn hidden_pending_ancestor_blocks_until_superseded_by_descendant() {
             candidate_id: old.clone(),
             successor_id: new.clone(),
             expect_phase: state.candidates[&old].phase_op_id.clone(),
+            recovery: None,
             idempotency_key: "supersede-old".into(),
         }),
     );
@@ -383,6 +937,813 @@ fn hidden_pending_ancestor_blocks_until_superseded_by_descendant() {
         ),
         LeaseDisposition::Orphaned
     );
+    assert_eq!(
+        state.candidates[&old]
+            .supersession
+            .as_ref()
+            .unwrap()
+            .authority,
+        CandidateSupersessionAuthority::PredecessorProposer
+    );
+}
+
+#[test]
+fn ordinary_supersession_still_accepts_the_predecessor_authorizer() {
+    let (_temp, store, issue) = setup();
+    let predecessor = ids::new_candidate_id();
+    let successor = ids::new_candidate_id();
+    publish_checked(
+        &store,
+        &proposal(
+            &predecessor,
+            &issue,
+            COMMIT_A,
+            "ordinary-authorizer-predecessor",
+        ),
+    );
+    publish_checked(
+        &store,
+        &proposal(
+            &successor,
+            &issue,
+            COMMIT_B,
+            "ordinary-authorizer-successor",
+        ),
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    publish_checked(
+        &store,
+        &Op::CandidateSupersede(CandidateSupersedeOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "authorizer".into(),
+            candidate_id: predecessor.clone(),
+            successor_id: successor,
+            expect_phase: state.candidates[&predecessor].phase_op_id.clone(),
+            recovery: None,
+            idempotency_key: "ordinary-authorizer-supersede".into(),
+        }),
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    let record = state.candidates[&predecessor]
+        .supersession
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        record.authority,
+        CandidateSupersessionAuthority::PredecessorAuthorizer
+    );
+    assert!(record.containment_evidence_op_ids.is_empty());
+}
+
+#[test]
+fn successor_authorizer_can_recover_only_with_exact_complete_containment_evidence() {
+    let (temp, store, issue) = setup();
+    let predecessor = ids::new_candidate_id();
+    let successor = ids::new_candidate_id();
+    let predecessor_proposal = publish_checked(
+        &store,
+        &proposal_with_authorizer(
+            &predecessor,
+            &issue,
+            COMMIT_A,
+            "predecessor-authorizer",
+            "recovery-predecessor",
+        ),
+    );
+    publish_checked(
+        &store,
+        &proposal_with_authorizer(
+            &successor,
+            &issue,
+            COMMIT_B,
+            "successor-authorizer",
+            "recovery-successor",
+        ),
+    );
+
+    let complete_payload = |digest: &str| {
+        v2_ancestry_payload(
+            COMMIT_B,
+            vec![(predecessor.clone(), predecessor_proposal.clone())],
+            vec![v2_relation(
+                &predecessor,
+                &predecessor_proposal,
+                COMMIT_A,
+                GitRelationKind::NotAncestor,
+                GitRelationKind::Ancestor,
+                GitRelationKind::NotAncestor,
+                GitRelationKind::NotAncestor,
+            )],
+            digest,
+        )
+    };
+    let initial_evidence = publish_checked(
+        &store,
+        &evidence(
+            &successor,
+            complete_payload("recovery-initial-complete"),
+            "recovery-initial-evidence",
+        ),
+    );
+    publish_checked(&store, &approve(&successor, "recovery-review-successor"));
+    publish_checked(
+        &store,
+        &authorize_as(
+            &successor,
+            "successor-authorizer",
+            "recovery-authorize-successor",
+        ),
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    let predecessor_phase = state.candidates[&predecessor].phase_op_id.clone();
+    let successor_phase = state.candidates[&successor].phase_op_id.clone();
+    let initial_basis = state
+        .candidate_containment_basis(&predecessor, &successor)
+        .unwrap();
+    assert_eq!(
+        initial_basis.evidence_op_ids.as_slice(),
+        std::slice::from_ref(&initial_evidence)
+    );
+    assert!(
+        state
+            .candidate_landability(&successor, Some("lander"))
+            .reason_codes
+            .contains(&"ancestor_pending".into())
+    );
+
+    publish_rejected(
+        &store,
+        &containment_recovery(
+            &predecessor,
+            &successor,
+            "intruder",
+            &predecessor_phase,
+            &successor_phase,
+            vec![initial_evidence.clone()],
+            CandidateSupersessionAuthority::SuccessorAuthorizerContainment,
+            "recovery-intruder",
+        ),
+        "immutable successor authorizer",
+    );
+    publish_rejected(
+        &store,
+        &containment_recovery(
+            &predecessor,
+            &successor,
+            "successor-authorizer",
+            &predecessor_phase,
+            &successor_phase,
+            vec![initial_evidence.clone()],
+            CandidateSupersessionAuthority::PredecessorProposer,
+            "recovery-false-authority",
+        ),
+        "immutable successor authorizer",
+    );
+    publish_rejected(
+        &store,
+        &containment_recovery(
+            &predecessor,
+            &successor,
+            "successor-authorizer",
+            &predecessor_phase,
+            "op-stale-successor-phase",
+            vec![initial_evidence.clone()],
+            CandidateSupersessionAuthority::SuccessorAuthorizerContainment,
+            "recovery-stale-successor",
+        ),
+        "current successor phase CAS",
+    );
+    publish_rejected(
+        &store,
+        &containment_recovery(
+            &predecessor,
+            &successor,
+            "successor-authorizer",
+            &predecessor_phase,
+            &successor_phase,
+            vec!["op-stale-evidence".into()],
+            CandidateSupersessionAuthority::SuccessorAuthorizerContainment,
+            "recovery-stale-evidence",
+        ),
+        "stale containment evidence CAS",
+    );
+
+    let not_contained = publish_checked(
+        &store,
+        &evidence(
+            &successor,
+            v2_ancestry_payload(
+                COMMIT_B,
+                vec![(predecessor.clone(), predecessor_proposal.clone())],
+                vec![v2_relation(
+                    &predecessor,
+                    &predecessor_proposal,
+                    COMMIT_A,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                )],
+                "recovery-not-contained",
+            ),
+            "recovery-not-contained-evidence",
+        ),
+    );
+    publish_rejected(
+        &store,
+        &containment_recovery(
+            &predecessor,
+            &successor,
+            "successor-authorizer",
+            &predecessor_phase,
+            &successor_phase,
+            vec![not_contained],
+            CandidateSupersessionAuthority::SuccessorAuthorizerContainment,
+            "recovery-not-contained-attempt",
+        ),
+        "predecessor commit is an ancestor",
+    );
+
+    let partial = publish_checked(
+        &store,
+        &evidence(
+            &successor,
+            v2_ancestry_payload(
+                COMMIT_B,
+                vec![(predecessor.clone(), predecessor_proposal.clone())],
+                vec![v2_relation(
+                    &predecessor,
+                    &predecessor_proposal,
+                    COMMIT_A,
+                    GitRelationKind::Unavailable,
+                    GitRelationKind::Ancestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                )],
+                "recovery-partial",
+            ),
+            "recovery-partial-evidence",
+        ),
+    );
+    publish_rejected(
+        &store,
+        &containment_recovery(
+            &predecessor,
+            &successor,
+            "successor-authorizer",
+            &predecessor_phase,
+            &successor_phase,
+            vec![partial],
+            CandidateSupersessionAuthority::SuccessorAuthorizerContainment,
+            "recovery-partial-attempt",
+        ),
+        "complete determinate evidence",
+    );
+
+    let final_evidence = publish_checked(
+        &store,
+        &evidence(
+            &successor,
+            complete_payload("recovery-final-complete"),
+            "recovery-final-evidence",
+        ),
+    );
+    let args = [
+        "--json",
+        "--actor",
+        "successor-authorizer",
+        "candidate",
+        "supersede",
+        &predecessor,
+        &successor,
+        "--expect-phase",
+        &predecessor_phase,
+        "--containment-recovery",
+        "--idempotency-key",
+        "recovery-cli-success",
+    ];
+    let recovered = run_mote(temp.path(), &args);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered_json: serde_json::Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered_json["phase"]["value"], "superseded");
+    assert_eq!(
+        recovered_json["supersession"]["record"]["authority"],
+        "successor_authorizer_containment"
+    );
+    assert_eq!(
+        recovered_json["supersession"]["record"]["containment_evidence_op_ids"][0],
+        final_evidence
+    );
+    let shown = run_mote(temp.path(), &["candidate", "show", &predecessor]);
+    assert!(shown.status.success());
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert!(
+        shown.contains("authority=successor_authorizer_containment"),
+        "{shown}"
+    );
+
+    let state = reducer::replay_store(&store).unwrap();
+    let record = state.candidates[&predecessor]
+        .supersession
+        .as_ref()
+        .unwrap();
+    assert_eq!(record.actor, "successor-authorizer");
+    assert_eq!(
+        record.authority,
+        CandidateSupersessionAuthority::SuccessorAuthorizerContainment
+    );
+    assert_eq!(record.containment_evidence_op_ids, [final_evidence]);
+    assert_eq!(record.op_id, state.candidates[&predecessor].phase_op_id);
+    assert!(
+        state
+            .candidate_landability(&successor, Some("lander"))
+            .landable
+    );
+    assert_eq!(
+        format!("{:?}", reducer::replay_store(&store).unwrap()),
+        format!("{:?}", state)
+    );
+
+    let audit = run_mote(temp.path(), &["--json", "audit", "--fail-on", "never"]);
+    assert!(audit.status.success());
+    let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert!(audit["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["code"] == "candidate_containment_recovery_recorded"
+            && finding["subject"] == predecessor
+    }));
+
+    let op_count_before_retry = store.list_op_filenames().unwrap().len();
+    let retry = run_mote(temp.path(), &args);
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(
+        store.list_op_filenames().unwrap().len(),
+        op_count_before_retry,
+        "recovery retry must return the accepted action without publishing a new snapshot"
+    );
+    let accepted_phase = reducer::replay_store(&store).unwrap().candidates[&predecessor]
+        .phase_op_id
+        .clone();
+    assert_eq!(accepted_phase, record.op_id);
+
+    publish_rejected(
+        &store,
+        &containment_recovery(
+            &predecessor,
+            &successor,
+            "successor-authorizer",
+            &predecessor_phase,
+            &successor_phase,
+            record.containment_evidence_op_ids.clone(),
+            CandidateSupersessionAuthority::SuccessorAuthorizerContainment,
+            "recovery-after-terminal-race",
+        ),
+        "current predecessor phase CAS",
+    );
+}
+
+#[test]
+fn newer_v2_receipt_resolves_an_unrelated_older_candidate_without_refreshing_it() {
+    let (_temp, store, issue) = setup();
+    let old = ids::new_candidate_id();
+    let new = ids::new_candidate_id();
+    let _old_proposal = publish_checked(
+        &store,
+        &proposal(&old, &issue, COMMIT_A, "propose-old-unrelated"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &old,
+            ancestry_payload(&old, COMMIT_A, Vec::new(), Vec::new()),
+            "ancestry-old-unrelated",
+        ),
+    );
+    publish_checked(&store, &approve(&old, "review-old-unrelated"));
+    publish_checked(&store, &authorize(&old, "authorize-old-unrelated"));
+    assert!(
+        reducer::replay_store(&store)
+            .unwrap()
+            .candidate_landability(&old, Some("lander"))
+            .landable
+    );
+
+    let new_proposal = publish_checked(
+        &store,
+        &proposal(&new, &issue, COMMIT_B, "propose-new-unrelated"),
+    );
+    let stale = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_landability(&old, Some("lander"));
+    assert!(stale.reason_codes.contains(&"git_evidence_stale".into()));
+
+    let old_proposal = reducer::replay_store(&store).unwrap().candidates[&old]
+        .proposal_op_id
+        .clone();
+    publish_checked(
+        &store,
+        &evidence(
+            &new,
+            v2_ancestry_payload(
+                COMMIT_B,
+                vec![(old.clone(), old_proposal.clone())],
+                vec![v2_relation(
+                    &old,
+                    &old_proposal,
+                    COMMIT_A,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                )],
+                "snapshot-new-unrelated",
+            ),
+            "ancestry-new-unrelated",
+        ),
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    assert_eq!(state.candidates[&new].proposal_op_id, new_proposal);
+    let restored = state.candidate_landability(&old, Some("lander"));
+    assert!(restored.landable, "{restored:?}");
+}
+
+#[test]
+fn reciprocal_v2_evidence_with_the_wrong_known_base_cannot_resolve_a_pair() {
+    let (_temp, store, issue) = setup();
+    let old = ids::new_candidate_id();
+    let new = ids::new_candidate_id();
+    let old_proposal = publish_checked(
+        &store,
+        &proposal(&old, &issue, COMMIT_A, "propose-anchor-old"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &old,
+            ancestry_payload(&old, COMMIT_A, Vec::new(), Vec::new()),
+            "ancestry-anchor-old",
+        ),
+    );
+    publish_checked(
+        &store,
+        &proposal(&new, &issue, COMMIT_B, "propose-anchor-new"),
+    );
+    let mut wrong_anchor = v2_relation(
+        &old,
+        &old_proposal,
+        COMMIT_A,
+        GitRelationKind::NotAncestor,
+        GitRelationKind::NotAncestor,
+        GitRelationKind::NotAncestor,
+        GitRelationKind::NotAncestor,
+    );
+    wrong_anchor.base_oid = Some(COMMIT_B.into());
+    publish_checked(
+        &store,
+        &evidence(
+            &new,
+            v2_ancestry_payload(
+                COMMIT_B,
+                vec![(old.clone(), old_proposal)],
+                vec![wrong_anchor],
+                "snapshot-wrong-known-base",
+            ),
+            "ancestry-wrong-known-base",
+        ),
+    );
+
+    let landability = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_landability(&old, Some("lander"));
+    assert!(
+        landability
+            .reason_codes
+            .contains(&"git_evidence_stale".into()),
+        "{landability:?}"
+    );
+}
+
+#[test]
+fn newer_v2_receipt_exposes_a_hidden_ancestor_of_an_older_candidate() {
+    let (_temp, store, issue) = setup();
+    let old = ids::new_candidate_id();
+    let new_ancestor = ids::new_candidate_id();
+    let old_proposal = publish_checked(
+        &store,
+        &proposal(&old, &issue, COMMIT_B, "propose-old-descendant"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &old,
+            ancestry_payload(&old, COMMIT_B, Vec::new(), Vec::new()),
+            "ancestry-old-descendant",
+        ),
+    );
+    publish_checked(&store, &approve(&old, "review-old-descendant"));
+    publish_checked(&store, &authorize(&old, "authorize-old-descendant"));
+    publish_checked(
+        &store,
+        &proposal(&new_ancestor, &issue, COMMIT_A, "propose-later-ancestor"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &new_ancestor,
+            v2_ancestry_payload(
+                COMMIT_A,
+                vec![(old.clone(), old_proposal.clone())],
+                vec![v2_relation(
+                    &old,
+                    &old_proposal,
+                    COMMIT_B,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::Ancestor,
+                )],
+                "snapshot-later-ancestor",
+            ),
+            "ancestry-later-ancestor",
+        ),
+    );
+
+    let landability = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_landability(&old, Some("lander"));
+    assert!(
+        landability
+            .reason_codes
+            .contains(&"ancestor_pending".into()),
+        "{landability:?}"
+    );
+    assert!(
+        !landability
+            .reason_codes
+            .contains(&"git_evidence_stale".into())
+    );
+}
+
+#[test]
+fn concurrent_v2_snapshots_that_omit_each_other_remain_stale() {
+    let (temp, store, issue) = setup();
+    let first = ids::new_candidate_id();
+    let second = ids::new_candidate_id();
+    let first_proposal = publish_checked(
+        &store,
+        &proposal(&first, &issue, COMMIT_A, "propose-concurrent-first"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &first,
+            v2_ancestry_payload(COMMIT_A, Vec::new(), Vec::new(), "snapshot-first-empty"),
+            "ancestry-concurrent-first",
+        ),
+    );
+    let second_proposal = publish_checked(
+        &store,
+        &proposal(&second, &issue, COMMIT_B, "propose-concurrent-second"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &second,
+            v2_ancestry_payload(COMMIT_B, Vec::new(), Vec::new(), "snapshot-second-empty"),
+            "ancestry-concurrent-second",
+        ),
+    );
+
+    let state = reducer::replay_store(&store).unwrap();
+    for candidate_id in [&first, &second] {
+        let landability = state.candidate_landability(candidate_id, Some("lander"));
+        assert!(
+            landability
+                .reason_codes
+                .contains(&"git_evidence_stale".into()),
+            "{candidate_id}: {landability:?}"
+        );
+    }
+    let first_landability = state.candidate_landability(&first, Some("lander"));
+    let stale_detail = &first_landability
+        .reasons
+        .iter()
+        .find(|reason| reason.code == "git_evidence_stale")
+        .unwrap()
+        .detail;
+    assert!(
+        stale_detail.contains(&format!("predates proposal op {second_proposal}")),
+        "{stale_detail}"
+    );
+    assert!(
+        stale_detail.contains(&format!(
+            "proposal op {first_proposal} is absent from the declared producer snapshot"
+        )),
+        "{stale_detail}"
+    );
+    assert!(
+        stale_detail
+            .contains("repeating the refresh in this producer checkout cannot repair the target"),
+        "{stale_detail}"
+    );
+    assert!(
+        stale_detail.contains("refresh from a store snapshot containing both exact proposal ops"),
+        "{stale_detail}"
+    );
+
+    let shown = run_mote(temp.path(), &["candidate", "show", &first]);
+    assert!(shown.status.success());
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert!(shown.contains("git_evidence_stale"), "{shown}");
+    assert!(
+        shown.contains("absent from the declared producer snapshot"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn stale_pair_diagnostic_falls_back_honestly_for_legacy_receipts() {
+    let (_temp, store, issue) = setup();
+    let first = ids::new_candidate_id();
+    let second = ids::new_candidate_id();
+    publish_checked(
+        &store,
+        &proposal(&first, &issue, COMMIT_A, "propose-legacy-first"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &first,
+            ancestry_payload(&first, COMMIT_A, Vec::new(), Vec::new()),
+            "ancestry-legacy-first",
+        ),
+    );
+    publish_checked(
+        &store,
+        &proposal(&second, &issue, COMMIT_B, "propose-legacy-second"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &second,
+            ancestry_payload(&second, COMMIT_B, Vec::new(), Vec::new()),
+            "ancestry-legacy-second",
+        ),
+    );
+
+    let landability = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_landability(&first, Some("lander"));
+    let detail = &landability
+        .reasons
+        .iter()
+        .find(|reason| reason.code == "git_evidence_stale")
+        .unwrap()
+        .detail;
+    assert!(
+        detail.contains("legacy receipt without producer snapshot provenance"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("cannot distinguish incomplete input from malformed coverage"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn conflicting_determinate_pair_observations_fail_closed() {
+    let (_temp, store, issue) = setup();
+    let first = ids::new_candidate_id();
+    let second = ids::new_candidate_id();
+    let first_proposal = publish_checked(
+        &store,
+        &proposal(&first, &issue, COMMIT_A, "propose-conflict-first"),
+    );
+    let second_proposal = publish_checked(
+        &store,
+        &proposal(&second, &issue, COMMIT_B, "propose-conflict-second"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &first,
+            v2_ancestry_payload(
+                COMMIT_A,
+                vec![(second.clone(), second_proposal.clone())],
+                vec![v2_relation(
+                    &second,
+                    &second_proposal,
+                    COMMIT_B,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                )],
+                "snapshot-conflict-first",
+            ),
+            "ancestry-conflict-first",
+        ),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &second,
+            v2_ancestry_payload(
+                COMMIT_B,
+                vec![(first.clone(), first_proposal.clone())],
+                vec![v2_relation(
+                    &first,
+                    &first_proposal,
+                    COMMIT_A,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::Ancestor,
+                    GitRelationKind::Ancestor,
+                )],
+                "snapshot-conflict-second",
+            ),
+            "ancestry-conflict-second",
+        ),
+    );
+
+    let landability = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_landability(&first, Some("lander"));
+    assert!(
+        landability
+            .reason_codes
+            .contains(&"ancestor_ambiguous".into()),
+        "{landability:?}"
+    );
+    assert!(landability.reasons.iter().any(|reason| {
+        reason.code == "ancestor_ambiguous" && reason.detail.contains("conflicting determinate")
+    }));
+}
+
+#[test]
+fn later_snapshot_omission_does_not_erase_an_explicit_pair_fact() {
+    let (_temp, store, issue) = setup();
+    let first = ids::new_candidate_id();
+    let second = ids::new_candidate_id();
+    publish_checked(
+        &store,
+        &proposal(&first, &issue, COMMIT_A, "propose-persistent-first"),
+    );
+    let second_proposal = publish_checked(
+        &store,
+        &proposal(&second, &issue, COMMIT_B, "propose-persistent-second"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &first,
+            v2_ancestry_payload(
+                COMMIT_A,
+                vec![(second.clone(), second_proposal.clone())],
+                vec![v2_relation(
+                    &second,
+                    &second_proposal,
+                    COMMIT_B,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                    GitRelationKind::NotAncestor,
+                )],
+                "snapshot-persistent-pair",
+            ),
+            "ancestry-persistent-pair",
+        ),
+    );
+    publish_checked(&store, &approve(&first, "review-persistent-first"));
+    publish_checked(&store, &authorize(&first, "authorize-persistent-first"));
+    assert!(
+        reducer::replay_store(&store)
+            .unwrap()
+            .candidate_landability(&first, Some("lander"))
+            .landable
+    );
+
+    publish_checked(
+        &store,
+        &evidence(
+            &first,
+            v2_ancestry_payload(COMMIT_A, Vec::new(), Vec::new(), "snapshot-later-omission"),
+            "ancestry-later-omission",
+        ),
+    );
+    let landability = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_landability(&first, Some("lander"));
+    assert!(landability.landable, "{landability:?}");
 }
 
 #[test]
@@ -415,8 +1776,11 @@ fn abandoned_ancestor_blocks_only_when_introduced_after_base_and_ambiguity_fails
                         candidate_id: old.clone(),
                         proposal_op_id: old_proposal.clone(),
                         commit_oid: COMMIT_A.into(),
+                        base_oid: None,
                         base_relation,
                         relation,
+                        subject_to_known_base: None,
+                        subject_to_known_tip: None,
                     }],
                 ),
                 key,
@@ -509,6 +1873,7 @@ fn authorization_race_and_idempotency_fail_closed() {
         body: None,
         evidence_refs: Vec::new(),
         expect_review: None,
+        role: None,
         idempotency_key: "same-key".into(),
     });
     let name = publish::publish_op(&store, &conflicting).unwrap();
@@ -605,6 +1970,7 @@ fn review_cas_and_terminal_abandon_are_one_way() {
         body: None,
         evidence_refs: Vec::new(),
         expect_review: None,
+        role: None,
         idempotency_key: "review-racer".into(),
     });
     let stale_name = publish::publish_op(&store, &stale_review).unwrap();
@@ -866,12 +2232,20 @@ fn git_probe_distinguishes_already_in_base_introduced_and_unrelated_relations() 
     let known = [KnownCandidate {
         candidate_id: "cand-known".into(),
         proposal_op_id: "op-known".into(),
-        repository_id: identity.repository_id,
+        repository_id: identity.repository_id.clone(),
+        landing_repository_id: identity.repository_id,
+        object_format: identity.object_format,
         commit_oid: known_oid.clone(),
+        base_oid: root.clone(),
     }];
 
     let already =
         mote::candidate::probe_ancestry(temp.path(), &descendant, &known_oid, &known).unwrap();
+    assert_eq!(already.relation_schema, GIT_RELATION_SCHEMA_V2);
+    assert_eq!(
+        already.candidate_relations[0].base_oid.as_deref(),
+        Some(root.as_str())
+    );
     assert_eq!(
         already.candidate_relations[0].base_relation,
         Some(GitRelationKind::Ancestor)
@@ -879,6 +2253,14 @@ fn git_probe_distinguishes_already_in_base_introduced_and_unrelated_relations() 
     assert_eq!(
         already.candidate_relations[0].relation,
         GitRelationKind::Ancestor
+    );
+    assert_eq!(
+        already.candidate_relations[0].subject_to_known_base,
+        Some(GitRelationKind::NotAncestor)
+    );
+    assert_eq!(
+        already.candidate_relations[0].subject_to_known_tip,
+        Some(GitRelationKind::NotAncestor)
     );
 
     let introduced =
@@ -970,7 +2352,67 @@ fn candidate_cli_happy_path_and_json_schema() {
     assert_eq!(proposed["phase"]["value"], "pending");
     assert!(proposed["identity"]["commit_oid"].as_str().unwrap().len() == 40);
     assert!(proposed["landability"]["reason_codes"].is_array());
+    let reasons = proposed["landability"]["reasons"].as_array().unwrap();
+    assert!(!reasons.is_empty());
+    assert!(reasons.iter().all(|reason| reason["class"].is_string()));
+    assert!(reasons.iter().all(|reason| reason["blocking"] == true));
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| { reason["code"] == "review_missing" && reason["class"] == "process" })
+    );
+    let human = run_mote(temp.path(), &["candidate", "show", candidate_id]);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("BLOCKED — process:"));
+    assert!(human.contains("review_missing [reviewer]: required reviewer has not approved"));
+    assert_eq!(proposed["evidence"][0]["payload"]["relation_schema"], 2);
+    let snapshot = &proposed["evidence"][0]["payload"]["producer_snapshot"];
+    assert_eq!(snapshot["store_id"], store.read_format().unwrap().store_id);
+    assert_eq!(snapshot["replayed_op_count"], 1);
+    assert_eq!(
+        snapshot["replayed_op_ids_digest"].as_str().unwrap().len(),
+        64
+    );
+    assert!(
+        snapshot["observed_candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(snapshot["store_git_head"].as_str().unwrap().len(), 40);
+    assert!(snapshot["uncommitted_op_count"].as_u64().unwrap() >= 1);
     let phase_op = proposed["phase"]["op_id"].as_str().unwrap();
+
+    let refresh_args = [
+        "--json",
+        "--actor",
+        "proposer",
+        "candidate",
+        "evidence",
+        "refresh",
+        candidate_id,
+        "--idempotency-key",
+        "cli-refresh-retry",
+    ];
+    let refreshed = run_mote(temp.path(), &refresh_args);
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let op_count_after_refresh = store.list_op_filenames().unwrap().len();
+    let retried = run_mote(temp.path(), &refresh_args);
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert_eq!(
+        store.list_op_filenames().unwrap().len(),
+        op_count_after_refresh,
+        "an idempotent refresh retry must not publish a snapshot with a changed digest"
+    );
 
     let reserved = run_mote(
         temp.path(),
@@ -1194,6 +2636,314 @@ fn candidate_cli_happy_path_and_json_schema() {
             .iter()
             .all(|event| event["type"] != "candidate.proposed")
     );
+}
+
+#[test]
+fn candidate_cli_reconciles_out_of_band_without_rewriting_governance() {
+    let temp = TempDir::new().unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "Test"]);
+    std::fs::write(temp.path().join("work.txt"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "work.txt"]);
+    run_git(temp.path(), &["commit", "-qm", "base"]);
+    let base = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(temp.path().join("work.txt"), "candidate\n").unwrap();
+    run_git(temp.path(), &["commit", "-qam", "candidate"]);
+    let candidate_oid = run_git(temp.path(), &["rev-parse", "HEAD"]);
+
+    let store = Store::init(temp.path()).unwrap();
+    let issue = ids::new_bead_id();
+    publish::publish_op(
+        &store,
+        &make_create(
+            "proposer".into(),
+            issue.clone(),
+            ScalarSet {
+                title: Some("out-of-band candidate".into()),
+                ..Default::default()
+            },
+            Timestamp::now(),
+        ),
+    )
+    .unwrap();
+
+    let proposed = run_mote(
+        temp.path(),
+        &[
+            "--json",
+            "--actor",
+            "proposer",
+            "candidate",
+            "propose",
+            "--issue",
+            &issue,
+            "--base",
+            &base,
+            "--path",
+            "work.txt",
+            "--authorizer",
+            "authorizer",
+            "--reviewer",
+            "reviewer",
+            "--idempotency-key",
+            "reconcile-cli-propose",
+        ],
+    );
+    assert!(
+        proposed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&proposed.stderr)
+    );
+    let proposed: serde_json::Value = serde_json::from_slice(&proposed.stdout).unwrap();
+    let candidate_id = proposed["candidate_id"].as_str().unwrap().to_string();
+    let phase_op = proposed["phase"]["op_id"].as_str().unwrap().to_string();
+
+    let reserved = run_mote(
+        temp.path(),
+        &[
+            "--actor",
+            "proposer",
+            "reserve",
+            "work.txt",
+            "--candidate",
+            &candidate_id,
+        ],
+    );
+    assert!(reserved.status.success());
+
+    let op_count_before_intruder = store.list_op_filenames().unwrap().len();
+    let intruder = run_mote(
+        temp.path(),
+        &[
+            "--actor",
+            "intruder",
+            "candidate",
+            "reconcile",
+            &candidate_id,
+            "--target",
+            "HEAD",
+            "--expect-phase",
+            &phase_op,
+            "--idempotency-key",
+            "reconcile-cli-intruder",
+        ],
+    );
+    assert_eq!(intruder.status.code(), Some(2));
+    assert_eq!(
+        store.list_op_filenames().unwrap().len(),
+        op_count_before_intruder,
+        "authority is checked before probing or publishing evidence"
+    );
+
+    let reconcile_args = [
+        "--json",
+        "--actor",
+        "authorizer",
+        "candidate",
+        "reconcile",
+        &candidate_id,
+        "--target",
+        "HEAD",
+        "--expect-phase",
+        &phase_op,
+        "--idempotency-key",
+        "reconcile-cli-success",
+    ];
+    let reconciled = run_mote(temp.path(), &reconcile_args);
+    assert!(
+        reconciled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reconciled.stderr)
+    );
+    let reconciled: serde_json::Value = serde_json::from_slice(&reconciled.stdout).unwrap();
+    assert_eq!(reconciled["phase"]["value"], "landed_out_of_band");
+    assert!(reconciled["landing"].is_null());
+    assert!(reconciled["authorization"].is_null());
+    assert_eq!(
+        reconciled["reconciliation"]["authority"],
+        "proposal_authorizer"
+    );
+    assert_eq!(reconciled["reconciliation"]["target_oid"], candidate_oid);
+    assert_eq!(
+        reconciled["reconciliation"]["policy_snapshot"]["authorization_op_id"],
+        serde_json::Value::Null
+    );
+    let preserved_codes = reconciled["reconciliation"]["policy_snapshot"]
+        ["pre_transition_landability"]["reason_codes"]
+        .as_array()
+        .unwrap();
+    assert!(preserved_codes.iter().any(|code| code == "review_missing"));
+    assert!(
+        preserved_codes
+            .iter()
+            .any(|code| code == "authorization_absent")
+    );
+    assert_eq!(reconciled["reservations"][0]["disposition"], "orphaned");
+    assert!(
+        reconciled["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|receipt| {
+                receipt["name"] == GIT_REACHABILITY_EVIDENCE
+                    && receipt["outcome"] == "pass"
+                    && receipt["payload"]["kind"] == "git_reachability"
+            })
+    );
+
+    let op_count_after_success = store.list_op_filenames().unwrap().len();
+    let retry = run_mote(temp.path(), &reconcile_args);
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(
+        store.list_op_filenames().unwrap().len(),
+        op_count_after_success,
+        "an exact reconciliation retry must not re-probe or publish"
+    );
+
+    let human = run_mote(temp.path(), &["candidate", "show", &candidate_id]);
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("landed_out_of_band"));
+    assert!(human.contains("formal review/authorization did not govern this landing"));
+    assert!(human.contains("preserved pre-transition blockers"));
+
+    let listed = run_mote(
+        temp.path(),
+        &[
+            "--json",
+            "candidate",
+            "list",
+            "--phase",
+            "landed_out_of_band",
+        ],
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+
+    let events = run_mote(temp.path(), &["--json", "events", "--kind", "candidate"]);
+    let events: Vec<serde_json::Value> = String::from_utf8(events.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let event = events
+        .iter()
+        .find(|event| event["type"] == "candidate.landed_out_of_band")
+        .unwrap();
+    assert_eq!(event["data"]["candidate_id"], candidate_id);
+    assert_eq!(
+        event["data"]["lease_effects"]["orphaned_reservations"][0]["disposition"],
+        "orphaned"
+    );
+
+    let audit = run_mote(temp.path(), &["--json", "audit", "--fail-on", "never"]);
+    assert!(
+        audit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&audit.stderr)
+    );
+    let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    let finding = audit["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["code"] == "candidate_out_of_band_landing_recorded")
+        .unwrap();
+    assert_eq!(finding["severity"], "warning");
+    assert_eq!(finding["evidence"]["target_oid"], candidate_oid);
+    assert!(
+        finding["message"]
+            .as_str()
+            .unwrap()
+            .contains("outside the formal candidate transition")
+    );
+}
+
+#[test]
+fn candidate_cli_reconciliation_rejects_non_ancestor_target() {
+    let temp = TempDir::new().unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "Test"]);
+    std::fs::write(temp.path().join("work.txt"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "work.txt"]);
+    run_git(temp.path(), &["commit", "-qm", "base"]);
+    let base = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    run_git(temp.path(), &["branch", "target", &base]);
+    std::fs::write(temp.path().join("work.txt"), "candidate\n").unwrap();
+    run_git(temp.path(), &["commit", "-qam", "candidate"]);
+
+    let store = Store::init(temp.path()).unwrap();
+    let issue = ids::new_bead_id();
+    publish::publish_op(
+        &store,
+        &make_create(
+            "proposer".into(),
+            issue.clone(),
+            ScalarSet {
+                title: Some("non-ancestor candidate".into()),
+                ..Default::default()
+            },
+            Timestamp::now(),
+        ),
+    )
+    .unwrap();
+    let proposed = run_mote(
+        temp.path(),
+        &[
+            "--json",
+            "--actor",
+            "proposer",
+            "candidate",
+            "propose",
+            "--issue",
+            &issue,
+            "--base",
+            &base,
+            "--path",
+            "work.txt",
+            "--authorizer",
+            "authorizer",
+            "--reviewer",
+            "reviewer",
+            "--idempotency-key",
+            "non-ancestor-propose",
+        ],
+    );
+    let proposed: serde_json::Value = serde_json::from_slice(&proposed.stdout).unwrap();
+    let candidate_id = proposed["candidate_id"].as_str().unwrap();
+    let phase_op = proposed["phase"]["op_id"].as_str().unwrap();
+    let rejected = run_mote(
+        temp.path(),
+        &[
+            "--actor",
+            "authorizer",
+            "candidate",
+            "reconcile",
+            candidate_id,
+            "--target",
+            "target",
+            "--expect-phase",
+            phase_op,
+            "--idempotency-key",
+            "non-ancestor-reconcile",
+        ],
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    let state = reducer::replay_store(&store).unwrap();
+    let candidate = &state.candidates[candidate_id];
+    assert_eq!(candidate.phase.as_str(), "pending");
+    assert!(candidate.reconciled.is_none());
+    let receipt = candidate
+        .evidence
+        .values()
+        .find(|receipt| receipt.name == GIT_REACHABILITY_EVIDENCE)
+        .unwrap();
+    assert_eq!(receipt.outcome, EvidenceOutcome::Fail);
 }
 
 #[test]

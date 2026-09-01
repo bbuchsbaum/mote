@@ -87,6 +87,7 @@ export interface Board {
   orphaned_claims: ClaimRow[];
   orphaned_reservations: ReservationRow[];
   discussion_unread: number;
+  discussion: DiscussionDecisionSummary;
   inbox_unacked: number;
 }
 
@@ -103,6 +104,14 @@ export interface Topic {
   post_count: number;
   sticky_count: number;
   decision_count: number;
+  structured_decision_count: number;
+  legacy_decision_count: number;
+  question_count: number;
+  open_question_count: number;
+  deferred_question_count: number;
+  superseded_question_count: number;
+  closed_question_count: number;
+  unresolved_question_count: number;
   explicit: boolean;
   route_state: RouteState;
   issues: string[];
@@ -128,8 +137,97 @@ export interface Post {
   explicit_notify: string[];
   notification_recipients: string[];
   idempotency_key: string | null;
+  decision: StructuredDecision | null;
   /** Present on `thread` only. */
   depth?: number;
+}
+
+export type DiscussionReference =
+  | { kind: "topic"; topic: string }
+  | { kind: "post"; post_id: string }
+  | { kind: "issue"; issue_id: string }
+  | { kind: "candidate"; candidate_id: string }
+  | { kind: "url"; url: string };
+
+export type DecisionQuestionStatus = "open" | "deferred" | "superseded" | "closed";
+export type DecisionQuestionAction = "answer" | "defer" | "supersede" | "close";
+
+export interface DecisionQuestionTransition {
+  action: DecisionQuestionAction;
+  actor: string;
+  expect_question: string;
+  references: DiscussionReference[];
+  note: string | null;
+  successor_question_id: string | null;
+  idempotency_key: string | null;
+  op_id: string;
+  ts: string;
+}
+
+export interface DecisionQuestion {
+  question_id: string;
+  decision_id: string;
+  topic: string;
+  text: string;
+  opened_by: string;
+  opened_op_id: string;
+  opened_ts: string;
+  position: number;
+  status: DecisionQuestionStatus;
+  unresolved: boolean;
+  clock_op_id: string;
+  successor_question_id: string | null;
+  answer_count: number;
+  candidate_answers: DecisionQuestionTransition[];
+  transitions: DecisionQuestionTransition[];
+}
+
+export interface AgreedPost {
+  post_id: string;
+  from: string;
+  body: string;
+  disposition: "active" | "superseded" | "retracted";
+  sent_op_id: string;
+}
+
+export interface ResolvedDiscussionReference {
+  reference: DiscussionReference;
+  exists: boolean | null;
+  disposition: string;
+  title?: string | null;
+  status?: string | null;
+  route_state?: RouteState | null;
+  topic?: string | null;
+  from?: string | null;
+  body?: string | null;
+  issue?: string | null;
+  commit_oid?: string | null;
+  url?: string;
+}
+
+export interface StructuredDecision {
+  decision_id: string;
+  post: Omit<Post, "decision">;
+  agreed: AgreedPost[];
+  agreed_post_ids: string[];
+  references: DiscussionReference[];
+  resolved_references: ResolvedDiscussionReference[];
+  questions: DecisionQuestion[];
+  actor: string;
+  op_id: string;
+  ts: string;
+}
+
+export interface DiscussionDecisionSummary {
+  structured_decision_count: number;
+  legacy_decision_count: number;
+  question_count: number;
+  open_question_count: number;
+  deferred_question_count: number;
+  superseded_question_count: number;
+  closed_question_count: number;
+  unresolved_question_count: number;
+  decisions: StructuredDecision[];
 }
 
 /** `mote --json actor list` */

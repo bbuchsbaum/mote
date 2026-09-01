@@ -148,6 +148,12 @@ await eventually("threaded reply is indented", () =>
   all(".post").some((p) => parseInt(p.style.marginLeft || "0", 10) > 0));
 await eventually("a needs-bead post is flagged", () => text().includes("needs bead"));
 await eventually("a routed post shows its bead chip", () => all(".route.routed").length > 0);
+await eventually("a structured cited decision is visible", () => text().includes("Cited decision"));
+check("agreed evidence is exact and disposition-labelled",
+  text().includes("Agreed evidence") && text().includes("ACTIVE") && text().includes("Proposal: split parser"));
+check("question lifecycle is textual rather than color-only",
+  text().includes("Tracked questions") && text().includes("OPEN") && text().includes("CLOSED"));
+check("candidate answers stay distinct from closure", text().includes("CANDIDATE ANSWER"));
 const composer = window.document.querySelector(".composer textarea");
 setValue(composer, "Console is wired up end to end.");
 await waitFor("enabled discussion post button", () => !byText(".composer-foot button", "Post")?.disabled);

@@ -718,11 +718,14 @@ fn is_known_read_route(path: &str) -> bool {
             | "/api/unrouted"
             | "/api/search"
             | "/api/actors"
+            | "/api/roles"
             | "/api/inflight"
             | "/api/events"
     ) || path.starts_with("/api/topics/")
         || path.starts_with("/api/posts/")
+        || path.starts_with("/api/questions/")
         || path.starts_with("/api/dm/")
+        || path.starts_with("/api/roles/")
         || path
             .strip_prefix("/api/beads/")
             .is_some_and(|rest| rest.ends_with("/history"))
@@ -745,22 +748,31 @@ fn handle_get(
             state
                 .board_topics_by_activity()
                 .into_iter()
-                .map(crate::cli::topic_json)
+                .map(|topic| crate::cli::topic_json(&state, topic))
                 .collect(),
         ),
         "/api/unread" => Value::Array(
             state
                 .unread_board_posts_for(&request_actor(request)?, None)
                 .into_iter()
-                .map(crate::cli::board_post_json)
+                .map(|post| crate::cli::board_post_json_with_state(&state, post))
                 .collect(),
         ),
         "/api/unrouted" => unrouted_json(&state, request)?,
         "/api/search" => search_json(&state, request)?,
         "/api/actors" => actors_json(&state, &request_actor(request)?)?,
+        "/api/roles" => roles_json(&state),
         "/api/inflight" => inflight_json(&state, &request_actor(request)?, request)?,
         _ => {
-            if let Some(rest) = request.path.strip_prefix("/api/beads/") {
+            if let Some(role) = request.path.strip_prefix("/api/roles/") {
+                if role.is_empty() || role.contains('/') {
+                    return Ok(None);
+                }
+                let role = state
+                    .resolve_role(role)
+                    .ok_or_else(|| ApiError::message(404, format!("no such role {role}")))?;
+                crate::cli::role_json(&state, role, &ids::format_rfc3339(jiff::Timestamp::now()))
+            } else if let Some(rest) = request.path.strip_prefix("/api/beads/") {
                 let segments: Vec<_> = rest.split('/').collect();
                 match segments.as_slice() {
                     [id] if !id.is_empty() => bead_detail_json(&state, id)?,
@@ -781,9 +793,18 @@ fn handle_get(
                             state
                                 .board_posts_for(Some(topic))
                                 .into_iter()
-                                .map(crate::cli::board_post_json)
+                                .map(|post| crate::cli::board_post_json_with_state(&state, post))
                                 .collect(),
                         )
+                    }
+                    [topic, "decisions"] if !topic.is_empty() => {
+                        if !state.board_topics.contains_key(*topic) {
+                            return Err(ApiError::message(
+                                404,
+                                format!("no such discussion topic {topic}"),
+                            ));
+                        }
+                        crate::cli::discussion_decisions_json(&state, Some(topic))
                     }
                     _ => return Ok(None),
                 }
@@ -799,7 +820,8 @@ fn handle_get(
                                 .thread_posts(post_id)
                                 .into_iter()
                                 .map(|(depth, post)| {
-                                    let mut value = crate::cli::board_post_json(post);
+                                    let mut value =
+                                        crate::cli::board_post_json_with_state(&state, post);
                                     value["depth"] = json!(depth);
                                     value
                                 })
@@ -808,6 +830,16 @@ fn handle_get(
                     }
                     _ => return Ok(None),
                 }
+            } else if let Some(question_id) = request.path.strip_prefix("/api/questions/") {
+                if question_id.is_empty() || question_id.contains('/') {
+                    return Ok(None);
+                }
+                let question = state.board_questions.get(question_id).ok_or_else(|| {
+                    ApiError::message(404, format!("no such decision question {question_id}"))
+                })?;
+                let mut value = crate::cli::decision_question_json(question);
+                value["idempotent_retry"] = json!(false);
+                value
             } else if let Some(peer) = request.path.strip_prefix("/api/dm/") {
                 if peer.is_empty() || peer.contains('/') {
                     return Ok(None);
@@ -1031,14 +1063,16 @@ fn board_json(state: &State, actor: String) -> Result<Value, ApiError> {
             "paths": reservation.live_paths(), "deadline": reservation.lease_until_ts,
             "reason": "ttl_near_deadline", "warning_at": state.reservation_warning_ts(reservation),
         })).collect::<Vec<_>>(),
-        "expired_reservations": expired_reservations.iter().map(|reservation| json!({
+            "expired_reservations": expired_reservations.iter().map(|reservation| json!({
             "reservation_id": reservation.reservation_id, "holder": reservation.actor,
             "entity": reservation.entity, "binding_kind": state.reservation_binding_kind(reservation),
             "paths": reservation.live_paths(), "deadline": reservation.lease_until_ts,
-            "reason": "ttl_elapsed",
-        })).collect::<Vec<_>>(),
-        "inbox_unacked": state.inbox_for(&actor).len(),
+                "reason": "ttl_elapsed",
+            })).collect::<Vec<_>>(),
+            "roles": state.roles.values().map(|role| crate::cli::role_json(state, role, &now)).collect::<Vec<_>>(),
+            "inbox_unacked": state.inbox_for(&actor).len(),
         "discussion_unread": state.unread_board_posts_for(&actor, None).len(),
+        "discussion": crate::cli::discussion_decisions_json(state, None),
         "actors": actors,
     }))
 }
@@ -1050,8 +1084,8 @@ fn unrouted_json(state: &State, request: &Request) -> Result<Value, ApiError> {
         .transpose()
         .map_err(|error| ApiError::message(422, error.to_string()))?;
     Ok(json!({
-        "topics": state.unrouted_topics(topic.as_deref()).into_iter().map(crate::cli::topic_json).collect::<Vec<_>>(),
-        "posts": state.unrouted_posts(topic.as_deref()).into_iter().map(crate::cli::board_post_json).collect::<Vec<_>>(),
+        "topics": state.unrouted_topics(topic.as_deref()).into_iter().map(|record| crate::cli::topic_json(state, record)).collect::<Vec<_>>(),
+        "posts": state.unrouted_posts(topic.as_deref()).into_iter().map(|post| crate::cli::board_post_json_with_state(state, post)).collect::<Vec<_>>(),
     }))
 }
 
@@ -1098,8 +1132,8 @@ fn search_json(state: &State, request: &Request) -> Result<Value, ApiError> {
         posts = crate::cli::limit_board_posts_preserving_stickies(posts, limit);
     }
     Ok(json!({
-        "topics": topics.into_iter().map(crate::cli::topic_json).collect::<Vec<_>>(),
-        "posts": posts.into_iter().map(crate::cli::board_post_json).collect::<Vec<_>>(),
+        "topics": topics.into_iter().map(|record| crate::cli::topic_json(state, record)).collect::<Vec<_>>(),
+        "posts": posts.into_iter().map(|post| crate::cli::board_post_json_with_state(state, post)).collect::<Vec<_>>(),
     }))
 }
 
@@ -1123,6 +1157,17 @@ fn actors_json(state: &State, viewer: &str) -> Result<Value, ApiError> {
         });
     }
     Ok(values)
+}
+
+fn roles_json(state: &State) -> Value {
+    let now = ids::format_rfc3339(jiff::Timestamp::now());
+    Value::Array(
+        state
+            .roles
+            .values()
+            .map(|role| crate::cli::role_json(state, role, &now))
+            .collect(),
+    )
 }
 
 fn inflight_json(state: &State, actor: &str, request: &Request) -> Result<Value, ApiError> {
@@ -1250,15 +1295,20 @@ fn inflight_json(state: &State, actor: &str, request: &Request) -> Result<Value,
             "reason": "ttl_elapsed",
         })).collect::<Vec<_>>(),
         "topics": topics.iter().map(|topic| {
-            let mut value = crate::cli::topic_json(topic);
+            let mut value = crate::cli::topic_json(state, topic);
             value["unread"] = json!(state.unread_board_posts_for(actor, Some(&topic.topic)).len());
             value
         }).collect::<Vec<_>>(),
         "candidates": candidates.iter().map(|candidate| {
-            let mut value = crate::cli::candidate_json(state, candidate);
-            value["landability"] = json!(state.candidate_landability(&candidate.candidate_id, Some(actor)));
+            let mut value = crate::cli::candidate_json_at(state, candidate, &now_ts);
+            value["landability"] = json!(state.candidate_landability_at(
+                &candidate.candidate_id,
+                Some(actor),
+                &now_ts,
+            ));
             value
         }).collect::<Vec<_>>(),
+        "roles": state.roles.values().map(|role| crate::cli::role_json(state, role, &now_ts)).collect::<Vec<_>>(),
         "recent_commits_advisory": Vec::<Value>::new(),
         "actors": actors,
     }))
