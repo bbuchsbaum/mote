@@ -166,8 +166,11 @@ and OID or filesystem evidence used.
 | `candidate_object_unreachable` | warning | The exact commit and immutable parent anchors are not readable from the bound landing repository | Transfer or fetch from the recorded object source, then publish availability evidence |
 | `candidate_git_unavailable` | warning | Requested ref or object cannot be resolved, or history is shallow | Repair Git visibility; never infer reachability |
 | `candidate_blockers` | info | Full structured landability reasons and counts, without truncation | Follow each typed blocker; display order is not policy |
+| `candidate_ancestry_operator_override_recorded` | warning | The immutable proposal authorizer refreshed an existing passing Git-ancestry receipt on behalf of unavailable named producers, with the exact phase operation, policy identities, and durable authority references | Independently review producer unavailability and the references; the operation changes reproducible Git bookkeeping only |
 | `candidate_containment_recovery_recorded` | info | A successor authorizer used exact pair evidence to retire a contained predecessor | Review the immutable authority and evidence basis; do not call it governed landing |
-| `candidate_out_of_band_landing_recorded` | warning | The proposal authorizer recorded exact target reachability and the pre-transition policy snapshot | Retain as reconciliation evidence; do not call it governed landing |
+| `candidate_out_of_band_landing_recorded` | warning | A proposal authorizer or explicit recovery operator recorded exact target reachability and the pre-transition policy snapshot | Retain as reconciliation evidence; do not call it governed landing |
+| `candidate_reconciliation_operator_override_recorded` | warning | A distinct operator reconciled reachability with exact original-authorizer/repository bindings, reason, and durable authority references | Review the recorded basis independently; references are attestations, not a machine-rooted authority grant |
+| `candidate_reconciliation_repository_bridge_recorded` | warning | Operator reconciliation observed the exact commit and parents in the store repository while preserving a different recorded landing repository | Verify object/parent anchors and operator basis; do not treat the bridge as a provenance rewrite |
 | `parent_all_children_closed` | info | An open relation parent has at least one child and all live children are closed | Review the parent; never auto-close it |
 | `dangling_dependency` | warning | A live bead depends on a missing or deleted bead | Repair the explicit edge or restore the target |
 | `dangling_relation` | info | A live hierarchy relation points to a missing or deleted bead | Review the organizational link |
@@ -203,14 +206,35 @@ result `1` is a clean not-reachable observation; all other results are
 and cherry-pick inference remain out of scope.
 
 Observed reachability never skips candidate pair coverage inside the reducer.
-`mote candidate reconcile` records a passing exact `git-reachability` receipt
-and a compare-and-set snapshot of the pending phase, review-policy and landing-
-repository clocks, reviews, evidence, pair-evidence, authorization, and full
-landability blockers. Only the proposal's
-immutable authorizer may publish it. Acceptance produces the distinct terminal
-phase `landed_out_of_band`, leaves authorization unchanged, and emits
-`candidate_out_of_band_landing_recorded`. Until that operation is accepted,
+Ordinary `mote candidate reconcile` records a passing exact
+`git-reachability` receipt and a compare-and-set snapshot of the pending phase,
+review-policy and landing-repository clocks, reviews, evidence, pair-evidence,
+authorization, and full landability blockers. Only the proposal's immutable
+authorizer may publish the ordinary form.
+
+A distinct operator may use the explicit audited override when that authorizer
+cannot act. It binds the exact current phase, original authorizer and landing
+repository, a non-empty reason, and sorted non-empty durable authority
+references. Those references are retained attestations for human review; audit
+does not dereference them or turn them into a machine-validated grant. This
+form may correct an abandoned row as well as a pending row, but
+superseded and other completed phases remain closed. If the store's Git
+repository differs from the recorded landing repository, reconciliation also
+requires an exact current binding plus object-availability proof for the commit
+and immutable parents, and preserves both original repository identities.
+
+Either accepted form produces the distinct terminal phase
+`landed_out_of_band`, leaves authorization unchanged, and emits
+`candidate_out_of_band_landing_recorded`. Override and repository-bridge use
+emit their dedicated warnings as well. Until the operation is accepted,
 candidate phase remains exactly as recorded.
+
+`candidate evidence refresh --operator-override` is a separate, narrower
+recovery. Only the immutable authorizer may use it when every named ancestry
+producer is unavailable and each producer already has a passing anchored
+receipt. It records exact phase, producer, prior-receipt, repository, reason,
+reference, and tool bindings, changes no candidate phase or authority, and
+emits `candidate_ancestry_operator_override_recorded`.
 
 ## 7. Display rules
 

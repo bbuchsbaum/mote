@@ -718,6 +718,15 @@ pub enum CandidateCmd {
         target: String,
         #[arg(long)]
         expect_phase: String,
+        /// Use an explicit audited override when the immutable proposal authorizer is unavailable
+        #[arg(long)]
+        operator_override: bool,
+        /// Why the operator is overriding the immutable proposal authorizer
+        #[arg(long)]
+        reason: Option<String>,
+        /// Durable external or board reference supporting the override; repeatable
+        #[arg(long = "authority-ref")]
+        authority_refs: Vec<String>,
         #[arg(long)]
         idempotency_key: String,
     },
@@ -728,6 +737,18 @@ pub enum CandidateEvidenceCmd {
     /// Refresh built-in Git ancestry evidence for the immutable proposal
     Refresh {
         candidate_id: String,
+        /// Use an audited Git-only recovery when every immutable producer is unavailable
+        #[arg(long)]
+        operator_override: bool,
+        /// Current candidate phase op id; required with --operator-override
+        #[arg(long)]
+        expect_phase: Option<String>,
+        /// Why the immutable producers cannot perform this refresh
+        #[arg(long)]
+        reason: Option<String>,
+        /// Durable external or board reference supporting the override; repeatable
+        #[arg(long = "authority-ref")]
+        authority_refs: Vec<String>,
         #[arg(long)]
         idempotency_key: String,
     },
@@ -2103,6 +2124,21 @@ fn print_candidate(
             candidate.landing_repository_id,
             candidate.landing_repository_op_id
         );
+        for evidence in candidate.evidence.values() {
+            if let Some(override_basis) = evidence.payload.git_ancestry_override() {
+                println!(
+                    "  ancestry refresh override: actor={} phase={} authorizer={} repository={} producers=[{}] prior-evidence=[{}] refs=[{}] reason={}",
+                    evidence.producer,
+                    override_basis.expect_phase_op_id,
+                    override_basis.expect_authorizer,
+                    override_basis.expect_landing_repository_id,
+                    override_basis.expect_producers.join(","),
+                    override_basis.expect_producer_evidence_op_ids.join(","),
+                    override_basis.authority_refs.join(","),
+                    override_basis.reason,
+                );
+            }
+        }
         if let Some(source) = &candidate.object_source {
             println!(
                 "  object source: repo={} ref={} locator={}",
@@ -2143,6 +2179,24 @@ fn print_candidate(
                 reconciliation.target_oid,
                 reconciliation.evidence_id,
             );
+            if let Some(override_basis) = &reconciliation.override_basis {
+                println!(
+                    "  reconciliation override: expected-authorizer={} expected-repository={} refs=[{}] reason={}",
+                    override_basis.expect_authorizer,
+                    override_basis.expect_landing_repository_id,
+                    override_basis.authority_refs.join(","),
+                    override_basis.reason,
+                );
+            }
+            if let Some(bridge) = &reconciliation.repository_bridge {
+                println!(
+                    "  reconciliation repository bridge: expected-binding={} observed-repository={} object={} parents=[{}]",
+                    bridge.expect_landing_repository_op_id,
+                    bridge.object_availability.repository_id,
+                    bridge.object_availability.candidate_oid,
+                    bridge.object_availability.observed_parent_oids.join(","),
+                );
+            }
             println!("  governance: formal review/authorization did not govern this landing");
             if !reconciliation
                 .policy_snapshot
@@ -3089,6 +3143,9 @@ fn cmd_candidate(
             candidate_id,
             target,
             expect_phase,
+            operator_override,
+            reason,
+            mut authority_refs,
             idempotency_key,
         } => {
             let actor = store.resolve_actor(actor_flag)?;
@@ -3096,6 +3153,67 @@ fn cmd_candidate(
                 return Err(MoteError::Invalid("invalid idempotency key".into()));
             }
             let initial = reducer::replay_store(&store)?;
+            let candidate = initial.candidates.get(&candidate_id).ok_or_else(|| {
+                MoteError::Invalid(format!("candidate `{candidate_id}` does not exist"))
+            })?;
+            let (authority, override_basis) = if operator_override {
+                if candidate.authorizer == actor {
+                    return Err(MoteError::Rejected(
+                        "the immutable proposal authorizer must use ordinary reconciliation, not an operator override"
+                            .into(),
+                    ));
+                }
+                let reason = reason
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        MoteError::Invalid("operator override requires a non-empty --reason".into())
+                    })?;
+                if authority_refs
+                    .iter()
+                    .any(|reference| reference.trim().is_empty())
+                {
+                    return Err(MoteError::Invalid(
+                        "operator override authority refs must be non-empty".into(),
+                    ));
+                }
+                authority_refs = authority_refs
+                    .into_iter()
+                    .map(|reference| reference.trim().to_string())
+                    .collect();
+                authority_refs.sort();
+                authority_refs.dedup();
+                if authority_refs.is_empty() {
+                    return Err(MoteError::Invalid(
+                        "operator override requires at least one --authority-ref".into(),
+                    ));
+                }
+                (
+                    crate::candidate::CandidateReconciliationAuthority::ExplicitOperatorOverride,
+                    Some(crate::candidate::CandidateOperatorOverride {
+                        expect_authorizer: candidate.authorizer.clone(),
+                        expect_landing_repository_id: candidate.landing_repository_id.clone(),
+                        reason,
+                        authority_refs,
+                    }),
+                )
+            } else {
+                if reason.is_some() || !authority_refs.is_empty() {
+                    return Err(MoteError::Invalid(
+                        "--reason and --authority-ref require --operator-override".into(),
+                    ));
+                }
+                if candidate.authorizer != actor {
+                    return Err(MoteError::Rejected(
+                        "only the proposal's immutable authorizer may reconcile normally; a different operator must use the explicit audited override"
+                            .into(),
+                    ));
+                }
+                (
+                    crate::candidate::CandidateReconciliationAuthority::ProposalAuthorizer,
+                    None,
+                )
+            };
             if let Some(previous) = initial
                 .candidate_idempotency
                 .get(&(actor.clone(), idempotency_key.clone()))
@@ -3109,8 +3227,8 @@ fn cmd_candidate(
                             && reconcile.candidate_id == candidate_id
                             && reconcile.target_ref == target
                             && reconcile.expect_phase == expect_phase
-                            && reconcile.authority
-                                == crate::candidate::CandidateReconciliationAuthority::ProposalAuthorizer
+                            && reconcile.authority == authority
+                            && reconcile.override_basis == override_basis
                 );
                 if !same_reconciliation || previous.candidate_id != candidate_id {
                     return Err(MoteError::Rejected(format!(
@@ -3125,31 +3243,91 @@ fn cmd_candidate(
                 return Ok(0);
             }
 
-            let candidate = initial.candidates.get(&candidate_id).ok_or_else(|| {
-                MoteError::Invalid(format!("candidate `{candidate_id}` does not exist"))
-            })?;
-            if candidate.phase != crate::candidate::CandidatePhase::Pending
-                || candidate.phase_op_id != expect_phase
-            {
+            let reconcilable_phase = candidate.phase == crate::candidate::CandidatePhase::Pending
+                || (candidate.phase == crate::candidate::CandidatePhase::Abandoned
+                    && authority
+                        == crate::candidate::CandidateReconciliationAuthority::ExplicitOperatorOverride);
+            if !reconcilable_phase || candidate.phase_op_id != expect_phase {
                 return Err(MoteError::Rejected(
-                    "out-of-band reconciliation requires the current pending phase CAS".into(),
-                ));
-            }
-            if candidate.authorizer != actor {
-                return Err(MoteError::Rejected(
-                    "only the proposal's immutable authorizer may reconcile an out-of-band landing"
+                    "out-of-band reconciliation requires the current pending phase CAS, or the current abandoned phase CAS under an explicit operator override"
                         .into(),
                 ));
             }
             let candidate_oid = candidate.commit_oid.clone();
-            let receipt = crate::candidate::probe_reachability(
-                &std::env::current_dir()?,
-                &candidate.landing_repository_id,
-                &candidate.object_format,
-                &candidate.commit_oid,
-                &target,
-            )
-            .map_err(crate::candidate::git_probe_error)?;
+            let (receipt, repository_bridge) = if authority
+                == crate::candidate::CandidateReconciliationAuthority::ExplicitOperatorOverride
+            {
+                let repository_cwd = store_repository_cwd(&store)?;
+                let (observed_repository_id, observed_object_format, _) =
+                    crate::candidate::repository_identity(&repository_cwd)
+                        .map_err(crate::candidate::git_probe_error)?;
+                if observed_object_format != candidate.object_format {
+                    return Err(MoteError::Rejected(format!(
+                        "candidate object format {} does not match store repository format {}",
+                        candidate.object_format, observed_object_format
+                    )));
+                }
+                if observed_repository_id == candidate.landing_repository_id {
+                    (
+                        crate::candidate::probe_reachability(
+                            &repository_cwd,
+                            &candidate.landing_repository_id,
+                            &candidate.object_format,
+                            &candidate.commit_oid,
+                            &target,
+                        )
+                        .map_err(crate::candidate::git_probe_error)?,
+                        None,
+                    )
+                } else {
+                    let availability = crate::candidate::probe_object_availability(
+                        &repository_cwd,
+                        &observed_repository_id,
+                        &candidate.object_format,
+                        &candidate.commit_oid,
+                        &candidate.parent_oids,
+                    )
+                    .map_err(crate::candidate::git_probe_error)?;
+                    if availability.object_available != Some(true)
+                        || availability.observed_parent_oids != candidate.parent_oids
+                    {
+                        return Err(MoteError::Rejected(
+                            "cross-repository reconciliation requires the exact candidate commit and parent anchors to be readable from the store's Git repository"
+                                .into(),
+                        ));
+                    }
+                    let receipt = crate::candidate::probe_reachability(
+                        &repository_cwd,
+                        &observed_repository_id,
+                        &candidate.object_format,
+                        &candidate.commit_oid,
+                        &target,
+                    )
+                    .map_err(crate::candidate::git_probe_error)?;
+                    (
+                        receipt,
+                        Some(crate::candidate::CandidateReconciliationRepositoryBridge {
+                            expect_landing_repository_op_id: candidate
+                                .landing_repository_op_id
+                                .clone(),
+                            object_availability: availability,
+                        }),
+                    )
+                }
+            } else {
+                let cwd = std::env::current_dir()?;
+                (
+                    crate::candidate::probe_reachability(
+                        &cwd,
+                        &candidate.landing_repository_id,
+                        &candidate.object_format,
+                        &candidate.commit_oid,
+                        &target,
+                    )
+                    .map_err(crate::candidate::git_probe_error)?,
+                    None,
+                )
+            };
             let outcome = match receipt.candidate_reachable {
                 Some(true) => crate::candidate::EvidenceOutcome::Pass,
                 Some(false) => crate::candidate::EvidenceOutcome::Fail,
@@ -3166,7 +3344,11 @@ fn cmd_candidate(
                 candidate_id: candidate_id.clone(),
                 candidate_oid,
                 evidence_id: evidence_id.clone(),
-                name: crate::candidate::GIT_REACHABILITY_EVIDENCE.into(),
+                name: if repository_bridge.is_some() {
+                    crate::candidate::GIT_RECONCILIATION_REACHABILITY_EVIDENCE.into()
+                } else {
+                    crate::candidate::GIT_REACHABILITY_EVIDENCE.into()
+                },
                 evidence_kind: "git".into(),
                 producer_tool,
                 outcome,
@@ -3193,7 +3375,9 @@ fn cmd_candidate(
                 evidence_id,
                 target_ref: target,
                 expect_phase,
-                authority: crate::candidate::CandidateReconciliationAuthority::ProposalAuthorizer,
+                authority,
+                override_basis,
+                repository_bridge,
                 policy_snapshot,
                 idempotency_key,
             });
@@ -3223,6 +3407,70 @@ fn cmd_candidate_evidence(
         .get(&candidate_id)
         .ok_or_else(|| MoteError::Invalid(format!("candidate `{candidate_id}` does not exist")))?;
 
+    let refresh_override_request = match &cmd {
+        CandidateEvidenceCmd::Refresh {
+            operator_override: true,
+            expect_phase,
+            reason,
+            authority_refs,
+            ..
+        } => {
+            let expect_phase = expect_phase
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    MoteError::Invalid("operator ancestry refresh requires --expect-phase".into())
+                })?;
+            let reason = reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    MoteError::Invalid(
+                        "operator ancestry refresh requires a non-empty --reason".into(),
+                    )
+                })?
+                .to_string();
+            if authority_refs
+                .iter()
+                .any(|reference| reference.trim().is_empty())
+            {
+                return Err(MoteError::Invalid(
+                    "operator ancestry refresh authority refs must be non-empty".into(),
+                ));
+            }
+            let mut authority_refs = authority_refs
+                .iter()
+                .map(|reference| reference.trim().to_string())
+                .collect::<Vec<_>>();
+            authority_refs.sort();
+            authority_refs.dedup();
+            if authority_refs.is_empty() {
+                return Err(MoteError::Invalid(
+                    "operator ancestry refresh requires at least one --authority-ref".into(),
+                ));
+            }
+            Some((expect_phase.to_string(), reason, authority_refs))
+        }
+        CandidateEvidenceCmd::Refresh {
+            operator_override: false,
+            expect_phase,
+            reason,
+            authority_refs,
+            ..
+        } => {
+            if expect_phase.is_some() || reason.is_some() || !authority_refs.is_empty() {
+                return Err(MoteError::Invalid(
+                    "--expect-phase, --reason, and --authority-ref require --operator-override"
+                        .into(),
+                ));
+            }
+            None
+        }
+        CandidateEvidenceCmd::Availability { .. } | CandidateEvidenceCmd::Record { .. } => None,
+    };
+
     if let CandidateEvidenceCmd::Refresh {
         idempotency_key, ..
     }
@@ -3240,18 +3488,33 @@ fn cmd_candidate_evidence(
             let bytes = fs::read(store.ops_dir().join(format!("{}.json", previous.op_id)))?;
             let previous_op: op::Op = serde_json::from_slice(&bytes)?;
             let same_refresh = match &cmd {
-                CandidateEvidenceCmd::Refresh { .. } => matches!(
-                    previous_op,
-                    op::Op::CandidateEvidence(ref evidence)
+                CandidateEvidenceCmd::Refresh { .. } => match &previous_op {
+                    op::Op::CandidateEvidence(evidence)
                         if evidence.actor == actor
                             && evidence.candidate_id == candidate_id
                             && evidence.name == crate::candidate::GIT_ANCESTRY_EVIDENCE
-                            && evidence.evidence_kind == "git"
-                            && matches!(
-                                &evidence.payload,
-                                crate::candidate::CandidateEvidencePayload::GitAncestry(_)
-                            )
-                ),
+                            && evidence.evidence_kind == "git" =>
+                    {
+                        match (&refresh_override_request, &evidence.payload) {
+                            (None, crate::candidate::CandidateEvidencePayload::GitAncestry(_)) => {
+                                true
+                            }
+                            (
+                                Some((expect_phase, reason, authority_refs)),
+                                crate::candidate::CandidateEvidencePayload::GitAncestryOverride {
+                                    override_basis,
+                                    ..
+                                },
+                            ) => {
+                                override_basis.expect_phase_op_id == *expect_phase
+                                    && override_basis.reason == *reason
+                                    && override_basis.authority_refs == *authority_refs
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                },
                 CandidateEvidenceCmd::Availability { .. } => matches!(
                     previous_op,
                     op::Op::CandidateEvidence(ref evidence)
@@ -3278,10 +3541,80 @@ fn cmd_candidate_evidence(
         }
     }
 
+    let refresh_override_basis = match refresh_override_request {
+        Some((expect_phase, reason, authority_refs)) => {
+            if expect_phase != candidate.phase_op_id {
+                return Err(MoteError::Rejected(format!(
+                    "stale candidate phase CAS: current phase op is {}",
+                    candidate.phase_op_id
+                )));
+            }
+            let expect_producers =
+                crate::candidate::git_ancestry_producers(&candidate.evidence_requirements);
+            if expect_producers.is_empty() {
+                return Err(MoteError::Rejected(
+                    "candidate has no immutable git-ancestry producer policy to recover".into(),
+                ));
+            }
+            if expect_producers.iter().any(|producer| producer == &actor) {
+                return Err(MoteError::Rejected(
+                    "a named git-ancestry producer must use ordinary refresh, not an operator override"
+                        .into(),
+                ));
+            }
+            if candidate.authorizer != actor {
+                return Err(MoteError::Rejected(
+                    "only the immutable proposal authorizer may use an operator ancestry refresh"
+                        .into(),
+                ));
+            }
+            let mut expect_producer_evidence_op_ids = Vec::new();
+            for producer in &expect_producers {
+                let key = (
+                    crate::candidate::GIT_ANCESTRY_EVIDENCE.to_string(),
+                    producer.clone(),
+                );
+                let Some(record) = candidate.evidence.get(&key) else {
+                    return Err(MoteError::Rejected(format!(
+                        "operator ancestry recovery may only refresh existing evidence; producer {producer} has no git-ancestry receipt"
+                    )));
+                };
+                let anchored_pass = record.outcome == crate::candidate::EvidenceOutcome::Pass
+                    && record.payload.git_ancestry().is_some_and(|git| {
+                        (git.repository_id == candidate.repository_id
+                            || git.repository_id == candidate.landing_repository_id)
+                            && git.object_format == candidate.object_format
+                            && git.commit_oid == candidate.commit_oid
+                            && git.base_oid == candidate.base_oid
+                            && git.parent_oids == candidate.parent_oids
+                    });
+                if !anchored_pass {
+                    return Err(MoteError::Rejected(format!(
+                        "operator ancestry recovery may only refresh an existing passing anchored receipt from producer {producer}"
+                    )));
+                }
+                expect_producer_evidence_op_ids.push(record.op_id.clone());
+            }
+            expect_producer_evidence_op_ids.sort();
+
+            Some(crate::candidate::CandidateEvidenceOperatorOverride {
+                expect_phase_op_id: expect_phase,
+                expect_authorizer: candidate.authorizer.clone(),
+                expect_landing_repository_id: candidate.landing_repository_id.clone(),
+                expect_producers,
+                expect_producer_evidence_op_ids,
+                reason,
+                authority_refs,
+            })
+        }
+        None => None,
+    };
+
     let mutation = match cmd {
         CandidateEvidenceCmd::Refresh {
             candidate_id,
             idempotency_key,
+            ..
         } => {
             let mut known = known_candidates(&state);
             known.retain(|known| known.candidate_id != candidate.candidate_id);
@@ -3344,7 +3677,22 @@ fn cmd_candidate_evidence(
                     )
                 }
             };
-            let payload = crate::candidate::CandidateEvidencePayload::GitAncestry(receipt);
+            let (payload, refs) = match refresh_override_basis {
+                Some(override_basis) => {
+                    let refs = override_basis.authority_refs.clone();
+                    (
+                        crate::candidate::CandidateEvidencePayload::GitAncestryOverride {
+                            receipt,
+                            override_basis,
+                        },
+                        refs,
+                    )
+                }
+                None => (
+                    crate::candidate::CandidateEvidencePayload::GitAncestry(receipt),
+                    Vec::new(),
+                ),
+            };
             op::Op::CandidateEvidence(op::CandidateEvidenceOp {
                 v: 1,
                 op: String::new(),
@@ -3355,15 +3703,14 @@ fn cmd_candidate_evidence(
                 evidence_id: crate::candidate::evidence_id(&payload)?,
                 name: crate::candidate::GIT_ANCESTRY_EVIDENCE.into(),
                 evidence_kind: "git".into(),
-                producer_tool: match &payload {
-                    crate::candidate::CandidateEvidencePayload::GitAncestry(git) => {
-                        git.git_version.clone()
-                    }
-                    _ => unreachable!(),
-                },
+                producer_tool: payload
+                    .git_ancestry()
+                    .expect("refresh payload is always git ancestry")
+                    .git_version
+                    .clone(),
                 outcome,
                 payload,
-                refs: Vec::new(),
+                refs,
                 idempotency_key,
             })
         }

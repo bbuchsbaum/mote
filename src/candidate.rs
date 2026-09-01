@@ -18,6 +18,7 @@ pub const GIT_RELATION_SCHEMA_V2: u32 = 2;
 pub const GIT_ANCESTRY_EVIDENCE: &str = "git-ancestry";
 pub const GIT_LANDING_EVIDENCE: &str = "git-landing";
 pub const GIT_REACHABILITY_EVIDENCE: &str = "git-reachability";
+pub const GIT_RECONCILIATION_REACHABILITY_EVIDENCE: &str = "git-reconciliation-reachability";
 pub const GIT_OBJECT_AVAILABILITY_EVIDENCE: &str = "git-object-availability";
 
 fn legacy_git_relation_schema() -> u32 {
@@ -54,14 +55,45 @@ impl CandidatePhase {
 #[serde(rename_all = "snake_case")]
 pub enum CandidateReconciliationAuthority {
     ProposalAuthorizer,
+    ExplicitOperatorOverride,
 }
 
 impl CandidateReconciliationAuthority {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ProposalAuthorizer => "proposal_authorizer",
+            Self::ExplicitOperatorOverride => "explicit_operator_override",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateOperatorOverride {
+    pub expect_authorizer: String,
+    pub expect_landing_repository_id: String,
+    pub reason: String,
+    pub authority_refs: Vec<String>,
+}
+
+/// Audited authority used to refresh independently reproducible Git ancestry
+/// when every immutable proposal producer is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateEvidenceOperatorOverride {
+    pub expect_phase_op_id: String,
+    pub expect_authorizer: String,
+    pub expect_landing_repository_id: String,
+    pub expect_producers: Vec<String>,
+    pub expect_producer_evidence_op_ids: Vec<String>,
+    pub reason: String,
+    pub authority_refs: Vec<String>,
+}
+
+/// Exact proof that an out-of-band reconciliation was observed in a different
+/// repository without changing the candidate's recorded landing repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateReconciliationRepositoryBridge {
+    pub expect_landing_repository_op_id: String,
+    pub object_availability: GitObjectAvailabilityReceipt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +318,19 @@ pub struct EvidenceRequirement {
     pub producers: Vec<String>,
 }
 
+pub fn git_ancestry_producers(requirements: &[EvidenceRequirement]) -> Vec<String> {
+    let mut producers = requirements
+        .iter()
+        .filter(|requirement| {
+            requirement.name == GIT_ANCESTRY_EVIDENCE && requirement.kind == "git"
+        })
+        .flat_map(|requirement| requirement.producers.iter().cloned())
+        .collect::<Vec<_>>();
+    producers.sort();
+    producers.dedup();
+    producers
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCandidateRelation {
     pub candidate_id: String,
@@ -379,9 +424,10 @@ pub struct GitReachabilityReceipt {
     pub detail: Option<String>,
 }
 
-/// Exact observation that the candidate commit object is readable from the
-/// repository currently bound for landing. This is an operational visibility
-/// receipt, not evidence that a landing occurred.
+/// Exact observation that the candidate commit object and parents are readable
+/// from one named repository. Ordinary availability evidence binds that name to
+/// the landing repository; a reconciliation bridge records the narrower,
+/// explicit cross-repository exception. This is not evidence of a landing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitObjectAvailabilityReceipt {
     pub repository_id: String,
@@ -398,6 +444,10 @@ pub struct GitObjectAvailabilityReceipt {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CandidateEvidencePayload {
     GitAncestry(GitAncestryReceipt),
+    GitAncestryOverride {
+        receipt: GitAncestryReceipt,
+        override_basis: CandidateEvidenceOperatorOverride,
+    },
     GitLanding(GitLandingReceipt),
     GitReachability(GitReachabilityReceipt),
     GitObjectAvailability(GitObjectAvailabilityReceipt),
@@ -406,6 +456,22 @@ pub enum CandidateEvidencePayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+}
+
+impl CandidateEvidencePayload {
+    pub fn git_ancestry(&self) -> Option<&GitAncestryReceipt> {
+        match self {
+            Self::GitAncestry(receipt) | Self::GitAncestryOverride { receipt, .. } => Some(receipt),
+            _ => None,
+        }
+    }
+
+    pub fn git_ancestry_override(&self) -> Option<&CandidateEvidenceOperatorOverride> {
+        match self {
+            Self::GitAncestryOverride { override_basis, .. } => Some(override_basis),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

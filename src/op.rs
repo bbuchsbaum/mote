@@ -19,8 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::{
-    AuthorizationStatus, CandidateEvidencePayload, CandidatePolicySnapshot,
-    CandidateReconciliationAuthority, CandidateSupersedeRecovery, EvidenceOutcome,
+    AuthorizationStatus, CandidateEvidencePayload, CandidateOperatorOverride,
+    CandidatePolicySnapshot, CandidateReconciliationAuthority,
+    CandidateReconciliationRepositoryBridge, CandidateSupersedeRecovery, EvidenceOutcome,
     EvidenceRequirement, ReviewVerdict,
 };
 use crate::ids;
@@ -847,6 +848,10 @@ pub struct CandidateReconcileOp {
     pub target_ref: String,
     pub expect_phase: String,
     pub authority: CandidateReconciliationAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_basis: Option<CandidateOperatorOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_bridge: Option<CandidateReconciliationRepositoryBridge>,
     pub policy_snapshot: CandidatePolicySnapshot,
     pub idempotency_key: String,
 }

@@ -295,6 +295,8 @@ pub struct CandidateLandedRecord {
 pub struct CandidateReconciledRecord {
     pub actor: String,
     pub authority: CandidateReconciliationAuthority,
+    pub override_basis: Option<crate::candidate::CandidateOperatorOverride>,
+    pub repository_bridge: Option<crate::candidate::CandidateReconciliationRepositoryBridge>,
     pub evidence_id: String,
     pub target_ref: String,
     pub target_oid: String,
@@ -1512,8 +1514,8 @@ impl State {
             .max_by(|a, b| a.op_id.cmp(&b.op_id));
         match ancestry {
             Some(receipt) if receipt.outcome == EvidenceOutcome::Pass => {
-                match &receipt.payload {
-                    CandidateEvidencePayload::GitAncestry(git)
+                match receipt.payload.git_ancestry() {
+                    Some(git)
                         if (git.repository_id == candidate.repository_id
                             || git.repository_id == candidate.landing_repository_id)
                             && git.object_format == candidate.object_format
@@ -1586,7 +1588,7 @@ impl State {
                             }
                         }
                     }
-                    CandidateEvidencePayload::GitAncestry(git) => reasons.push(candidate_reason(
+                    Some(git) => reasons.push(candidate_reason(
                         if git.repository_id != candidate.repository_id
                             && git.repository_id != candidate.landing_repository_id
                         {
@@ -1597,7 +1599,7 @@ impl State {
                         Some(candidate_id),
                         "receipt does not match immutable proposal anchors",
                     )),
-                    _ => reasons.push(candidate_reason(
+                    None => reasons.push(candidate_reason(
                         LandabilityReasonCode::ProposalAnchorMismatch,
                         Some(candidate_id),
                         "git-ancestry evidence has the wrong payload kind",
@@ -2111,8 +2113,8 @@ impl State {
             );
         }
 
-        match &receipt.payload {
-            CandidateEvidencePayload::GitAncestry(git) => match &git.producer_snapshot {
+        match receipt.payload.git_ancestry() {
+            Some(git) => match &git.producer_snapshot {
                 Some(snapshot)
                     if !snapshot
                         .observed_candidates
@@ -2129,7 +2131,7 @@ impl State {
                     "{source} is a legacy receipt without producer snapshot provenance, so the target cannot distinguish incomplete input from malformed coverage; refresh with a v2 binary from a store snapshot containing both exact proposal ops"
                 ),
             },
-            _ => format!(
+            None => format!(
                 "{source} has the wrong payload kind; refresh from a store snapshot containing both exact proposal ops"
             ),
         }

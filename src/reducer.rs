@@ -4594,7 +4594,22 @@ fn apply_candidate_evidence(
         );
         return;
     };
-    if candidate.phase != crate::candidate::CandidatePhase::Pending {
+    let ancestry_refresh = o.name == crate::candidate::GIT_ANCESTRY_EVIDENCE
+        && o.evidence_kind == "git"
+        && o.payload.git_ancestry().is_some();
+    let abandoned_reconciliation_reachability = candidate.phase
+        == crate::candidate::CandidatePhase::Abandoned
+        && (o.name == crate::candidate::GIT_REACHABILITY_EVIDENCE
+            || o.name == crate::candidate::GIT_RECONCILIATION_REACHABILITY_EVIDENCE)
+        && o.evidence_kind == "git"
+        && matches!(
+            &o.payload,
+            crate::candidate::CandidateEvidencePayload::GitReachability(_)
+        );
+    if candidate.phase != crate::candidate::CandidatePhase::Pending
+        && !ancestry_refresh
+        && !abandoned_reconciliation_reachability
+    {
         reject(
             state,
             &candidate_id,
@@ -4602,7 +4617,8 @@ fn apply_candidate_evidence(
             kind,
             actor,
             ts,
-            "evidence can only update a pending candidate".into(),
+            "terminal candidates accept only built-in Git ancestry bookkeeping; an abandoned candidate additionally accepts exact Git reachability needed for audited reconciliation"
+                .into(),
         );
         return;
     }
@@ -4657,7 +4673,113 @@ fn apply_candidate_evidence(
         );
         return;
     }
-    let required_producer = candidate.evidence_requirements.iter().any(|requirement| {
+    let operator_override_authorized = if let Some(override_basis) =
+        o.payload.git_ancestry_override()
+    {
+        if o.name != crate::candidate::GIT_ANCESTRY_EVIDENCE || o.evidence_kind != "git" {
+            reject(
+                state,
+                &candidate_id,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "git-ancestry operator override requires the built-in git evidence name and kind"
+                    .into(),
+            );
+            return;
+        }
+        let current_producers =
+            crate::candidate::git_ancestry_producers(&candidate.evidence_requirements);
+        let mut current_producer_evidence_op_ids = Vec::new();
+        for producer in &current_producers {
+            let key = (
+                crate::candidate::GIT_ANCESTRY_EVIDENCE.to_string(),
+                producer.clone(),
+            );
+            let Some(record) = candidate.evidence.get(&key) else {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    format!(
+                        "operator ancestry recovery may only refresh existing evidence; producer {producer} has no git-ancestry receipt"
+                    ),
+                );
+                return;
+            };
+            let anchored_pass = record.outcome == crate::candidate::EvidenceOutcome::Pass
+                && record.payload.git_ancestry().is_some_and(|git| {
+                    (git.repository_id == candidate.repository_id
+                        || git.repository_id == candidate.landing_repository_id)
+                        && git.object_format == candidate.object_format
+                        && git.commit_oid == candidate.commit_oid
+                        && git.base_oid == candidate.base_oid
+                        && git.parent_oids == candidate.parent_oids
+                });
+            if !anchored_pass {
+                reject(
+                    state,
+                    &candidate_id,
+                    op_id,
+                    kind,
+                    actor,
+                    ts,
+                    format!(
+                        "operator ancestry recovery may only refresh an existing passing anchored receipt from producer {producer}"
+                    ),
+                );
+                return;
+            }
+            current_producer_evidence_op_ids.push(record.op_id.clone());
+        }
+        current_producer_evidence_op_ids.sort();
+
+        let normalized_reason = override_basis.reason.trim();
+        let ancestry = o
+            .payload
+            .git_ancestry()
+            .expect("override payload always carries ancestry");
+        if current_producers.is_empty()
+            || override_basis.expect_phase_op_id != candidate.phase_op_id
+            || override_basis.expect_authorizer != candidate.authorizer
+            || actor != candidate.authorizer
+            || override_basis.expect_landing_repository_id != candidate.landing_repository_id
+            || override_basis.expect_producers != current_producers
+            || override_basis.expect_producer_evidence_op_ids != current_producer_evidence_op_ids
+            || override_basis
+                .expect_producers
+                .iter()
+                .any(|producer| producer == actor)
+            || !sorted_unique_nonempty(&override_basis.expect_producers)
+            || !sorted_unique_nonempty(&override_basis.expect_producer_evidence_op_ids)
+            || normalized_reason.is_empty()
+            || normalized_reason != override_basis.reason
+            || !sorted_unique_nonempty(&override_basis.authority_refs)
+            || o.refs != override_basis.authority_refs
+            || o.producer_tool != ancestry.git_version
+        {
+            reject(
+                state,
+                &candidate_id,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "operator ancestry refresh requires exact phase, authorizer, repository, producer, prior-evidence, reason, reference, and tool bindings"
+                    .into(),
+            );
+            return;
+        }
+        true
+    } else {
+        false
+    };
+    let required_producer = operator_override_authorized
+        || candidate.evidence_requirements.iter().any(|requirement| {
         requirement.name == o.name
             && requirement.kind == o.evidence_kind
             && requirement.producers.iter().any(|p| p == actor)
@@ -4672,9 +4794,11 @@ fn apply_candidate_evidence(
                     .iter()
                     .any(|grantee| grantee == actor)
             })
-        || o.name == crate::candidate::GIT_REACHABILITY_EVIDENCE
+        // Reachability is an independently reproducible Git fact. Authority to
+        // act on it is checked separately by CandidateReconcile.
+        || (o.name == crate::candidate::GIT_REACHABILITY_EVIDENCE
+            || o.name == crate::candidate::GIT_RECONCILIATION_REACHABILITY_EVIDENCE)
             && o.evidence_kind == "git"
-            && candidate.authorizer == actor
         || o.name == crate::candidate::GIT_OBJECT_AVAILABILITY_EVIDENCE
             && o.evidence_kind == "git"
             && (candidate.proposer == actor
@@ -4723,8 +4847,8 @@ fn apply_candidate_evidence(
         return;
     }
     if o.name == crate::candidate::GIT_ANCESTRY_EVIDENCE {
-        match &o.payload {
-            crate::candidate::CandidateEvidencePayload::GitAncestry(git)
+        match o.payload.git_ancestry() {
+            Some(git)
                 if (git.repository_id == candidate.repository_id
                     || git.repository_id == candidate.landing_repository_id)
                     && git.object_format == candidate.object_format
@@ -4745,10 +4869,16 @@ fn apply_candidate_evidence(
             }
         }
     }
-    if o.name == crate::candidate::GIT_REACHABILITY_EVIDENCE {
+    if o.name == crate::candidate::GIT_REACHABILITY_EVIDENCE
+        || o.name == crate::candidate::GIT_RECONCILIATION_REACHABILITY_EVIDENCE
+    {
         match &o.payload {
             crate::candidate::CandidateEvidencePayload::GitReachability(git)
-                if git.repository_id == candidate.landing_repository_id
+                if ((o.name == crate::candidate::GIT_REACHABILITY_EVIDENCE
+                    && git.repository_id == candidate.landing_repository_id)
+                    || (o.name == crate::candidate::GIT_RECONCILIATION_REACHABILITY_EVIDENCE
+                        && !git.repository_id.trim().is_empty()
+                        && git.repository_id != candidate.landing_repository_id))
                     && git.object_format == candidate.object_format
                     && git.candidate_oid == candidate.commit_oid
                     && !git.target_ref.trim().is_empty()
@@ -4823,10 +4953,8 @@ fn apply_candidate_evidence(
         );
         return;
     }
-    let pair_updates = match &o.payload {
-        crate::candidate::CandidateEvidencePayload::GitAncestry(git)
-            if o.name == crate::candidate::GIT_ANCESTRY_EVIDENCE =>
-        {
+    let pair_updates = match o.payload.git_ancestry() {
+        Some(git) if o.name == crate::candidate::GIT_ANCESTRY_EVIDENCE => {
             let mut known_ids = BTreeSet::new();
             known_ids.extend(
                 git.candidate_relations
@@ -5819,12 +5947,11 @@ fn apply_candidate_reconcile(
         );
         return;
     };
-    let expected_authority = crate::candidate::CandidateReconciliationAuthority::ProposalAuthorizer;
-    if candidate.phase != crate::candidate::CandidatePhase::Pending
-        || candidate.phase_op_id != o.expect_phase
-        || candidate.authorizer != actor
-        || o.authority != expected_authority
-    {
+    let reconcilable_phase = candidate.phase == crate::candidate::CandidatePhase::Pending
+        || (candidate.phase == crate::candidate::CandidatePhase::Abandoned
+            && o.authority
+                == crate::candidate::CandidateReconciliationAuthority::ExplicitOperatorOverride);
+    if !reconcilable_phase || candidate.phase_op_id != o.expect_phase {
         reject(
             state,
             &candidate_id,
@@ -5832,11 +5959,42 @@ fn apply_candidate_reconcile(
             kind,
             actor,
             ts,
-            "out-of-band reconciliation requires proposal-authorizer authority and current pending phase CAS"
+            "out-of-band reconciliation requires the current pending phase CAS, or the current abandoned phase CAS under an explicit operator override"
                 .into(),
         );
         return;
     }
+    let override_basis = match (o.authority, &o.override_basis) {
+        (crate::candidate::CandidateReconciliationAuthority::ProposalAuthorizer, None)
+            if candidate.authorizer == actor =>
+        {
+            None
+        }
+        (
+            crate::candidate::CandidateReconciliationAuthority::ExplicitOperatorOverride,
+            Some(basis),
+        ) if candidate.authorizer != actor
+            && basis.expect_authorizer == candidate.authorizer
+            && basis.expect_landing_repository_id == candidate.landing_repository_id
+            && !basis.reason.trim().is_empty()
+            && sorted_unique_nonempty(&basis.authority_refs) =>
+        {
+            Some(basis.clone())
+        }
+        _ => {
+            reject(
+                state,
+                &candidate_id,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "reconciliation requires proposal-authorizer authority with no override basis, or a distinct explicit operator with the exact original-authorizer CAS and landing-repository CAS values, non-empty reason, and sorted non-empty authority refs"
+                    .into(),
+            );
+            return;
+        }
+    };
 
     let mut current_policy = state
         .candidate_policy_snapshot_at(&candidate_id, ts)
@@ -5860,10 +6018,43 @@ fn apply_candidate_reconcile(
         return;
     }
 
+    let bridged_repository = match (&o.repository_bridge, o.authority) {
+        (None, _) => None,
+        (
+            Some(bridge),
+            crate::candidate::CandidateReconciliationAuthority::ExplicitOperatorOverride,
+        ) if bridge.expect_landing_repository_op_id == candidate.landing_repository_op_id
+            && bridge.object_availability.repository_id != candidate.landing_repository_id
+            && !bridge.object_availability.repository_id.trim().is_empty()
+            && bridge.object_availability.object_format == candidate.object_format
+            && bridge.object_availability.candidate_oid == candidate.commit_oid
+            && bridge.object_availability.observed_parent_oids == candidate.parent_oids
+            && bridge.object_availability.object_available == Some(true)
+            && !bridge.object_availability.git_version.trim().is_empty() =>
+        {
+            Some((
+                bridge.object_availability.repository_id.as_str(),
+                bridge.object_availability.git_version.as_str(),
+            ))
+        }
+        _ => {
+            reject(
+                state,
+                &candidate_id,
+                op_id,
+                kind,
+                actor,
+                ts,
+                "cross-repository reconciliation requires an explicit operator override and exact current binding, commit, parent, and Git object-availability proof"
+                    .into(),
+            );
+            return;
+        }
+    };
     let Some(receipt) = candidate
         .evidence
         .values()
-        .find(|receipt| receipt.evidence_id == o.evidence_id)
+        .find(|receipt| receipt.evidence_id == o.evidence_id && receipt.producer == actor)
     else {
         reject(
             state,
@@ -5876,8 +6067,8 @@ fn apply_candidate_reconcile(
         );
         return;
     };
-    let target_oid = match &receipt.payload {
-        crate::candidate::CandidateEvidencePayload::GitReachability(git)
+    let target_oid = match (&receipt.payload, bridged_repository) {
+        (crate::candidate::CandidateEvidencePayload::GitReachability(git), None)
             if receipt.outcome == crate::candidate::EvidenceOutcome::Pass
                 && receipt.name == crate::candidate::GIT_REACHABILITY_EVIDENCE
                 && receipt.evidence_kind == "git"
@@ -5890,6 +6081,23 @@ fn apply_candidate_reconcile(
         {
             git.observed_target_oid.clone()
         }
+        (
+            crate::candidate::CandidateEvidencePayload::GitReachability(git),
+            Some((bridged_repository_id, bridge_git_version)),
+        ) if receipt.outcome == crate::candidate::EvidenceOutcome::Pass
+            && receipt.name == crate::candidate::GIT_RECONCILIATION_REACHABILITY_EVIDENCE
+            && receipt.evidence_kind == "git"
+            && receipt.producer == actor
+            && git.repository_id == bridged_repository_id
+            && git.object_format == candidate.object_format
+            && git.candidate_oid == candidate.commit_oid
+            && git.target_ref == o.target_ref
+            && git.candidate_reachable == Some(true)
+            && git.git_version == bridge_git_version
+            && receipt.producer_tool == git.git_version =>
+        {
+            git.observed_target_oid.clone()
+        }
         _ => {
             reject(
                 state,
@@ -5898,7 +6106,7 @@ fn apply_candidate_reconcile(
                 kind,
                 actor,
                 ts,
-                "reconciliation requires a passing exact-reachability receipt produced by the proposal authorizer"
+                "reconciliation requires a passing exact-reachability receipt in the bound repository, or the same repository and Git tool as its exact object-availability bridge, produced by the acting operator"
                     .into(),
             );
             return;
@@ -5913,7 +6121,9 @@ fn apply_candidate_reconcile(
     candidate.phase_op_id = op_id.to_string();
     candidate.reconciled = Some(crate::state::CandidateReconciledRecord {
         actor: actor.to_string(),
-        authority: expected_authority,
+        authority: o.authority,
+        override_basis,
+        repository_bridge: o.repository_bridge,
         evidence_id: o.evidence_id,
         target_ref: o.target_ref,
         target_oid,

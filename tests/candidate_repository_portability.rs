@@ -8,8 +8,8 @@ use mote::candidate::{
     AuthorizationStatus, CANDIDATE_PORTABLE_PROTOCOL_VERSION, CANDIDATE_PROTOCOL_VERSION,
     CANDIDATE_ROLE_REVIEW_VERSION, CandidateEvidencePayload, CandidateObjectSource,
     CandidateReviewPolicy, EvidenceOutcome, EvidenceRequirement, GIT_ANCESTRY_EVIDENCE,
-    GIT_OBJECT_AVAILABILITY_EVIDENCE, GitAncestryReceipt, GitObjectAvailabilityReceipt,
-    ReviewVerdict,
+    GIT_OBJECT_AVAILABILITY_EVIDENCE, GIT_RECONCILIATION_REACHABILITY_EVIDENCE, GitAncestryReceipt,
+    GitObjectAvailabilityReceipt, ReviewVerdict,
 };
 use mote::ids;
 use mote::op::{
@@ -494,6 +494,207 @@ fn legacy_source_bound_candidate_can_be_explicitly_rebound_and_terminalized() {
     );
     let landed: serde_json::Value = serde_json::from_slice(&landed.stdout).unwrap();
     assert_eq!(landed["phase"]["value"], "landed");
+}
+
+#[test]
+fn operator_reconciles_across_repositories_without_rewriting_provenance() {
+    let repositories = repositories();
+    let commit = source_commit(&repositories, "already landed candidate");
+    let source_locator = repositories.source.to_str().unwrap();
+    run_git(&repositories.canonical, &["fetch", source_locator, "main"]);
+    run_git(
+        &repositories.canonical,
+        &["merge", "--ff-only", "FETCH_HEAD"],
+    );
+
+    let ancestry =
+        mote::candidate::probe_ancestry(&repositories.source, &commit, &repositories.base, &[])
+            .unwrap();
+    let canonical_repository_id =
+        mote::candidate::probe_ancestry(&repositories.canonical, &commit, &repositories.base, &[])
+            .unwrap()
+            .repository_id;
+    assert_ne!(ancestry.repository_id, canonical_repository_id);
+
+    let candidate_id = ids::new_candidate_id();
+    let proposal_op = publish_checked(
+        &repositories.store,
+        &Op::CandidatePropose(CandidateProposeOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "proposer".into(),
+            candidate_id: candidate_id.clone(),
+            entity: repositories.issue.clone(),
+            store_id: repositories.store.read_format().unwrap().store_id,
+            repository_id: ancestry.repository_id.clone(),
+            landing_repository_id: None,
+            object_source: None,
+            object_format: ancestry.object_format.clone(),
+            commit_oid: commit.clone(),
+            base_oid: repositories.base.clone(),
+            parent_oids: ancestry.parent_oids.clone(),
+            paths: vec!["work.txt".into()],
+            authorizer: "departed-authorizer".into(),
+            reviewers: vec!["reviewer".into()],
+            review_policy: None,
+            evidence_requirements: vec![EvidenceRequirement {
+                name: GIT_ANCESTRY_EVIDENCE.into(),
+                kind: "git".into(),
+                producers: vec!["proposer".into()],
+            }],
+            evidence_refs: Vec::new(),
+            idempotency_key: "cross-repository-proposal".into(),
+        }),
+    );
+    let ancestry_payload = CandidateEvidencePayload::GitAncestry(GitAncestryReceipt {
+        producer_snapshot: None,
+        ..ancestry.clone()
+    });
+    publish_checked(
+        &repositories.store,
+        &Op::CandidateEvidence(CandidateEvidenceOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "proposer".into(),
+            candidate_id: candidate_id.clone(),
+            candidate_oid: commit.clone(),
+            evidence_id: mote::candidate::evidence_id(&ancestry_payload).unwrap(),
+            name: GIT_ANCESTRY_EVIDENCE.into(),
+            evidence_kind: "git".into(),
+            producer_tool: "git version test".into(),
+            outcome: EvidenceOutcome::Pass,
+            payload: ancestry_payload,
+            refs: Vec::new(),
+            idempotency_key: "cross-repository-ancestry".into(),
+        }),
+    );
+    publish_checked(
+        &repositories.store,
+        &review(&candidate_id, "cross-repository-review"),
+    );
+
+    let reconcile_args = [
+        "--json",
+        "candidate",
+        "reconcile",
+        &candidate_id,
+        "--target",
+        "HEAD",
+        "--expect-phase",
+        &proposal_op,
+        "--operator-override",
+        "--reason",
+        "owner appointed a successor coordinator",
+        "--authority-ref",
+        "post-appointment-record",
+        "--authority-ref",
+        "post-independent-ack",
+        "--idempotency-key",
+        "cross-repository-reconciliation",
+    ];
+    let reconciled = run_mote(
+        &repositories.canonical,
+        &repositories.canonical,
+        "recovery-operator",
+        &reconcile_args,
+    );
+    assert!(
+        reconciled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reconciled.stderr)
+    );
+    let reconciled: serde_json::Value = serde_json::from_slice(&reconciled.stdout).unwrap();
+    assert_eq!(reconciled["phase"]["value"], "landed_out_of_band");
+    assert_eq!(
+        reconciled["identity"]["proposal_repository_id"],
+        ancestry.repository_id
+    );
+    assert_eq!(
+        reconciled["identity"]["landing_repository_id"],
+        ancestry.repository_id
+    );
+    assert_eq!(
+        reconciled["identity"]["landing_repository_bindings"],
+        serde_json::json!([])
+    );
+    assert_eq!(reconciled["policy"]["authorizer"], "departed-authorizer");
+    assert_eq!(
+        reconciled["reconciliation"]["override_basis"]["expect_landing_repository_id"],
+        ancestry.repository_id
+    );
+    assert_eq!(
+        reconciled["reconciliation"]["repository_bridge"]["expect_landing_repository_op_id"],
+        proposal_op
+    );
+    assert_eq!(
+        reconciled["reconciliation"]["repository_bridge"]["object_availability"]["repository_id"],
+        canonical_repository_id
+    );
+    assert_eq!(
+        reconciled["reconciliation"]["repository_bridge"]["object_availability"]["candidate_oid"],
+        commit
+    );
+    assert_eq!(
+        reconciled["reconciliation"]["repository_bridge"]["object_availability"]["observed_parent_oids"],
+        serde_json::json!([repositories.base])
+    );
+    assert!(
+        reconciled["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|receipt| {
+                receipt["name"] == GIT_RECONCILIATION_REACHABILITY_EVIDENCE
+                    && receipt["outcome"] == "pass"
+                    && receipt["payload"]["repository_id"] == canonical_repository_id
+            })
+    );
+
+    let human = run_mote(
+        &repositories.canonical,
+        &repositories.canonical,
+        "recovery-operator",
+        &["candidate", "show", &candidate_id],
+    );
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("reconciliation repository bridge"));
+    assert!(human.contains(&canonical_repository_id));
+
+    let audit = run_mote(
+        &repositories.canonical,
+        &repositories.canonical,
+        "recovery-operator",
+        &["--json", "audit", "--fail-on", "never"],
+    );
+    assert!(audit.status.success());
+    let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    let finding = audit["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["code"] == "candidate_reconciliation_repository_bridge_recorded")
+        .unwrap();
+    assert_eq!(
+        finding["evidence"]["preserved_landing_repository_id"],
+        ancestry.repository_id
+    );
+    assert_eq!(
+        finding["evidence"]["observed_repository_id"],
+        canonical_repository_id
+    );
+
+    let doctor = run_mote(
+        &repositories.canonical,
+        &repositories.canonical,
+        "recovery-operator",
+        &["--json", "doctor"],
+    );
+    assert!(doctor.status.success());
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor["ok"], true);
 }
 
 #[test]

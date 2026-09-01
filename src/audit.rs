@@ -658,6 +658,39 @@ pub fn run_audit(
     }
 
     for candidate in state.candidates.values() {
+        for evidence in candidate.evidence.values() {
+            let Some(override_basis) = evidence.payload.git_ancestry_override() else {
+                continue;
+            };
+            findings.push(finding(
+                "candidate_ancestry_operator_override_recorded",
+                AuditSeverity::Warning,
+                "candidate",
+                &candidate.candidate_id,
+                format!(
+                    "operator {} refreshed immutable-producer Git ancestry under an explicit recovery basis",
+                    evidence.producer
+                ),
+                json!({
+                    "actor": evidence.producer,
+                    "expected_phase_op_id": override_basis.expect_phase_op_id,
+                    "expected_authorizer": override_basis.expect_authorizer,
+                    "expected_landing_repository_id": override_basis.expect_landing_repository_id,
+                    "expected_producers": override_basis.expect_producers,
+                    "expected_producer_evidence_op_ids": override_basis.expect_producer_evidence_op_ids,
+                    "reason": override_basis.reason,
+                    "authority_refs": override_basis.authority_refs,
+                    "evidence_id": evidence.evidence_id,
+                    "evidence_op_id": evidence.op_id,
+                    "recorded_at": evidence.ts,
+                }),
+                "candidate_governance",
+                "review the durable authority references and producer-unavailability basis; this refresh changes only reproducible Git ancestry bookkeeping",
+            ));
+        }
+    }
+
+    for candidate in state.candidates.values() {
         let Some(supersession) = &candidate.supersession else {
             continue;
         };
@@ -705,6 +738,8 @@ pub fn run_audit(
                 "phase_recorded": candidate.phase,
                 "actor": reconciliation.actor,
                 "authority": reconciliation.authority,
+                "override_basis": reconciliation.override_basis,
+                "repository_bridge": reconciliation.repository_bridge,
                 "reachability_evidence_id": reconciliation.evidence_id,
                 "target_ref": reconciliation.target_ref,
                 "target_oid": reconciliation.target_oid,
@@ -720,6 +755,61 @@ pub fn run_audit(
             "candidate_governance",
             "retain this as an explicit reconciliation record; it resolves reachability but does not prove governed review, authorization, or landing",
         ));
+        if let Some(override_basis) = &reconciliation.override_basis {
+            findings.push(finding(
+                "candidate_reconciliation_operator_override_recorded",
+                AuditSeverity::Warning,
+                "candidate",
+                &candidate.candidate_id,
+                format!(
+                    "operator {} reconciled the candidate by explicit override while preserving original proposal authorizer {}",
+                    reconciliation.actor, override_basis.expect_authorizer
+                ),
+                json!({
+                    "actor": reconciliation.actor,
+                    "authority": reconciliation.authority,
+                    "expected_authorizer": override_basis.expect_authorizer,
+                    "expected_landing_repository_id": override_basis.expect_landing_repository_id,
+                    "reason": override_basis.reason,
+                    "authority_refs": override_basis.authority_refs,
+                    "repository_bridge": reconciliation.repository_bridge,
+                    "reachability_evidence_id": reconciliation.evidence_id,
+                    "target_ref": reconciliation.target_ref,
+                    "target_oid": reconciliation.target_oid,
+                    "policy_snapshot": reconciliation.policy_snapshot,
+                    "reconciliation_op_id": reconciliation.op_id,
+                    "recorded_at": reconciliation.ts,
+                }),
+                "candidate_governance",
+                "review the recorded override basis independently; this is explicit bookkeeping recovery, not inherited proposal-authorizer authority",
+            ));
+        }
+        if let Some(bridge) = &reconciliation.repository_bridge {
+            findings.push(finding(
+                "candidate_reconciliation_repository_bridge_recorded",
+                AuditSeverity::Warning,
+                "candidate",
+                &candidate.candidate_id,
+                format!(
+                    "candidate was reconciled in repository {} while preserving landing repository {}",
+                    bridge.object_availability.repository_id,
+                    candidate.landing_repository_id
+                ),
+                json!({
+                    "actor": reconciliation.actor,
+                    "preserved_landing_repository_id": candidate.landing_repository_id,
+                    "preserved_landing_repository_op_id": bridge.expect_landing_repository_op_id,
+                    "observed_repository_id": bridge.object_availability.repository_id,
+                    "candidate_oid": bridge.object_availability.candidate_oid,
+                    "observed_parent_oids": bridge.object_availability.observed_parent_oids,
+                    "git_version": bridge.object_availability.git_version,
+                    "reconciliation_op_id": reconciliation.op_id,
+                    "recorded_at": reconciliation.ts,
+                }),
+                "candidate_governance",
+                "verify the exact object and parent anchors plus the recorded operator authority; the candidate's repository provenance was not rewritten",
+            ));
+        }
     }
 
     let mut target_oid = None;

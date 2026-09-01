@@ -298,7 +298,35 @@ claim that mutable Git storage can never later be pruned. The final landing and
 reconciliation commands probe exact target reachability again. Reducer replay
 never opens the repository or silently fetches an object.
 
-### 4.7 Containment-backed supersession recovery
+### 4.7 Immutable-producer ancestry recovery
+
+Ordinary `candidate evidence refresh` remains owned by a producer named in the
+immutable evidence requirement. When every named Git-ancestry producer is
+unavailable, the immutable proposal authorizer may instead publish an audited
+Git-only refresh with `--operator-override`. This does not inherit a producer's
+identity or authority. The operation records and the reducer checks:
+
+- the exact current candidate phase operation, authorizer identity, and
+  landing-repository identity;
+- the sorted immutable producer set and the exact prior evidence operation for
+  each producer;
+- that every prior receipt was passing and anchored to the candidate's exact
+  repository or landing repository, object format, commit, base, and parents;
+- a fresh ancestry receipt produced by the acting authorizer; and
+- a non-empty reason plus sorted, non-empty durable authority references.
+
+The acting authorizer must be distinct from every named producer. The override
+can refresh reproducible Git facts after a terminal transition because it never
+changes candidate phase, reviews, authorization, or proposal provenance.
+Missing prior receipts, a stale phase, a policy mismatch, a failed Git probe, or
+an authorizer that is itself a named producer fails closed.
+
+Authority references are durable attestations for later human review. Mote
+records and audits them, but does not dereference them or treat them as a
+machine-rooted grant of authority. Every accepted use emits
+`candidate_ancestry_operator_override_recorded`.
+
+### 4.8 Containment-backed supersession recovery
 
 Ordinary supersession remains owned by the predecessor's proposer or immutable
 authorizer. A second, explicit recovery mode exists for the case where neither
@@ -324,7 +352,7 @@ candidates, infer patch equivalence, or turn containment into a governed landing
 claim. The supersession record retains actor, authority, evidence ids, op id,
 and timestamp, and `mote audit` surfaces recovery use for review.
 
-### 4.8 Out-of-band reachability reconciliation
+### 4.9 Out-of-band reachability reconciliation
 
 When a pending candidate is already reachable from an explicit Git target but
 the formal landing transition was never recorded, the proposal's immutable
@@ -352,6 +380,33 @@ terminal transition fails closed. The result is the distinct terminal phase
 `landed_out_of_band`; it stores the observed target OID and the complete policy
 basis. It does not create, grant, revoke, or consume authorization and never
 claims that formal review or authorization governed the Git landing.
+
+A second, explicit operator-recovery form exists when the immutable proposal
+authorizer cannot act. A distinct operator supplies `--operator-override`, the
+exact current phase clock, a non-empty reason, and sorted non-empty durable
+authority references. The operation also binds the exact original authorizer
+and landing-repository identity. The reducer accepts this form for a pending
+candidate, or for an abandoned candidate whose exact commit is already
+reachable from the target. It rejects superseded, landed, and already
+reconciled candidates. Ordinary proposal-authorizer reconciliation remains
+pending-only, and the proposal authorizer may not masquerade as an override
+operator.
+
+The explicit override does not confer inherited authorizer authority. Its
+references are durable attestations, not a machine-validated grant; Mote stores
+them so an independent reviewer can assess the recovery basis and emits
+`candidate_reconciliation_operator_override_recorded`.
+
+Operator recovery probes the Git repository backing the store. If that
+repository differs from the candidate's recorded landing repository, the
+operation carries a typed repository bridge: the exact current landing-binding
+clock plus object-availability proof for the immutable commit and parent list
+in the observed repository. The reachability receipt is then bound to that
+observed repository while the proposal and landing repository identities remain
+unchanged. Missing objects, changed parents, a stale binding, or a repository or
+tool mismatch fails closed. Audit emits
+`candidate_reconciliation_repository_bridge_recorded`; the bridge is evidence
+of where the recovery was observed, never a provenance rewrite.
 
 ## 5. Review model
 
@@ -449,8 +504,8 @@ machine-resolvable. Timestamp prose is never authorization.
 | Supersede candidate | predecessor submitter/authorizer; or successor authorizer with explicit containment recovery |
 | Abandon candidate | submitter or landing authorizer |
 | Record landing | actor in the current grant's grantee set |
-| Reconcile an out-of-band landing | proposal-named landing authorizer only |
-| Change terminal candidate state | nobody |
+| Reconcile an out-of-band landing | proposal-named landing authorizer for an ordinary pending repair; or a distinct operator with the exact audited override basis |
+| Change terminal candidate state | only `abandoned` to `landed_out_of_band` through the explicit audited operator-reconciliation exception |
 
 The reducer compares op actor strings to the current recorded policy. This is strong
 coordination attribution but, as stated in the safety boundary, not
@@ -474,6 +529,7 @@ Candidate phase is separate from review and authorization state.
 | `abandon` | submitter or landing authorizer | phase `pending`; phase expectation matches | `abandoned` |
 | `landed` | actor in current grant | phase `pending`; exact grant expectation matches; candidate is landable; landing receipt passes | `landed`, grant becomes `consumed` |
 | `reconcile` | proposal authorizer | phase `pending`; phase and complete policy snapshot match; authorizer-produced reachability receipt passes for the exact target | `landed_out_of_band`, authorization unchanged, pre-transition blockers retained |
+| `reconcile --operator-override` | actor distinct from proposal authorizer | phase `pending`, or `abandoned` for legacy recovery; exact phase, original authorizer, landing repository, non-empty reason, sorted durable references, complete policy snapshot, and acting-operator reachability receipt match; a cross-repository probe also carries the exact binding and object/parent bridge | `landed_out_of_band`, original provenance and authorization unchanged, pre-transition blockers retained, audit warnings emitted |
 
 `pending` is the only non-terminal phase. `superseded`, `abandoned`, `landed`,
 and `landed_out_of_band` are terminal. Authorization `revoked` is not a terminal candidate
@@ -611,7 +667,10 @@ collapse it into governed `landed`.
    registers.
 4. Every mutable register transition carries an expectation; at most one
    concurrent transition from one prior value is accepted.
-5. Terminal candidate phases never reopen.
+5. Terminal candidate phases never reopen to `pending`. The sole terminal-to-
+   terminal correction is audited operator reconciliation from `abandoned` to
+   `landed_out_of_band`; `superseded`, `landed`, and `landed_out_of_band` remain
+   immutable.
 6. A grant is consumable at most once and only by a named grantee.
 7. Evidence for one candidate object id cannot satisfy another candidate.
 8. Reviews and authorization never transfer through supersession.
@@ -771,6 +830,9 @@ mote candidate propose --require-reviews 2 --from-role reviewer
 mote candidate show
 mote candidate list
 mote candidate evidence refresh
+# Break glass only when every immutable ancestry producer is unavailable:
+mote candidate evidence refresh CANDIDATE --operator-override \
+  --expect-phase OP_ID --reason TEXT --authority-ref REF
 mote candidate evidence availability CANDIDATE
 mote candidate review CANDIDATE approve
 mote candidate review CANDIDATE approve --from-role reviewer
@@ -784,6 +846,11 @@ mote candidate supersede
 mote candidate abandon
 mote candidate landed
 mote candidate reconcile
+# A distinct operator may record exact out-of-band reachability when the
+# immutable authorizer cannot act; abandoned rows require this form.
+mote candidate reconcile CANDIDATE --target REF --expect-phase OP_ID \
+  --operator-override --reason TEXT --authority-ref REF \
+  --idempotency-key KEY
 ```
 
 Mutating commands return exit `0` on accepted or idempotently matched state,
@@ -857,6 +924,10 @@ optional `subject`, and `detail`.
   `candidate_reconcile` op, and `landed_out_of_band` phase. Older binaries may
   reject these additive variants and must be upgraded before writing candidate
   operations in a store that uses reconciliation.
+- Audited ancestry recovery adds a distinct Git-ancestry override payload.
+  Operator reconciliation adds the explicit authority variant, durable override
+  basis, and optional cross-repository bridge. All candidate writers, reducers,
+  and audit readers must be upgraded before these recovery forms are used.
 - A legacy relation row remains valid in its original direction when its
   candidate id, proposal op id, commit id, repository, and receipt anchors all
   match. Missing reciprocal fields can never be used to resolve the opposite

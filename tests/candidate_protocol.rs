@@ -3,12 +3,14 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use mote::candidate::{
-    AuthorizationStatus, CandidateEvidencePayload, CandidatePolicySnapshot,
-    CandidateReconciliationAuthority, CandidateSnapshotProvenance, CandidateSupersedeRecovery,
-    CandidateSupersessionAuthority, EvidenceOutcome, EvidenceRequirement, GIT_ANCESTRY_EVIDENCE,
-    GIT_LANDING_EVIDENCE, GIT_REACHABILITY_EVIDENCE, GIT_RELATION_SCHEMA_V2, GitAncestryReceipt,
-    GitCandidateRelation, GitLandingReceipt, GitReachabilityReceipt, GitRelationKind,
-    KnownCandidate, ReviewVerdict, evidence_id,
+    AuthorizationStatus, CandidateEvidenceOperatorOverride, CandidateEvidencePayload,
+    CandidateOperatorOverride, CandidatePolicySnapshot, CandidateReconciliationAuthority,
+    CandidateReconciliationRepositoryBridge, CandidateSnapshotProvenance,
+    CandidateSupersedeRecovery, CandidateSupersessionAuthority, EvidenceOutcome,
+    EvidenceRequirement, GIT_ANCESTRY_EVIDENCE, GIT_LANDING_EVIDENCE, GIT_REACHABILITY_EVIDENCE,
+    GIT_RECONCILIATION_REACHABILITY_EVIDENCE, GIT_RELATION_SCHEMA_V2, GitAncestryReceipt,
+    GitCandidateRelation, GitLandingReceipt, GitObjectAvailabilityReceipt, GitReachabilityReceipt,
+    GitRelationKind, KnownCandidate, ReviewVerdict, evidence_id,
 };
 use mote::ids;
 use mote::op::{
@@ -22,6 +24,7 @@ use mote::{publish, reducer, repo::Store};
 const BASE: &str = "1111111111111111111111111111111111111111";
 const COMMIT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const COMMIT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const COMMIT_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const REPO: &str = "repo-test";
 
 fn setup() -> (TempDir, Store, String) {
@@ -225,6 +228,38 @@ fn evidence(candidate_id: &str, payload: CandidateEvidencePayload, key: &str) ->
     })
 }
 
+fn operator_ancestry_evidence(
+    candidate_id: &str,
+    receipt: GitAncestryReceipt,
+    override_basis: CandidateEvidenceOperatorOverride,
+    actor: &str,
+    refs: Vec<String>,
+    key: &str,
+) -> Op {
+    let candidate_oid = receipt.commit_oid.clone();
+    let producer_tool = receipt.git_version.clone();
+    let payload = CandidateEvidencePayload::GitAncestryOverride {
+        receipt,
+        override_basis,
+    };
+    Op::CandidateEvidence(CandidateEvidenceOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(Timestamp::now()),
+        actor: actor.into(),
+        candidate_id: candidate_id.into(),
+        candidate_oid,
+        evidence_id: evidence_id(&payload).unwrap(),
+        name: GIT_ANCESTRY_EVIDENCE.into(),
+        evidence_kind: "git".into(),
+        producer_tool,
+        outcome: EvidenceOutcome::Pass,
+        payload,
+        refs,
+        idempotency_key: key.into(),
+    })
+}
+
 fn reachability_evidence(
     candidate_id: &str,
     actor: &str,
@@ -233,12 +268,33 @@ fn reachability_evidence(
     repository_id: &str,
     key: &str,
 ) -> (Op, String) {
+    reachability_evidence_for_commit(
+        candidate_id,
+        actor,
+        outcome,
+        reachable,
+        repository_id,
+        COMMIT_A,
+        key,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reachability_evidence_for_commit(
+    candidate_id: &str,
+    actor: &str,
+    outcome: EvidenceOutcome,
+    reachable: Option<bool>,
+    repository_id: &str,
+    candidate_oid: &str,
+    key: &str,
+) -> (Op, String) {
     let payload = CandidateEvidencePayload::GitReachability(GitReachabilityReceipt {
         repository_id: repository_id.into(),
         object_format: "sha1".into(),
-        candidate_oid: COMMIT_A.into(),
+        candidate_oid: candidate_oid.into(),
         target_ref: "refs/heads/main".into(),
-        observed_target_oid: COMMIT_A.into(),
+        observed_target_oid: candidate_oid.into(),
         candidate_reachable: reachable,
         git_version: "git version test".into(),
         detail: None,
@@ -251,7 +307,7 @@ fn reachability_evidence(
             ts: ids::format_rfc3339(Timestamp::now()),
             actor: actor.into(),
             candidate_id: candidate_id.into(),
-            candidate_oid: COMMIT_A.into(),
+            candidate_oid: candidate_oid.into(),
             evidence_id: evidence_id.clone(),
             name: GIT_REACHABILITY_EVIDENCE.into(),
             evidence_kind: "git".into(),
@@ -283,6 +339,41 @@ fn reconcile(
         target_ref: "refs/heads/main".into(),
         expect_phase: expect_phase.into(),
         authority: CandidateReconciliationAuthority::ProposalAuthorizer,
+        override_basis: None,
+        repository_bridge: None,
+        policy_snapshot,
+        idempotency_key: key.into(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn override_reconcile(
+    candidate_id: &str,
+    actor: &str,
+    evidence_id: &str,
+    expect_phase: &str,
+    expect_authorizer: &str,
+    authority_refs: Vec<&str>,
+    policy_snapshot: CandidatePolicySnapshot,
+    key: &str,
+) -> Op {
+    Op::CandidateReconcile(CandidateReconcileOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(Timestamp::now()),
+        actor: actor.into(),
+        candidate_id: candidate_id.into(),
+        evidence_id: evidence_id.into(),
+        target_ref: "refs/heads/main".into(),
+        expect_phase: expect_phase.into(),
+        authority: CandidateReconciliationAuthority::ExplicitOperatorOverride,
+        override_basis: Some(CandidateOperatorOverride {
+            expect_authorizer: expect_authorizer.into(),
+            expect_landing_repository_id: REPO.into(),
+            reason: "proposal authorizer is unavailable; preserve observed Git state".into(),
+            authority_refs: authority_refs.into_iter().map(str::to_string).collect(),
+        }),
+        repository_bridge: None,
         policy_snapshot,
         idempotency_key: key.into(),
     })
@@ -395,6 +486,58 @@ fn legacy_candidate_supersede_payload_defaults_to_owner_mode() {
     assert!(supersede.recovery.is_none());
 }
 
+#[test]
+fn legacy_candidate_reconcile_payload_defaults_to_no_override_basis() {
+    let legacy = serde_json::json!({
+        "v": 1,
+        "op": "op-legacy-reconcile",
+        "ts": "2026-08-30T00:00:00Z",
+        "actor": "authorizer",
+        "kind": "candidate_reconcile",
+        "candidate_id": "cand-01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "evidence_id": "evid-legacy",
+        "target_ref": "refs/heads/main",
+        "expect_phase": "op-proposal",
+        "authority": "proposal_authorizer",
+        "policy_snapshot": {
+            "phase_op_id": "op-proposal",
+            "review_op_ids": [],
+            "evidence_op_ids": [],
+            "pair_evidence_op_ids": [],
+            "pre_transition_landability": {
+                "landable": false,
+                "reason_codes": [],
+                "reasons": []
+            }
+        },
+        "idempotency_key": "legacy-reconcile"
+    });
+    let op: Op = serde_json::from_value(legacy).unwrap();
+    let Op::CandidateReconcile(reconcile) = &op else {
+        unreachable!()
+    };
+    assert_eq!(
+        reconcile.authority,
+        CandidateReconciliationAuthority::ProposalAuthorizer
+    );
+    assert!(reconcile.override_basis.is_none());
+    assert!(reconcile.repository_bridge.is_none());
+    assert!(
+        serde_json::to_value(&op)
+            .unwrap()
+            .get("override_basis")
+            .is_none(),
+        "legacy proposal-authorizer reconciliation retains its historical wire shape"
+    );
+    assert!(
+        serde_json::to_value(&op)
+            .unwrap()
+            .get("repository_bridge")
+            .is_none(),
+        "legacy reconciliation does not acquire a synthetic repository bridge"
+    );
+}
+
 fn approve(candidate_id: &str, key: &str) -> Op {
     Op::CandidateReview(CandidateReviewOp {
         v: 1,
@@ -430,7 +573,7 @@ fn authorize_as(candidate_id: &str, actor: &str, key: &str) -> Op {
     })
 }
 
-fn abandon(store: &Store, candidate_id: &str, key: &str) {
+fn abandon(store: &Store, candidate_id: &str, key: &str) -> String {
     let state = reducer::replay_store(store).unwrap();
     publish_checked(
         store,
@@ -444,7 +587,7 @@ fn abandon(store: &Store, candidate_id: &str, key: &str) {
             reason: Some("did not govern the landing".into()),
             idempotency_key: key.into(),
         }),
-    );
+    )
 }
 
 #[test]
@@ -588,7 +731,7 @@ fn out_of_band_reconciliation_preserves_policy_and_resolves_descendants() {
         ),
     );
 
-    let (wrong_actor_evidence, _) = reachability_evidence(
+    let (independent_reachability_evidence, independent_evidence_id) = reachability_evidence(
         &candidate_id,
         "intruder",
         EvidenceOutcome::Pass,
@@ -596,7 +739,21 @@ fn out_of_band_reconciliation_preserves_policy_and_resolves_descendants() {
         REPO,
         "reconcile-wrong-producer",
     );
-    publish_rejected(&store, &wrong_actor_evidence, "not a named producer");
+    publish_checked(&store, &independent_reachability_evidence);
+    let state = reducer::replay_store(&store).unwrap();
+    let independent_snapshot = state.candidate_policy_snapshot(&candidate_id).unwrap();
+    publish_rejected(
+        &store,
+        &reconcile(
+            &candidate_id,
+            "intruder",
+            &independent_evidence_id,
+            &proposal_op,
+            independent_snapshot,
+            "reconcile-independent-fact-no-authority",
+        ),
+        "proposal-authorizer authority",
+    );
 
     let (failed_evidence, failed_id) = reachability_evidence(
         &candidate_id,
@@ -834,6 +991,577 @@ fn out_of_band_reconciliation_preserves_policy_and_resolves_descendants() {
 }
 
 #[test]
+fn explicit_operator_override_is_audited_and_does_not_impersonate_the_authorizer() {
+    let (_temp, store, issue) = setup();
+    let candidate_id = ids::new_candidate_id();
+    let proposal_op = publish_checked(
+        &store,
+        &proposal(
+            &candidate_id,
+            &issue,
+            COMMIT_A,
+            "operator-override-proposal",
+        ),
+    );
+    let (reachability, evidence_id) = reachability_evidence(
+        &candidate_id,
+        "recovery-operator",
+        EvidenceOutcome::Pass,
+        Some(true),
+        REPO,
+        "operator-override-reachability",
+    );
+    publish_checked(&store, &reachability);
+    let initial_snapshot = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_policy_snapshot(&candidate_id)
+        .unwrap();
+
+    let mut missing_basis = override_reconcile(
+        &candidate_id,
+        "recovery-operator",
+        &evidence_id,
+        &proposal_op,
+        "authorizer",
+        vec!["appointment-record"],
+        initial_snapshot.clone(),
+        "operator-override-missing-basis",
+    );
+    let Op::CandidateReconcile(operation) = &mut missing_basis else {
+        unreachable!()
+    };
+    operation.override_basis = None;
+    publish_rejected(&store, &missing_basis, "exact original-authorizer CAS");
+
+    let wrong_authorizer = override_reconcile(
+        &candidate_id,
+        "recovery-operator",
+        &evidence_id,
+        &proposal_op,
+        "caller-selected-authorizer",
+        vec!["appointment-record"],
+        initial_snapshot.clone(),
+        "operator-override-wrong-authorizer",
+    );
+    publish_rejected(&store, &wrong_authorizer, "exact original-authorizer CAS");
+
+    let mut wrong_repository = override_reconcile(
+        &candidate_id,
+        "recovery-operator",
+        &evidence_id,
+        &proposal_op,
+        "authorizer",
+        vec!["appointment-record"],
+        initial_snapshot.clone(),
+        "operator-override-wrong-repository",
+    );
+    let Op::CandidateReconcile(operation) = &mut wrong_repository else {
+        unreachable!()
+    };
+    operation
+        .override_basis
+        .as_mut()
+        .unwrap()
+        .expect_landing_repository_id = "repo-caller-selected".into();
+    publish_rejected(&store, &wrong_repository, "landing-repository CAS");
+
+    let unsorted_refs = override_reconcile(
+        &candidate_id,
+        "recovery-operator",
+        &evidence_id,
+        &proposal_op,
+        "authorizer",
+        vec!["post-z", "post-a"],
+        initial_snapshot.clone(),
+        "operator-override-unsorted-refs",
+    );
+    publish_rejected(&store, &unsorted_refs, "sorted non-empty authority refs");
+
+    let authorizer_override = override_reconcile(
+        &candidate_id,
+        "authorizer",
+        &evidence_id,
+        &proposal_op,
+        "authorizer",
+        vec!["appointment-record"],
+        initial_snapshot.clone(),
+        "operator-override-authorizer-misuse",
+    );
+    publish_rejected(&store, &authorizer_override, "distinct explicit operator");
+
+    publish_checked(&store, &approve(&candidate_id, "operator-override-review"));
+    let authorization_op = publish_checked(
+        &store,
+        &authorize(&candidate_id, "operator-override-authorization"),
+    );
+    let stale = override_reconcile(
+        &candidate_id,
+        "recovery-operator",
+        &evidence_id,
+        &proposal_op,
+        "authorizer",
+        vec!["appointment-record"],
+        initial_snapshot,
+        "operator-override-stale-policy",
+    );
+    publish_rejected(&store, &stale, "stale reconciliation policy snapshot CAS");
+
+    let current = reducer::replay_store(&store).unwrap();
+    let current_snapshot = current.candidate_policy_snapshot(&candidate_id).unwrap();
+    let operation = override_reconcile(
+        &candidate_id,
+        "recovery-operator",
+        &evidence_id,
+        &proposal_op,
+        "authorizer",
+        vec!["appointment-ack", "appointment-record"],
+        current_snapshot.clone(),
+        "operator-override-success",
+    );
+    let reconciliation_op = publish_checked(&store, &operation);
+
+    let state = reducer::replay_store(&store).unwrap();
+    let candidate = &state.candidates[&candidate_id];
+    assert_eq!(candidate.authorizer, "authorizer");
+    assert_eq!(candidate.phase.as_str(), "landed_out_of_band");
+    assert_eq!(candidate.phase_op_id, reconciliation_op);
+    assert_eq!(
+        candidate.reviews["reviewer"].verdict,
+        ReviewVerdict::Approve
+    );
+    assert_eq!(
+        candidate.authorization.as_ref().unwrap().op_id,
+        authorization_op
+    );
+    assert_eq!(
+        candidate.authorization.as_ref().unwrap().status,
+        AuthorizationStatus::Granted
+    );
+    let recorded = candidate.reconciled.as_ref().unwrap();
+    assert_eq!(
+        recorded.authority,
+        CandidateReconciliationAuthority::ExplicitOperatorOverride
+    );
+    assert_eq!(recorded.actor, "recovery-operator");
+    assert_eq!(recorded.policy_snapshot, current_snapshot);
+    let basis = recorded.override_basis.as_ref().unwrap();
+    assert_eq!(basis.expect_authorizer, "authorizer");
+    assert_eq!(basis.expect_landing_repository_id, REPO);
+    assert_eq!(
+        basis.authority_refs,
+        vec!["appointment-ack", "appointment-record"]
+    );
+    assert!(basis.reason.contains("proposal authorizer is unavailable"));
+    assert!(recorded.repository_bridge.is_none());
+}
+
+#[test]
+fn abandoned_reconciliation_requires_an_exact_audited_override_and_preserves_history() {
+    let (_temp, store, issue) = setup();
+    let candidate_id = ids::new_candidate_id();
+    let proposal_op = publish_checked(
+        &store,
+        &proposal(
+            &candidate_id,
+            &issue,
+            COMMIT_A,
+            "abandoned-reconciliation-proposal",
+        ),
+    );
+    let abandonment_op = abandon(&store, &candidate_id, "abandoned-reconciliation-abandon");
+
+    let (mut mislabeled_reachability, _) = reachability_evidence(
+        &candidate_id,
+        "recovery-operator",
+        EvidenceOutcome::Pass,
+        Some(true),
+        REPO,
+        "abandoned-reconciliation-mislabeled-reachability",
+    );
+    let Op::CandidateEvidence(mislabeled_record) = &mut mislabeled_reachability else {
+        unreachable!()
+    };
+    mislabeled_record.name = "external-tests".into();
+    publish_rejected(
+        &store,
+        &mislabeled_reachability,
+        "terminal candidates accept only built-in Git ancestry bookkeeping",
+    );
+
+    let (bystander_evidence, bystander_evidence_id) = reachability_evidence(
+        &candidate_id,
+        "bystander",
+        EvidenceOutcome::Pass,
+        Some(true),
+        REPO,
+        "abandoned-reconciliation-bystander-reachability",
+    );
+    publish_checked(&store, &bystander_evidence);
+    let bystander_snapshot = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_policy_snapshot(&candidate_id)
+        .unwrap();
+    publish_rejected(
+        &store,
+        &override_reconcile(
+            &candidate_id,
+            "recovery-operator",
+            &bystander_evidence_id,
+            &abandonment_op,
+            "authorizer",
+            vec!["legacy-abandonment-record"],
+            bystander_snapshot,
+            "abandoned-reconciliation-bystander-receipt",
+        ),
+        "reconciliation reachability evidence not found",
+    );
+
+    let (failed_evidence, failed_evidence_id) = reachability_evidence(
+        &candidate_id,
+        "recovery-operator",
+        EvidenceOutcome::Fail,
+        Some(false),
+        REPO,
+        "abandoned-reconciliation-failed-reachability",
+    );
+    publish_checked(&store, &failed_evidence);
+    let failed_snapshot = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_policy_snapshot(&candidate_id)
+        .unwrap();
+    publish_rejected(
+        &store,
+        &override_reconcile(
+            &candidate_id,
+            "recovery-operator",
+            &failed_evidence_id,
+            &abandonment_op,
+            "authorizer",
+            vec!["legacy-abandonment-record"],
+            failed_snapshot,
+            "abandoned-reconciliation-failed-receipt",
+        ),
+        "passing exact-reachability receipt",
+    );
+
+    let (passing_evidence, passing_evidence_id) = reachability_evidence(
+        &candidate_id,
+        "recovery-operator",
+        EvidenceOutcome::Pass,
+        Some(true),
+        REPO,
+        "abandoned-reconciliation-passing-reachability",
+    );
+    publish_checked(&store, &passing_evidence);
+    let (authorizer_evidence, authorizer_evidence_id) = reachability_evidence(
+        &candidate_id,
+        "authorizer",
+        EvidenceOutcome::Pass,
+        Some(true),
+        REPO,
+        "abandoned-reconciliation-authorizer-reachability",
+    );
+    publish_checked(&store, &authorizer_evidence);
+    let current_snapshot = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_policy_snapshot(&candidate_id)
+        .unwrap();
+
+    publish_rejected(
+        &store,
+        &reconcile(
+            &candidate_id,
+            "authorizer",
+            &authorizer_evidence_id,
+            &abandonment_op,
+            current_snapshot.clone(),
+            "abandoned-reconciliation-ordinary-authorizer",
+        ),
+        "explicit operator override",
+    );
+
+    publish_rejected(
+        &store,
+        &override_reconcile(
+            &candidate_id,
+            "recovery-operator",
+            &passing_evidence_id,
+            &proposal_op,
+            "authorizer",
+            vec!["legacy-abandonment-record"],
+            current_snapshot.clone(),
+            "abandoned-reconciliation-stale-phase",
+        ),
+        "current pending phase CAS",
+    );
+
+    let mut missing_basis = override_reconcile(
+        &candidate_id,
+        "recovery-operator",
+        &passing_evidence_id,
+        &abandonment_op,
+        "authorizer",
+        vec!["legacy-abandonment-record"],
+        current_snapshot.clone(),
+        "abandoned-reconciliation-missing-basis",
+    );
+    let Op::CandidateReconcile(operation) = &mut missing_basis else {
+        unreachable!()
+    };
+    operation.override_basis = None;
+    publish_rejected(&store, &missing_basis, "exact original-authorizer CAS");
+
+    let reconciliation_op = publish_checked(
+        &store,
+        &override_reconcile(
+            &candidate_id,
+            "recovery-operator",
+            &passing_evidence_id,
+            &abandonment_op,
+            "authorizer",
+            vec!["legacy-abandonment-record"],
+            current_snapshot,
+            "abandoned-reconciliation-success",
+        ),
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    let candidate = &state.candidates[&candidate_id];
+    assert_eq!(candidate.phase.as_str(), "landed_out_of_band");
+    assert_eq!(candidate.phase_op_id, reconciliation_op);
+    assert_eq!(
+        candidate.reconciled.as_ref().unwrap().authority,
+        CandidateReconciliationAuthority::ExplicitOperatorOverride
+    );
+    assert!(state.was_accepted(&abandonment_op));
+    assert!(
+        store
+            .ops_dir()
+            .join(format!("{abandonment_op}.json"))
+            .is_file(),
+        "reconciliation must append a new fact without erasing the accepted abandonment"
+    );
+
+    let superseded = ids::new_candidate_id();
+    let successor = ids::new_candidate_id();
+    publish_checked(
+        &store,
+        &proposal(
+            &superseded,
+            &issue,
+            COMMIT_B,
+            "superseded-reconciliation-predecessor",
+        ),
+    );
+    publish_checked(
+        &store,
+        &proposal(
+            &successor,
+            &issue,
+            COMMIT_C,
+            "superseded-reconciliation-successor",
+        ),
+    );
+    let (superseded_evidence, superseded_evidence_id) = reachability_evidence_for_commit(
+        &superseded,
+        "recovery-operator",
+        EvidenceOutcome::Pass,
+        Some(true),
+        REPO,
+        COMMIT_B,
+        "superseded-reconciliation-reachability",
+    );
+    publish_checked(&store, &superseded_evidence);
+    let pending = reducer::replay_store(&store).unwrap();
+    publish_checked(
+        &store,
+        &Op::CandidateSupersede(CandidateSupersedeOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "authorizer".into(),
+            candidate_id: superseded.clone(),
+            successor_id: successor,
+            expect_phase: pending.candidates[&superseded].phase_op_id.clone(),
+            recovery: None,
+            idempotency_key: "superseded-reconciliation-transition".into(),
+        }),
+    );
+    let superseded_phase = reducer::replay_store(&store).unwrap().candidates[&superseded]
+        .phase_op_id
+        .clone();
+    let superseded_snapshot = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_policy_snapshot(&superseded)
+        .unwrap();
+    publish_rejected(
+        &store,
+        &override_reconcile(
+            &superseded,
+            "recovery-operator",
+            &superseded_evidence_id,
+            &superseded_phase,
+            "authorizer",
+            vec!["legacy-abandonment-record"],
+            superseded_snapshot,
+            "superseded-reconciliation-refusal",
+        ),
+        "current pending phase CAS",
+    );
+}
+
+#[test]
+fn cross_repository_override_requires_a_current_exact_object_bridge() {
+    const OBSERVED_REPO: &str = "repo-observed-store";
+
+    let (_temp, store, issue) = setup();
+    let candidate_id = ids::new_candidate_id();
+    let proposal_op = publish_checked(
+        &store,
+        &proposal(
+            &candidate_id,
+            &issue,
+            COMMIT_A,
+            "cross-repository-override-proposal",
+        ),
+    );
+    let (mut reachability, evidence_id) = reachability_evidence(
+        &candidate_id,
+        "recovery-operator",
+        EvidenceOutcome::Pass,
+        Some(true),
+        OBSERVED_REPO,
+        "cross-repository-override-reachability",
+    );
+    let Op::CandidateEvidence(reachability) = &mut reachability else {
+        unreachable!()
+    };
+    reachability.name = GIT_RECONCILIATION_REACHABILITY_EVIDENCE.into();
+    publish_checked(&store, &Op::CandidateEvidence(reachability.clone()));
+
+    let snapshot = reducer::replay_store(&store)
+        .unwrap()
+        .candidate_policy_snapshot(&candidate_id)
+        .unwrap();
+    let operation = |key: &str| {
+        let mut operation = override_reconcile(
+            &candidate_id,
+            "recovery-operator",
+            &evidence_id,
+            &proposal_op,
+            "authorizer",
+            vec!["appointment-record"],
+            snapshot.clone(),
+            key,
+        );
+        let Op::CandidateReconcile(reconcile) = &mut operation else {
+            unreachable!()
+        };
+        reconcile.repository_bridge = Some(CandidateReconciliationRepositoryBridge {
+            expect_landing_repository_op_id: proposal_op.clone(),
+            object_availability: GitObjectAvailabilityReceipt {
+                repository_id: OBSERVED_REPO.into(),
+                object_format: "sha1".into(),
+                candidate_oid: COMMIT_A.into(),
+                observed_parent_oids: vec![BASE.into()],
+                object_available: Some(true),
+                git_version: "git version test".into(),
+                detail: None,
+            },
+        });
+        operation
+    };
+
+    let mut missing_bridge = operation("cross-repository-missing-bridge");
+    let Op::CandidateReconcile(reconcile) = &mut missing_bridge else {
+        unreachable!()
+    };
+    reconcile.repository_bridge = None;
+    publish_rejected(
+        &store,
+        &missing_bridge,
+        "exact-reachability receipt in the bound repository",
+    );
+
+    let mut stale_binding = operation("cross-repository-stale-binding");
+    let Op::CandidateReconcile(reconcile) = &mut stale_binding else {
+        unreachable!()
+    };
+    reconcile
+        .repository_bridge
+        .as_mut()
+        .unwrap()
+        .expect_landing_repository_op_id = "op-stale-binding".into();
+    publish_rejected(&store, &stale_binding, "exact current binding");
+
+    let mut wrong_parent = operation("cross-repository-wrong-parent");
+    let Op::CandidateReconcile(reconcile) = &mut wrong_parent else {
+        unreachable!()
+    };
+    reconcile
+        .repository_bridge
+        .as_mut()
+        .unwrap()
+        .object_availability
+        .observed_parent_oids = vec![COMMIT_B.into()];
+    publish_rejected(&store, &wrong_parent, "parent");
+
+    let mut mismatched_repository = operation("cross-repository-mismatched-repository");
+    let Op::CandidateReconcile(reconcile) = &mut mismatched_repository else {
+        unreachable!()
+    };
+    reconcile
+        .repository_bridge
+        .as_mut()
+        .unwrap()
+        .object_availability
+        .repository_id = "repo-other-observation".into();
+    publish_rejected(
+        &store,
+        &mismatched_repository,
+        "same repository and Git tool",
+    );
+
+    let mut mismatched_tool = operation("cross-repository-mismatched-tool");
+    let Op::CandidateReconcile(reconcile) = &mut mismatched_tool else {
+        unreachable!()
+    };
+    reconcile
+        .repository_bridge
+        .as_mut()
+        .unwrap()
+        .object_availability
+        .git_version = "git version caller-selected".into();
+    publish_rejected(&store, &mismatched_tool, "same repository and Git tool");
+
+    let mut authorizer_bridge = operation("cross-repository-authorizer-bridge");
+    let Op::CandidateReconcile(reconcile) = &mut authorizer_bridge else {
+        unreachable!()
+    };
+    reconcile.actor = "authorizer".into();
+    reconcile.authority = CandidateReconciliationAuthority::ProposalAuthorizer;
+    reconcile.override_basis = None;
+    publish_rejected(&store, &authorizer_bridge, "explicit operator override");
+
+    let reconciliation_op = publish_checked(&store, &operation("cross-repository-success"));
+    let state = reducer::replay_store(&store).unwrap();
+    let candidate = &state.candidates[&candidate_id];
+    assert_eq!(candidate.repository_id, REPO);
+    assert_eq!(candidate.landing_repository_id, REPO);
+    assert!(candidate.landing_repository_bindings.is_empty());
+    assert_eq!(candidate.phase_op_id, reconciliation_op);
+    let reconciliation = candidate.reconciled.as_ref().unwrap();
+    assert_eq!(
+        reconciliation
+            .repository_bridge
+            .as_ref()
+            .unwrap()
+            .object_availability
+            .repository_id,
+        OBSERVED_REPO
+    );
+}
+
+#[test]
 fn reachability_probe_fails_closed_for_identity_ref_and_object_gaps() {
     let temp = TempDir::new().unwrap();
     run_git(temp.path(), &["init", "-q"]);
@@ -963,6 +1691,346 @@ fn hidden_pending_ancestor_blocks_until_superseded_by_descendant() {
             .unwrap()
             .authority,
         CandidateSupersessionAuthority::PredecessorProposer
+    );
+}
+
+#[test]
+fn superseded_candidate_ancestry_has_a_fail_closed_audited_refresh_path() {
+    let (temp, store, issue) = setup();
+    let target = ids::new_candidate_id();
+    let predecessor = ids::new_candidate_id();
+    let successor = ids::new_candidate_id();
+
+    let target_proposal = publish_checked(
+        &store,
+        &proposal(&target, &issue, COMMIT_C, "override-target-proposal"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &target,
+            ancestry_payload(&target, COMMIT_C, Vec::new(), Vec::new()),
+            "override-target-ancestry",
+        ),
+    );
+    publish_checked(&store, &approve(&target, "override-target-review"));
+    publish_checked(&store, &authorize(&target, "override-target-authorize"));
+
+    let predecessor_proposal = publish_checked(
+        &store,
+        &proposal(
+            &predecessor,
+            &issue,
+            COMMIT_A,
+            "override-predecessor-proposal",
+        ),
+    );
+    let predecessor_evidence_op = publish_checked(
+        &store,
+        &evidence(
+            &predecessor,
+            ancestry_payload(&predecessor, COMMIT_A, Vec::new(), Vec::new()),
+            "override-predecessor-ancestry",
+        ),
+    );
+
+    let successor_proposal = publish_checked(
+        &store,
+        &proposal(&successor, &issue, COMMIT_B, "override-successor-proposal"),
+    );
+    publish_checked(
+        &store,
+        &evidence(
+            &successor,
+            v2_ancestry_payload(
+                COMMIT_B,
+                vec![
+                    (target.clone(), target_proposal.clone()),
+                    (predecessor.clone(), predecessor_proposal.clone()),
+                ],
+                vec![
+                    v2_relation(
+                        &target,
+                        &target_proposal,
+                        COMMIT_C,
+                        GitRelationKind::NotAncestor,
+                        GitRelationKind::NotAncestor,
+                        GitRelationKind::NotAncestor,
+                        GitRelationKind::NotAncestor,
+                    ),
+                    v2_relation(
+                        &predecessor,
+                        &predecessor_proposal,
+                        COMMIT_A,
+                        GitRelationKind::NotAncestor,
+                        GitRelationKind::NotAncestor,
+                        GitRelationKind::NotAncestor,
+                        GitRelationKind::NotAncestor,
+                    ),
+                ],
+                "override-successor-snapshot",
+            ),
+            "override-successor-ancestry",
+        ),
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    publish_checked(
+        &store,
+        &Op::CandidateSupersede(CandidateSupersedeOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "proposer".into(),
+            candidate_id: predecessor.clone(),
+            successor_id: successor.clone(),
+            expect_phase: state.candidates[&predecessor].phase_op_id.clone(),
+            recovery: None,
+            idempotency_key: "override-supersede-predecessor".into(),
+        }),
+    );
+
+    let state = reducer::replay_store(&store).unwrap();
+    let blocked = state.candidate_landability(&target, Some("lander"));
+    assert!(
+        blocked.reason_codes.contains(&"git_evidence_stale".into()),
+        "superseded candidates must remain pairwise visible: {blocked:?}"
+    );
+    let predecessor_phase = state.candidates[&predecessor].phase_op_id.clone();
+
+    let refreshed_payload = v2_ancestry_payload(
+        COMMIT_A,
+        vec![
+            (target.clone(), target_proposal.clone()),
+            (successor.clone(), successor_proposal.clone()),
+        ],
+        vec![
+            v2_relation(
+                &target,
+                &target_proposal,
+                COMMIT_C,
+                GitRelationKind::NotAncestor,
+                GitRelationKind::NotAncestor,
+                GitRelationKind::NotAncestor,
+                GitRelationKind::NotAncestor,
+            ),
+            v2_relation(
+                &successor,
+                &successor_proposal,
+                COMMIT_B,
+                GitRelationKind::NotAncestor,
+                GitRelationKind::NotAncestor,
+                GitRelationKind::NotAncestor,
+                GitRelationKind::NotAncestor,
+            ),
+        ],
+        "override-predecessor-refresh-snapshot",
+    );
+    let CandidateEvidencePayload::GitAncestry(refreshed_receipt) = refreshed_payload else {
+        panic!("expected ordinary ancestry payload")
+    };
+    let basis = CandidateEvidenceOperatorOverride {
+        expect_phase_op_id: predecessor_phase.clone(),
+        expect_authorizer: "authorizer".into(),
+        expect_landing_repository_id: REPO.into(),
+        expect_producers: vec!["proposer".into()],
+        expect_producer_evidence_op_ids: vec![predecessor_evidence_op.clone()],
+        reason: "immutable producer is unavailable".into(),
+        authority_refs: vec!["board:coordination/post-recovery".into()],
+    };
+
+    let mut mutations = Vec::new();
+    let mut wrong_phase = basis.clone();
+    wrong_phase.expect_phase_op_id = "stale-phase".into();
+    mutations.push((
+        "wrong-phase",
+        wrong_phase,
+        basis.authority_refs.clone(),
+        "git version test",
+    ));
+    let mut wrong_authorizer = basis.clone();
+    wrong_authorizer.expect_authorizer = "someone-else".into();
+    mutations.push((
+        "wrong-authorizer",
+        wrong_authorizer,
+        basis.authority_refs.clone(),
+        "git version test",
+    ));
+    let mut wrong_repository = basis.clone();
+    wrong_repository.expect_landing_repository_id = "repo-other".into();
+    mutations.push((
+        "wrong-repository",
+        wrong_repository,
+        basis.authority_refs.clone(),
+        "git version test",
+    ));
+    let mut wrong_producers = basis.clone();
+    wrong_producers.expect_producers = vec!["departed-producer".into()];
+    mutations.push((
+        "wrong-producers",
+        wrong_producers,
+        basis.authority_refs.clone(),
+        "git version test",
+    ));
+    let mut wrong_prior_evidence = basis.clone();
+    wrong_prior_evidence.expect_producer_evidence_op_ids = vec!["stale-evidence-op".into()];
+    mutations.push((
+        "wrong-prior-evidence",
+        wrong_prior_evidence,
+        basis.authority_refs.clone(),
+        "git version test",
+    ));
+    let mut empty_reason = basis.clone();
+    empty_reason.reason.clear();
+    mutations.push((
+        "empty-reason",
+        empty_reason,
+        basis.authority_refs.clone(),
+        "git version test",
+    ));
+    let mut empty_refs = basis.clone();
+    empty_refs.authority_refs.clear();
+    mutations.push(("empty-refs", empty_refs, Vec::new(), "git version test"));
+    mutations.push((
+        "mismatched-refs",
+        basis.clone(),
+        vec!["board:other".into()],
+        "git version test",
+    ));
+    mutations.push((
+        "wrong-tool",
+        basis.clone(),
+        basis.authority_refs.clone(),
+        "git version forged",
+    ));
+
+    for (label, mutated_basis, refs, producer_tool) in mutations {
+        let mut mutated = operator_ancestry_evidence(
+            &predecessor,
+            refreshed_receipt.clone(),
+            mutated_basis,
+            "authorizer",
+            refs,
+            &format!("override-mutation-{label}"),
+        );
+        let Op::CandidateEvidence(mutated_record) = &mut mutated else {
+            unreachable!()
+        };
+        mutated_record.producer_tool = producer_tool.into();
+        publish_rejected(&store, &mutated, "operator ancestry refresh requires exact");
+    }
+    publish_rejected(
+        &store,
+        &operator_ancestry_evidence(
+            &predecessor,
+            refreshed_receipt.clone(),
+            basis.clone(),
+            "proposer",
+            basis.authority_refs.clone(),
+            "override-named-producer",
+        ),
+        "operator ancestry refresh requires exact",
+    );
+
+    let ordinary_payload = CandidateEvidencePayload::GitAncestry(refreshed_receipt.clone());
+    let ordinary_unauthorized = Op::CandidateEvidence(CandidateEvidenceOp {
+        v: 1,
+        op: String::new(),
+        ts: ids::format_rfc3339(Timestamp::now()),
+        actor: "operator".into(),
+        candidate_id: predecessor.clone(),
+        candidate_oid: COMMIT_A.into(),
+        evidence_id: evidence_id(&ordinary_payload).unwrap(),
+        name: GIT_ANCESTRY_EVIDENCE.into(),
+        evidence_kind: "git".into(),
+        producer_tool: "git version test".into(),
+        outcome: EvidenceOutcome::Pass,
+        payload: ordinary_payload,
+        refs: Vec::new(),
+        idempotency_key: "override-ordinary-unauthorized".into(),
+    });
+    publish_rejected(&store, &ordinary_unauthorized, "is not a named producer");
+    let mut wrong_evidence_class = operator_ancestry_evidence(
+        &predecessor,
+        refreshed_receipt.clone(),
+        basis.clone(),
+        "authorizer",
+        basis.authority_refs.clone(),
+        "override-wrong-evidence-class",
+    );
+    let Op::CandidateEvidence(wrong_evidence_record) = &mut wrong_evidence_class else {
+        unreachable!()
+    };
+    wrong_evidence_record.name = "external-tests".into();
+    publish_rejected(
+        &store,
+        &wrong_evidence_class,
+        "terminal candidates accept only built-in Git ancestry bookkeeping",
+    );
+
+    publish_checked(
+        &store,
+        &operator_ancestry_evidence(
+            &predecessor,
+            refreshed_receipt.clone(),
+            basis.clone(),
+            "authorizer",
+            basis.authority_refs.clone(),
+            "override-valid-refresh",
+        ),
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    assert_eq!(
+        state.candidates[&predecessor].phase,
+        mote::candidate::CandidatePhase::Superseded
+    );
+    assert!(
+        state
+            .candidate_landability(&target, Some("lander"))
+            .landable
+    );
+
+    publish_checked(
+        &store,
+        &evidence(
+            &predecessor,
+            CandidateEvidencePayload::GitAncestry(refreshed_receipt),
+            "terminal-named-producer-refresh",
+        ),
+    );
+    let state = reducer::replay_store(&store).unwrap();
+    assert!(
+        state.candidates[&predecessor]
+            .evidence
+            .values()
+            .any(|record| record.payload.git_ancestry_override().is_some())
+    );
+
+    let shown = run_mote(temp.path(), &["candidate", "show", &predecessor]);
+    assert!(shown.status.success());
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert!(shown.contains("ancestry refresh override:"), "{shown}");
+    assert!(
+        shown.contains("immutable producer is unavailable"),
+        "{shown}"
+    );
+
+    let audit = run_mote(temp.path(), &["--json", "audit", "--fail-on", "never"]);
+    assert!(audit.status.success());
+    let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    let finding = audit["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["code"] == "candidate_ancestry_operator_override_recorded")
+        .unwrap();
+    assert_eq!(finding["subject"], predecessor);
+    assert_eq!(
+        finding["evidence"]["expected_phase_op_id"],
+        predecessor_phase
+    );
+    assert_eq!(
+        finding["evidence"]["expected_producer_evidence_op_ids"][0],
+        predecessor_evidence_op
     );
 }
 
@@ -2230,6 +3298,198 @@ fn run_mote(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn candidate_cli_records_an_idempotent_git_only_ancestry_override() {
+    let temp = TempDir::new().unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "Test"]);
+    std::fs::write(temp.path().join("work.txt"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "work.txt"]);
+    run_git(temp.path(), &["commit", "-qm", "base"]);
+    let base = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(temp.path().join("work.txt"), "candidate\n").unwrap();
+    run_git(temp.path(), &["commit", "-qam", "candidate"]);
+
+    let store = Store::init(temp.path()).unwrap();
+    let issue = ids::new_bead_id();
+    publish::publish_op(
+        &store,
+        &make_create(
+            "proposer".into(),
+            issue.clone(),
+            ScalarSet {
+                title: Some("CLI ancestry override".into()),
+                ..Default::default()
+            },
+            Timestamp::now(),
+        ),
+    )
+    .unwrap();
+    let proposed = run_mote(
+        temp.path(),
+        &[
+            "--json",
+            "--actor",
+            "proposer",
+            "candidate",
+            "propose",
+            "--issue",
+            &issue,
+            "--base",
+            &base,
+            "--path",
+            "work.txt",
+            "--authorizer",
+            "authorizer",
+            "--reviewer",
+            "reviewer",
+            "--idempotency-key",
+            "cli-override-propose",
+        ],
+    );
+    assert!(
+        proposed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&proposed.stderr)
+    );
+    let proposed: serde_json::Value = serde_json::from_slice(&proposed.stdout).unwrap();
+    let candidate_id = proposed["candidate_id"].as_str().unwrap().to_string();
+    let phase_op_id = proposed["phase"]["op_id"].as_str().unwrap().to_string();
+
+    let unauthorized = run_mote(
+        temp.path(),
+        &[
+            "--actor",
+            "operator",
+            "candidate",
+            "evidence",
+            "refresh",
+            &candidate_id,
+            "--idempotency-key",
+            "cli-override-unauthorized",
+        ],
+    );
+    assert!(!unauthorized.status.success());
+    assert!(
+        String::from_utf8_lossy(&unauthorized.stderr).contains("is not a named producer"),
+        "{}",
+        String::from_utf8_lossy(&unauthorized.stderr)
+    );
+
+    let named_producer_override = run_mote(
+        temp.path(),
+        &[
+            "--actor",
+            "proposer",
+            "candidate",
+            "evidence",
+            "refresh",
+            &candidate_id,
+            "--operator-override",
+            "--expect-phase",
+            &phase_op_id,
+            "--reason",
+            "operator unavailable",
+            "--authority-ref",
+            "board:coordination/post-cli",
+            "--idempotency-key",
+            "cli-override-named-producer",
+        ],
+    );
+    assert!(!named_producer_override.status.success());
+    assert!(
+        String::from_utf8_lossy(&named_producer_override.stderr)
+            .contains("must use ordinary refresh"),
+        "{}",
+        String::from_utf8_lossy(&named_producer_override.stderr)
+    );
+
+    let unauthorized_override = run_mote(
+        temp.path(),
+        &[
+            "--actor",
+            "operator",
+            "candidate",
+            "evidence",
+            "refresh",
+            &candidate_id,
+            "--operator-override",
+            "--expect-phase",
+            &phase_op_id,
+            "--reason",
+            "immutable producer is unavailable",
+            "--authority-ref",
+            "board:coordination/post-cli",
+            "--idempotency-key",
+            "cli-override-wrong-authority",
+        ],
+    );
+    assert!(!unauthorized_override.status.success());
+    assert!(
+        String::from_utf8_lossy(&unauthorized_override.stderr)
+            .contains("only the immutable proposal authorizer"),
+        "{}",
+        String::from_utf8_lossy(&unauthorized_override.stderr)
+    );
+
+    let args = [
+        "--json",
+        "--actor",
+        "authorizer",
+        "candidate",
+        "evidence",
+        "refresh",
+        &candidate_id,
+        "--operator-override",
+        "--expect-phase",
+        &phase_op_id,
+        "--reason",
+        "immutable producer is unavailable",
+        "--authority-ref",
+        "board:coordination/post-cli",
+        "--idempotency-key",
+        "cli-override-valid",
+    ];
+    let refreshed = run_mote(temp.path(), &args);
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let refreshed: serde_json::Value = serde_json::from_slice(&refreshed.stdout).unwrap();
+    let override_evidence = refreshed["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|evidence| evidence["payload"]["kind"] == "git_ancestry_override")
+        .unwrap();
+    assert_eq!(
+        override_evidence["payload"]["override_basis"]["expect_phase_op_id"],
+        phase_op_id
+    );
+    assert_eq!(
+        override_evidence["payload"]["override_basis"]["expect_producers"][0],
+        "proposer"
+    );
+    assert_eq!(override_evidence["refs"][0], "board:coordination/post-cli");
+
+    let op_count = store.list_op_filenames().unwrap().len();
+    let retry = run_mote(temp.path(), &args);
+    assert!(retry.status.success());
+    assert_eq!(store.list_op_filenames().unwrap().len(), op_count);
+
+    abandon(&store, &candidate_id, "cli-override-terminal-transition");
+    let terminal_op_count = store.list_op_filenames().unwrap().len();
+    let terminal_retry = run_mote(temp.path(), &args);
+    assert!(terminal_retry.status.success());
+    assert_eq!(
+        store.list_op_filenames().unwrap().len(),
+        terminal_op_count,
+        "an exact retry must return the accepted override even after a later phase transition"
+    );
+}
+
+#[test]
 fn git_probe_distinguishes_already_in_base_introduced_and_unrelated_relations() {
     let temp = TempDir::new().unwrap();
     run_git(temp.path(), &["init", "-q"]);
@@ -2879,6 +4139,376 @@ fn candidate_cli_reconciles_out_of_band_without_rewriting_governance() {
             .as_str()
             .unwrap()
             .contains("outside the formal candidate transition")
+    );
+}
+
+#[test]
+fn candidate_cli_records_an_explicit_operator_override_without_claiming_authorizer_identity() {
+    let temp = TempDir::new().unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "Test"]);
+    std::fs::write(temp.path().join("work.txt"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "work.txt"]);
+    run_git(temp.path(), &["commit", "-qm", "base"]);
+    let base = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(temp.path().join("work.txt"), "candidate\n").unwrap();
+    run_git(temp.path(), &["commit", "-qam", "candidate"]);
+    let candidate_oid = run_git(temp.path(), &["rev-parse", "HEAD"]);
+
+    let store = Store::init(temp.path()).unwrap();
+    let issue = ids::new_bead_id();
+    publish::publish_op(
+        &store,
+        &make_create(
+            "proposer".into(),
+            issue.clone(),
+            ScalarSet {
+                title: Some("operator recovery candidate".into()),
+                ..Default::default()
+            },
+            Timestamp::now(),
+        ),
+    )
+    .unwrap();
+    let proposed = run_mote(
+        temp.path(),
+        &[
+            "--json",
+            "--actor",
+            "proposer",
+            "candidate",
+            "propose",
+            "--issue",
+            &issue,
+            "--base",
+            &base,
+            "--path",
+            "work.txt",
+            "--authorizer",
+            "departed-authorizer",
+            "--reviewer",
+            "reviewer",
+            "--idempotency-key",
+            "operator-override-cli-propose",
+        ],
+    );
+    assert!(proposed.status.success());
+    let proposed: serde_json::Value = serde_json::from_slice(&proposed.stdout).unwrap();
+    let candidate_id = proposed["candidate_id"].as_str().unwrap().to_string();
+    let phase_op = proposed["phase"]["op_id"].as_str().unwrap().to_string();
+
+    let reconcile_args = [
+        "--json",
+        "--actor",
+        "recovery-operator",
+        "candidate",
+        "reconcile",
+        &candidate_id,
+        "--target",
+        "HEAD",
+        "--expect-phase",
+        &phase_op,
+        "--operator-override",
+        "--reason",
+        "owner appointed a successor coordinator",
+        "--authority-ref",
+        "post-appointment-record",
+        "--authority-ref",
+        "post-independent-ack",
+        "--idempotency-key",
+        "operator-override-cli-success",
+    ];
+    let reconciled = run_mote(temp.path(), &reconcile_args);
+    assert!(
+        reconciled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reconciled.stderr)
+    );
+    let reconciled: serde_json::Value = serde_json::from_slice(&reconciled.stdout).unwrap();
+    assert_eq!(reconciled["phase"]["value"], "landed_out_of_band");
+    assert_eq!(reconciled["policy"]["authorizer"], "departed-authorizer");
+    assert_eq!(
+        reconciled["reconciliation"]["authority"],
+        "explicit_operator_override"
+    );
+    assert_eq!(
+        reconciled["reconciliation"]["override_basis"]["expect_authorizer"],
+        "departed-authorizer"
+    );
+    assert_eq!(
+        reconciled["reconciliation"]["override_basis"]["reason"],
+        "owner appointed a successor coordinator"
+    );
+    assert_eq!(
+        reconciled["reconciliation"]["override_basis"]["authority_refs"],
+        serde_json::json!(["post-appointment-record", "post-independent-ack"])
+    );
+    assert_eq!(reconciled["reconciliation"]["target_oid"], candidate_oid);
+
+    let op_count_after_success = store.list_op_filenames().unwrap().len();
+    let retry = run_mote(temp.path(), &reconcile_args);
+    assert!(retry.status.success());
+    assert_eq!(
+        store.list_op_filenames().unwrap().len(),
+        op_count_after_success,
+        "an exact operator-override retry must not re-probe or publish"
+    );
+
+    let human = run_mote(temp.path(), &["candidate", "show", &candidate_id]);
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("authority=explicit_operator_override"));
+    assert!(human.contains("expected-authorizer=departed-authorizer"));
+    assert!(human.contains("owner appointed a successor coordinator"));
+
+    let events = run_mote(temp.path(), &["--json", "events", "--kind", "candidate"]);
+    let event = String::from_utf8(events.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["type"] == "candidate.landed_out_of_band")
+        .unwrap();
+    assert_eq!(
+        event["data"]["override_basis"]["expect_authorizer"],
+        "departed-authorizer"
+    );
+
+    let audit = run_mote(temp.path(), &["--json", "audit", "--fail-on", "never"]);
+    assert!(audit.status.success());
+    let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    let finding = audit["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["code"] == "candidate_reconciliation_operator_override_recorded")
+        .unwrap();
+    assert_eq!(finding["severity"], "warning");
+    assert_eq!(
+        finding["evidence"]["expected_authorizer"],
+        "departed-authorizer"
+    );
+}
+
+#[test]
+fn candidate_cli_recovers_a_legacy_abandonment_without_rewriting_it() {
+    let temp = TempDir::new().unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+    run_git(temp.path(), &["config", "user.name", "Test"]);
+    std::fs::write(temp.path().join("work.txt"), "base\n").unwrap();
+    run_git(temp.path(), &["add", "work.txt"]);
+    run_git(temp.path(), &["commit", "-qm", "base"]);
+    let base = run_git(temp.path(), &["rev-parse", "HEAD"]);
+    run_git(temp.path(), &["branch", "not-landed", &base]);
+    std::fs::write(temp.path().join("work.txt"), "candidate\n").unwrap();
+    run_git(temp.path(), &["commit", "-qam", "candidate"]);
+    let candidate_oid = run_git(temp.path(), &["rev-parse", "HEAD"]);
+
+    let store = Store::init(temp.path()).unwrap();
+    let issue = ids::new_bead_id();
+    publish::publish_op(
+        &store,
+        &make_create(
+            "proposer".into(),
+            issue.clone(),
+            ScalarSet {
+                title: Some("legacy abandoned candidate".into()),
+                ..Default::default()
+            },
+            Timestamp::now(),
+        ),
+    )
+    .unwrap();
+    let proposed = run_mote(
+        temp.path(),
+        &[
+            "--json",
+            "--actor",
+            "proposer",
+            "candidate",
+            "propose",
+            "--issue",
+            &issue,
+            "--base",
+            &base,
+            "--path",
+            "work.txt",
+            "--authorizer",
+            "departed-authorizer",
+            "--reviewer",
+            "reviewer",
+            "--idempotency-key",
+            "legacy-abandoned-cli-propose",
+        ],
+    );
+    assert!(
+        proposed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&proposed.stderr)
+    );
+    let proposed: serde_json::Value = serde_json::from_slice(&proposed.stdout).unwrap();
+    let candidate_id = proposed["candidate_id"].as_str().unwrap().to_string();
+    let proposal_phase = proposed["phase"]["op_id"].as_str().unwrap().to_string();
+    let abandonment_op = publish_checked(
+        &store,
+        &Op::CandidateAbandon(CandidateAbandonOp {
+            v: 1,
+            op: String::new(),
+            ts: ids::format_rfc3339(Timestamp::now()),
+            actor: "departed-authorizer".into(),
+            candidate_id: candidate_id.clone(),
+            expect_phase: proposal_phase.clone(),
+            reason: Some("commit was already present on main".into()),
+            idempotency_key: "legacy-abandoned-cli-abandon".into(),
+        }),
+    );
+
+    let op_count_before_refusals = store.list_op_filenames().unwrap().len();
+    let ordinary = run_mote(
+        temp.path(),
+        &[
+            "--actor",
+            "departed-authorizer",
+            "candidate",
+            "reconcile",
+            &candidate_id,
+            "--target",
+            "HEAD",
+            "--expect-phase",
+            &abandonment_op,
+            "--idempotency-key",
+            "legacy-abandoned-cli-ordinary-refusal",
+        ],
+    );
+    assert_eq!(ordinary.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&ordinary.stderr).contains("explicit operator override"),
+        "{}",
+        String::from_utf8_lossy(&ordinary.stderr)
+    );
+
+    let stale_phase = run_mote(
+        temp.path(),
+        &[
+            "--actor",
+            "recovery-operator",
+            "candidate",
+            "reconcile",
+            &candidate_id,
+            "--target",
+            "HEAD",
+            "--expect-phase",
+            &proposal_phase,
+            "--operator-override",
+            "--reason",
+            "legacy abandonment correction",
+            "--authority-ref",
+            "post-legacy-correction",
+            "--idempotency-key",
+            "legacy-abandoned-cli-stale-phase",
+        ],
+    );
+    assert_eq!(stale_phase.status.code(), Some(2));
+    assert_eq!(
+        store.list_op_filenames().unwrap().len(),
+        op_count_before_refusals,
+        "authority and phase refusals must occur before publishing Git evidence"
+    );
+
+    let failed_reachability = run_mote(
+        temp.path(),
+        &[
+            "--actor",
+            "recovery-operator",
+            "candidate",
+            "reconcile",
+            &candidate_id,
+            "--target",
+            "not-landed",
+            "--expect-phase",
+            &abandonment_op,
+            "--operator-override",
+            "--reason",
+            "legacy abandonment correction",
+            "--authority-ref",
+            "post-legacy-correction",
+            "--idempotency-key",
+            "legacy-abandoned-cli-failed-reachability",
+        ],
+    );
+    assert_eq!(failed_reachability.status.code(), Some(2));
+    let state_after_failed_reachability = reducer::replay_store(&store).unwrap();
+    assert_eq!(
+        state_after_failed_reachability.candidates[&candidate_id]
+            .phase
+            .as_str(),
+        "abandoned"
+    );
+    assert!(
+        state_after_failed_reachability.candidates[&candidate_id]
+            .evidence
+            .values()
+            .any(|receipt| {
+                receipt.name == GIT_REACHABILITY_EVIDENCE
+                    && receipt.producer == "recovery-operator"
+                    && receipt.outcome == EvidenceOutcome::Fail
+            })
+    );
+
+    let reconcile_args = [
+        "--json",
+        "--actor",
+        "recovery-operator",
+        "candidate",
+        "reconcile",
+        &candidate_id,
+        "--target",
+        "HEAD",
+        "--expect-phase",
+        &abandonment_op,
+        "--operator-override",
+        "--reason",
+        "legacy abandonment correction",
+        "--authority-ref",
+        "post-legacy-correction",
+        "--idempotency-key",
+        "legacy-abandoned-cli-success",
+    ];
+    let reconciled = run_mote(temp.path(), &reconcile_args);
+    assert!(
+        reconciled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reconciled.stderr)
+    );
+    let reconciled: serde_json::Value = serde_json::from_slice(&reconciled.stdout).unwrap();
+    assert_eq!(reconciled["phase"]["value"], "landed_out_of_band");
+    assert_eq!(reconciled["reconciliation"]["target_oid"], candidate_oid);
+    assert_eq!(
+        reconciled["reconciliation"]["authority"],
+        "explicit_operator_override"
+    );
+
+    let op_count_after_success = store.list_op_filenames().unwrap().len();
+    let retry = run_mote(temp.path(), &reconcile_args);
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(
+        store.list_op_filenames().unwrap().len(),
+        op_count_after_success,
+        "an exact legacy-recovery retry must not re-probe or publish"
+    );
+
+    let final_state = reducer::replay_store(&store).unwrap();
+    assert!(final_state.was_accepted(&abandonment_op));
+    assert!(
+        store
+            .ops_dir()
+            .join(format!("{abandonment_op}.json"))
+            .is_file(),
+        "the historical abandonment must remain an immutable accepted operation"
     );
 }
 

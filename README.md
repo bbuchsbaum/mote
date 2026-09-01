@@ -265,6 +265,12 @@ mote candidate propose --issue bd-... --base origin/main \
   --require-reviews 2 --from-role reviewer \
   --idempotency-key proposal-role-quorum-1
 mote candidate evidence refresh cand-... --idempotency-key ancestry-2
+# If every immutable ancestry producer is unavailable, the proposal authorizer
+# may refresh the reproducible Git fact without impersonating a producer. The
+# references are durable attestations for audit, not a machine-validated grant.
+mote candidate evidence refresh cand-... --operator-override \
+  --expect-phase OP_ID --reason "named producers unavailable" \
+  --authority-ref board:post-... --idempotency-key ancestry-recovery-1
 mote candidate evidence availability cand-... \
   --idempotency-key object-visible-1
 mote candidate review cand-... approve --idempotency-key review-1
@@ -295,6 +301,17 @@ mote candidate landed cand-... --target origin/main \
 # any review/authorization blockers and does not consume a grant.
 mote candidate reconcile cand-... --target origin/main \
   --expect-phase OP_ID --idempotency-key reconcile-1
+
+# If that authorizer cannot act, a distinct operator may use the audited
+# override. The same form is required to correct an abandoned row whose
+# exact commit is already reachable. Reason and references are recorded for
+# independent review; they do not grant authority by themselves. If the Git
+# repository backing the store differs from the recorded landing repository,
+# Mote also binds exact commit/parent availability without rewriting provenance.
+mote candidate reconcile cand-... --target origin/main \
+  --expect-phase OP_ID --operator-override \
+  --reason "immutable authorizer unavailable" \
+  --authority-ref board:post-... --idempotency-key reconcile-recovery-1
 
 # Path plane.
 mote reserve src/auth/ tests/auth/ --issue bd-... --ttl 3600
