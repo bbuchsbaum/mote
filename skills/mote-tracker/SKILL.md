@@ -307,6 +307,8 @@ mote candidate propose --issue <bd-id> --base <base-ref> \
   --path <repo-path> --authorizer <actor> --reviewer <actor> \
   --idempotency-key <stable-key>
 mote candidate evidence refresh <cand-id> --idempotency-key <new-key>
+mote candidate evidence target-scope <cand-id> --target <ref> \
+  --idempotency-key <new-key>
 mote candidate review <cand-id> approve --idempotency-key <stable-key>
 mote candidate authorize <cand-id> --grantee <actor> \
   --idempotency-key <stable-key>
@@ -318,6 +320,12 @@ stale, unavailable, or ambiguous Git evidence blocks landing. After an external
 Git operation, record reachability with `candidate landed`, naming the current
 phase and authorization op ids. Every mutation needs an actor-scoped
 idempotency key; use a new key for a genuinely new observation or transition.
+Portable and explicitly rebound candidates additionally require a current
+target-scope observation before Git changes; refresh it whenever the intended
+target advances. The target must be one mutable, reflog-enabled ref. Scope uses
+the prospective merge tree so target-side rename destinations enter policy;
+the final landing record requires the immediately previous reflog entry and
+actual target-to-result paths and result tree to match that observation.
 
 ## Finish Or Hand Off
 

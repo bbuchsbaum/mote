@@ -287,6 +287,10 @@ pub struct CandidateLandedRecord {
     pub evidence_id: String,
     pub authorization_op_id: String,
     pub target_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_scope_evidence_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_scope_op_id: Option<String>,
     pub op_id: String,
     pub ts: String,
 }
@@ -1714,6 +1718,65 @@ impl State {
                     "no current receipt proves the candidate object is readable from the bound landing repository",
                 )),
                 Some(_) | None => {}
+            }
+
+            let target_scope = candidate
+                .evidence
+                .values()
+                .filter(|evidence| evidence.name == crate::candidate::GIT_TARGET_SCOPE_EVIDENCE)
+                .max_by(|left, right| left.op_id.cmp(&right.op_id));
+            match target_scope {
+                Some(receipt)
+                    if receipt.outcome == EvidenceOutcome::Pass
+                        && matches!(
+                            &receipt.payload,
+                            CandidateEvidencePayload::GitTargetScope(git)
+                                if crate::candidate::target_scope_shape_is_valid(git)
+                                    && git.repository_id == candidate.landing_repository_id
+                                    && git.landing_repository_op_id
+                                        == candidate.landing_repository_op_id
+                                    && git.object_format == candidate.object_format
+                                    && git.candidate_oid == candidate.commit_oid
+                                    && git.candidate_base_oid == candidate.base_oid
+                        ) =>
+                {
+                    let CandidateEvidencePayload::GitTargetScope(git) = &receipt.payload else {
+                        unreachable!("target-scope payload checked above")
+                    };
+                    let uncovered = crate::candidate::uncovered_target_scope_paths(
+                        &candidate.paths,
+                        &git.effective_paths,
+                    );
+                    if !uncovered.is_empty() {
+                        reasons.push(candidate_reason(
+                            LandabilityReasonCode::TargetScopeUncovered,
+                            Some(&git.target_ref),
+                            format!(
+                                "effective landing scope at {} contains undeclared path(s): {}{}",
+                                git.observed_target_oid,
+                                uncovered.join(", "),
+                                if git.base_is_ancestor_of_target == Some(false) {
+                                    "; the immutable proposal base is not an ancestor of this target"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        ));
+                    }
+                }
+                Some(receipt) => reasons.push(candidate_reason(
+                    LandabilityReasonCode::TargetScopeEvidenceStale,
+                    Some(candidate_id),
+                    format!(
+                        "latest target-scope evidence {} is unavailable or does not match the current landing repository, binding, and immutable candidate anchors",
+                        receipt.op_id
+                    ),
+                )),
+                None => reasons.push(candidate_reason(
+                    LandabilityReasonCode::TargetScopeEvidenceMissing,
+                    Some(candidate_id),
+                    "no exact target-scope observation proves that the immutable policy covers the actual landing effect",
+                )),
             }
         }
 

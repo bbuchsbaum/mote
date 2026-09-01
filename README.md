@@ -273,6 +273,10 @@ mote candidate evidence refresh cand-... --operator-override \
   --authority-ref board:post-... --idempotency-key ancestry-recovery-1
 mote candidate evidence availability cand-... \
   --idempotency-key object-visible-1
+# Bind landability to a mutable full ref, its exact OID, and the prospective
+# target-to-merge path effect. Refresh after the target advances.
+mote candidate evidence target-scope cand-... --target origin/main \
+  --idempotency-key target-scope-1
 mote candidate review cand-... approve --idempotency-key review-1
 mote candidate review cand-... approve --from-role reviewer \
   --idempotency-key role-review-1
@@ -291,7 +295,9 @@ mote candidate show cand-...
 # command records the current successor phase and evidence op ids as CAS data.
 mote candidate supersede cand-OLD cand-NEW --expect-phase OP_ID \
   --containment-recovery --idempotency-key recover-old-1
-# After an external Git operation makes the commit reachable from the target:
+# After an external Git operation updates that same reflog-enabled ref directly
+# from the target-scope OID (or creates a merge with that OID first-parent) and
+# produces exactly the target-scope prospective tree:
 mote candidate landed cand-... --target origin/main \
   --expect-phase OP_ID --expect-authorization OP_ID \
   --idempotency-key landed-1

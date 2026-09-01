@@ -254,6 +254,27 @@ fn standalone_proposal_blocks_until_shared_repository_has_object_then_lands() {
             .iter()
             .any(|code| code == "object_unreachable")
     );
+    let target_scope = run_mote(
+        &repositories.canonical,
+        &repositories.canonical,
+        "authorizer",
+        &[
+            "--json",
+            "candidate",
+            "evidence",
+            "target-scope",
+            candidate_id,
+            "--target",
+            "HEAD",
+            "--idempotency-key",
+            "portable-target-scope",
+        ],
+    );
+    assert!(
+        target_scope.status.success(),
+        "{}",
+        String::from_utf8_lossy(&target_scope.stderr)
+    );
 
     let reviewed = run_mote(
         &repositories.canonical,
@@ -328,6 +349,30 @@ fn standalone_proposal_blocks_until_shared_repository_has_object_then_lands() {
     );
     let landed: serde_json::Value = serde_json::from_slice(&landed.stdout).unwrap();
     assert_eq!(landed["phase"]["value"], "landed");
+    let landing_receipt = landed["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|evidence| evidence["name"] == "git-landing")
+        .map(|evidence| &evidence["payload"])
+        .unwrap();
+    assert_eq!(landing_receipt["target_ref_full_name"], "refs/heads/main");
+    assert_eq!(landing_receipt["before_tip"], repositories.base);
+    let target_scope_receipt = landed["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|evidence| evidence["name"] == "git-target-scope")
+        .map(|evidence| &evidence["payload"])
+        .unwrap();
+    assert_eq!(
+        landing_receipt["after_tree_oid"],
+        target_scope_receipt["prospective_merge_tree_oid"]
+    );
+    assert_eq!(
+        landing_receipt["landing_effect_paths"],
+        serde_json::json!(["work.txt"])
+    );
 }
 
 #[test]
@@ -336,10 +381,6 @@ fn legacy_source_bound_candidate_can_be_explicitly_rebound_and_terminalized() {
     let commit = source_commit(&repositories, "legacy candidate");
     let source_locator = repositories.source.to_str().unwrap();
     run_git(&repositories.canonical, &["fetch", source_locator, "main"]);
-    run_git(
-        &repositories.canonical,
-        &["merge", "--ff-only", "FETCH_HEAD"],
-    );
 
     let ancestry =
         mote::candidate::probe_ancestry(&repositories.source, &commit, &repositories.base, &[])
@@ -466,7 +507,41 @@ fn legacy_source_bound_candidate_can_be_explicitly_rebound_and_terminalized() {
             .len(),
         1
     );
-    assert_eq!(rebound["landability"]["landable"], true);
+    assert!(
+        rebound["landability"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|code| code == "target_scope_evidence_missing")
+    );
+    let target_scope = run_mote(
+        &repositories.canonical,
+        &repositories.canonical,
+        "authorizer",
+        &[
+            "--json",
+            "candidate",
+            "evidence",
+            "target-scope",
+            &candidate_id,
+            "--target",
+            "HEAD",
+            "--idempotency-key",
+            "legacy-target-scope-after-bind",
+        ],
+    );
+    assert!(
+        target_scope.status.success(),
+        "{}",
+        String::from_utf8_lossy(&target_scope.stderr)
+    );
+    let target_scope: serde_json::Value = serde_json::from_slice(&target_scope.stdout).unwrap();
+    assert_eq!(target_scope["landability"]["landable"], true);
+
+    run_git(
+        &repositories.canonical,
+        &["merge", "--ff-only", "FETCH_HEAD"],
+    );
 
     let landed = run_mote(
         &repositories.canonical,
