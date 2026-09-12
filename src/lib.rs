@@ -8,6 +8,7 @@ pub mod audit;
 pub mod candidate;
 pub mod canonical;
 pub mod cli;
+pub mod discussion_pulse;
 pub mod errors;
 pub mod events;
 pub mod fsck;

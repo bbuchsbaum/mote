@@ -191,6 +191,15 @@ pub fn snapshot_value_with_request_horizon(
     let discussion_unread = actor
         .map(|a| state.unread_board_posts_for(a, None).len())
         .unwrap_or(0);
+    let discussion_pulse = parsed_as_of.and_then(|as_of| {
+        crate::discussion_pulse::build_discussion_pulse(
+            state,
+            actor,
+            as_of,
+            crate::discussion_pulse::DiscussionPulseParameters::default(),
+        )
+        .ok()
+    });
     let candidates: Vec<Value> = state
         .candidates
         .values()
@@ -261,6 +270,7 @@ pub fn snapshot_value_with_request_horizon(
         "stale_open_requests": stale_open_requests,
         "request_stale_after_s": request_stale_after_s,
         "discussion_unread": discussion_unread,
+        "discussion_pulse": discussion_pulse,
         "discussion": crate::cli::discussion_decisions_json(state, None),
         "board_topics": state.board_topics.len(),
         "board_posts": state.board_posts.len(),
@@ -447,6 +457,51 @@ fn print_human(state: &State, actor: Option<&str>, now: &str, request_stale_afte
         );
     }
     println!("discussion:   {unread} unread");
+    if let Ok(as_of) = now.parse::<Timestamp>()
+        && let Ok(pulse) = crate::discussion_pulse::build_discussion_pulse(
+            state,
+            actor,
+            as_of,
+            crate::discussion_pulse::DiscussionPulseParameters::default(),
+        )
+    {
+        println!(
+            "pulse:        {} active ({} burst), {} need eyes, {} solitary new",
+            pulse.totals.active_topics,
+            pulse.totals.burst_topics,
+            pulse.totals.needs_eyes_topics,
+            pulse.totals.solitary_new_posts,
+        );
+        for topic in pulse.needs_eyes.iter().take(5) {
+            println!(
+                "  NEEDS EYES {} unread={} notified={} solitary={} awaiting-external-reply={}",
+                topic.topic,
+                topic.unread_count,
+                topic.notification_count,
+                if topic.solitary_new_post_ids.is_empty() {
+                    "-".into()
+                } else {
+                    topic.solitary_new_post_ids.join(",")
+                },
+                if topic.no_external_reply_post_ids.is_empty() {
+                    "-".into()
+                } else {
+                    topic.no_external_reply_post_ids.join(",")
+                },
+            );
+        }
+        for topic in pulse.active_now.iter().take(5) {
+            println!(
+                "  ACTIVE{} {} 5m={} 15m={} 60m={} authors={}",
+                if topic.burst { "*" } else { "" },
+                topic.topic,
+                topic.posts_5m,
+                topic.posts_15m,
+                topic.posts_60m,
+                topic.distinct_authors_60m,
+            );
+        }
+    }
     let question_counts = state.board_question_counts(None);
     println!(
         "board:        {} topics, {} posts, {} cited decisions, {} unresolved questions",

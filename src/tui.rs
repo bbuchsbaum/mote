@@ -1380,10 +1380,35 @@ fn candidate_detail_lines(
 }
 
 fn render_discussion(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
+    let pulse_height = if area.height >= 16 { 8 } else { 0 };
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(pulse_height), Constraint::Min(1)])
+        .split(area);
+    if pulse_height > 0 {
+        let lines = crate::discussion_pulse::build_discussion_pulse(
+            state,
+            app.actor.as_deref(),
+            Timestamp::now(),
+            crate::discussion_pulse::DiscussionPulseParameters::default(),
+        )
+        .map(discussion_pulse_lines)
+        .unwrap_or_else(|error| vec![Line::from(format!("pulse unavailable: {error}"))]);
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Discussion pulse"),
+                )
+                .wrap(Wrap { trim: true }),
+            vertical[0],
+        );
+    }
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(32), Constraint::Min(24)])
-        .split(area);
+        .split(vertical[1]);
 
     let topics = state.board_topics_by_activity();
     let topics_focused = app.discussion_focus == DiscussionFocus::Topics;
@@ -1516,6 +1541,62 @@ fn render_discussion(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
             ),
         chunks[1],
     );
+}
+
+fn discussion_pulse_lines(pulse: crate::discussion_pulse::DiscussionPulse) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled("NEEDS EYES  ", Style::default().fg(Color::Yellow).bold()),
+        Span::raw(format!(
+            "{} topics · {} unread · {} solitary new · {} awaiting external reply",
+            pulse.totals.needs_eyes_topics,
+            pulse.totals.unread_posts,
+            pulse.totals.solitary_new_posts,
+            pulse.totals.no_external_reply_posts,
+        )),
+    ])];
+    if pulse.needs_eyes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  clear",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for topic in pulse.needs_eyes.iter().take(2) {
+            lines.push(Line::from(format!(
+                "  {}  unread={} notified={} solitary={} awaiting={}",
+                topic.topic,
+                topic.unread_count,
+                topic.notification_count,
+                topic.solitary_new_post_ids.len(),
+                topic.no_external_reply_post_ids.len(),
+            )));
+        }
+    }
+    lines.push(Line::from(vec![
+        Span::styled("ACTIVE NOW  ", Style::default().fg(Color::Cyan).bold()),
+        Span::raw(format!(
+            "{} topics · {} burst",
+            pulse.totals.active_topics, pulse.totals.burst_topics
+        )),
+    ]));
+    if pulse.active_now.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  quiet",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for topic in pulse.active_now.iter().take(2) {
+            lines.push(Line::from(format!(
+                "  {}{}  5m={} 15m={} 60m={} authors={}",
+                if topic.burst { "* " } else { "  " },
+                topic.topic,
+                topic.posts_5m,
+                topic.posts_15m,
+                topic.posts_60m,
+                topic.distinct_authors_60m,
+            )));
+        }
+    }
+    lines
 }
 
 fn pane_border_style(focused: bool) -> Style {
@@ -1951,11 +2032,37 @@ fn split_at_width(s: &str, width: usize) -> (&str, &str) {
     s.split_at(end)
 }
 
-fn render_activity(f: &mut Frame, app: &mut App, _state: &State, area: Rect) {
+fn render_activity(f: &mut Frame, app: &mut App, state: &State, area: Rect) {
+    let pulse_height = if area.height >= 14 { 6 } else { 0 };
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(pulse_height), Constraint::Min(1)])
+        .split(area);
+    if pulse_height > 0 {
+        let lines = crate::discussion_pulse::build_discussion_pulse(
+            state,
+            app.actor.as_deref(),
+            Timestamp::now(),
+            crate::discussion_pulse::DiscussionPulseParameters::default(),
+        )
+        .map(discussion_pulse_lines)
+        .unwrap_or_default()
+        .into_iter()
+        .take(4)
+        .collect::<Vec<_>>();
+        f.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Discussion pulse (passive)"),
+            ),
+            vertical[0],
+        );
+    }
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Min(20)])
-        .split(area);
+        .split(vertical[1]);
 
     let items: Vec<ListItem> = app
         .activity
@@ -2971,9 +3078,9 @@ mod tests {
         term.draw(|f| render(f, &mut app)).unwrap();
         assert_eq!(app.post_starts.len(), 8, "every post gets a row offset");
 
-        // Header rows are 3 tall and the pane has a border, so the first
-        // readable row of the posts pane is y = 4.
-        let top_row = 4;
+        // Header rows are 3 tall, the discussion pulse is 8 rows at this
+        // terminal height, and the pane has a border.
+        let top_row = 12;
         app.next_post();
         app.next_post();
         term.draw(|f| render(f, &mut app)).unwrap();
@@ -2991,5 +3098,25 @@ mod tests {
     fn short_ts_compacts_rfc3339() {
         assert_eq!(short_ts("2026-05-14T09:31:07Z"), "05-14 09:31");
         assert_eq!(short_ts("bogus"), "bogus");
+    }
+
+    #[test]
+    fn discussion_pulse_uses_textual_non_color_lane_labels() {
+        let pulse = crate::discussion_pulse::build_discussion_pulse(
+            &State::default(),
+            Some("viewer"),
+            "2026-09-12T12:00:00Z".parse().unwrap(),
+            crate::discussion_pulse::DiscussionPulseParameters::default(),
+        )
+        .unwrap();
+        let text = discussion_pulse_lines(pulse)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("NEEDS EYES"));
+        assert!(text.contains("ACTIVE NOW"));
+        assert!(text.contains("solitary new"));
     }
 }

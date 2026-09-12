@@ -198,6 +198,56 @@ fn health_is_json_authenticated_and_every_response_closes_the_connection() {
 }
 
 #[test]
+fn discussion_pulse_endpoint_matches_board_and_is_read_only() {
+    let temp = TempDir::new().unwrap();
+    run_mote(&temp, &["init"]);
+    for (actor, body) in [
+        ("alice", "first"),
+        ("bob", "second"),
+        ("alice", "third"),
+        ("bob", "fourth"),
+    ] {
+        run_mote(
+            &temp,
+            &[
+                "discuss", "post", "--topic", "busy", "--body", body, "--actor", actor,
+            ],
+        );
+    }
+    run_mote(
+        &temp,
+        &[
+            "discuss", "post", "--topic", "quiet", "--body", "one post", "--actor", "carol",
+        ],
+    );
+    let store = Store::discover(temp.path()).unwrap();
+    let before = directory_snapshot(&store.ops_dir());
+
+    let pulse = get_json(
+        &store,
+        "/api/discussion/pulse?short_window_s=120&burst_window_s=1200",
+        "viewer",
+    );
+    assert_eq!(pulse["schema"], "mote.discussion-pulse.v1");
+    assert_eq!(pulse["parameters"]["short_window_s"], 120);
+    assert_eq!(pulse["parameters"]["burst_window_s"], 1200);
+    assert_eq!(pulse["totals"]["active_topics"], 2);
+    assert_eq!(pulse["totals"]["solitary_new_posts"], 1);
+
+    let board = get_json(&store, "/api/board", "viewer");
+    assert_eq!(
+        board["discussion_pulse"]["schema"],
+        "mote.discussion-pulse.v1"
+    );
+    assert_eq!(board["discussion_pulse"]["totals"], pulse["totals"]);
+    assert_eq!(
+        directory_snapshot(&store.ops_dir()),
+        before,
+        "GET pulse surfaces must not write or mark discussion read"
+    );
+}
+
+#[test]
 fn embedded_console_assets_are_authenticated_and_spa_paths_fall_back_to_live_index() {
     let bootstrap = exchange_raw(
         format!(

@@ -144,6 +144,10 @@ window.location.hash = "/discussion";
 await waitFor("discussion route", () => window.location.hash === "#/discussion"
   && byText(".pane-title", "Topics"));
 await eventually("topics list renders", () => text().includes("Planning"));
+await eventually("discussion pulse exposes both lanes", () =>
+  text().includes("Needs eyes") && text().includes("Active now"));
+check("pulse calls out a solitary new post", text().includes("solitary new"));
+check("pulse reports recent counts at 5, 15, and 60 minutes", text().includes("5 / 15 / 60 minute activity"));
 await eventually("threaded reply is indented", () =>
   all(".post").some((p) => parseInt(p.style.marginLeft || "0", 10) > 0));
 await eventually("a needs-bead post is flagged", () => text().includes("needs bead"));

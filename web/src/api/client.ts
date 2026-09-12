@@ -1,5 +1,5 @@
 import type {
-  Actor, Board, BeadDetail, BeadQuery, BeadRow, HistoryEntry, Message,
+  Actor, Board, BeadDetail, BeadQuery, BeadRow, DiscussionPulse, HistoryEntry, Message,
   DiscussionPostOptions, MessageSendResult, MoteEvent, NewBeadInput, NoteKind,
   Post, ScalarField, Topic, Unrouted,
 } from "./types";
@@ -35,6 +35,7 @@ export interface MoteClient {
   bead(id: string): Promise<BeadDetail>;
   history(id: string): Promise<HistoryEntry[]>;
   topics(): Promise<Topic[]>;
+  discussionPulse(): Promise<DiscussionPulse>;
   posts(topic: string): Promise<Post[]>;
   unread(): Promise<Post[]>;
   thread(postId: string): Promise<Post[]>;
@@ -136,6 +137,7 @@ export class HttpClient implements MoteClient {
   bead(id: string) { return this.req<BeadDetail>("GET", `/beads/${encodeURIComponent(id)}`); }
   history(id: string) { return this.req<HistoryEntry[]>("GET", `/beads/${encodeURIComponent(id)}/history?include_rejected=1`); }
   topics() { return this.req<Topic[]>("GET", "/topics"); }
+  discussionPulse() { return this.req<DiscussionPulse>("GET", "/discussion/pulse"); }
   posts(topic: string) { return this.req<Post[]>("GET", `/topics/${encodeURIComponent(topic)}/posts`); }
   unread() { return this.req<Post[]>("GET", "/unread"); }
   thread(postId: string) { return this.req<Post[]>("GET", `/posts/${encodeURIComponent(postId)}/thread`); }

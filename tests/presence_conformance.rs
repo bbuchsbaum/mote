@@ -70,7 +70,12 @@ fn assert_matches_reference(state: &mote::state::State, status: &Value) {
         recent_window,
     ))
     .unwrap();
-    assert_eq!(*status, expected);
+    let mut actual = status.clone();
+    actual
+        .as_object_mut()
+        .expect("actor status is an object")
+        .remove("discussion_pulse");
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -162,6 +167,11 @@ fn monitoring_surfaces_match_one_reference_projection_and_restart_cleanly() {
         &["--json", "in-flight", "--no-git", "--minutes", "10"],
     );
     let flying = find_actor(&in_flight["actors"], "bob");
+
+    assert_eq!(
+        direct["discussion_pulse"]["schema"],
+        "mote.discussion-pulse.v1"
+    );
 
     for status in [&direct, listed, boarded, flying] {
         assert_matches_reference(&state, status);

@@ -714,6 +714,7 @@ fn is_known_read_route(path: &str) -> bool {
             | "/api/board"
             | "/api/beads"
             | "/api/topics"
+            | "/api/discussion/pulse"
             | "/api/unread"
             | "/api/unrouted"
             | "/api/search"
@@ -751,6 +752,9 @@ fn handle_get(
                 .map(|topic| crate::cli::topic_json(&state, topic))
                 .collect(),
         ),
+        "/api/discussion/pulse" => {
+            discussion_pulse_json(&state, &request_actor(request)?, request)?
+        }
         "/api/unread" => Value::Array(
             state
                 .unread_board_posts_for(&request_actor(request)?, None)
@@ -870,6 +874,40 @@ fn query_bool(request: &Request, name: &str) -> Result<bool, ApiError> {
             format!("{name} must be 0, 1, false, or true (got `{value}`)"),
         )),
     }
+}
+
+fn discussion_pulse_json(state: &State, actor: &str, request: &Request) -> Result<Value, ApiError> {
+    fn number<T>(request: &Request, name: &str, default: T) -> Result<T, ApiError>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        request.query_first(name).map_or(Ok(default), |value| {
+            value.parse::<T>().map_err(|error| {
+                ApiError::message(422, format!("invalid {name} value `{value}`: {error}"))
+            })
+        })
+    }
+
+    let defaults = crate::discussion_pulse::DiscussionPulseParameters::default();
+    let parameters = crate::discussion_pulse::DiscussionPulseParameters {
+        short_window_s: number(request, "short_window_s", defaults.short_window_s)?,
+        burst_window_s: number(request, "burst_window_s", defaults.burst_window_s)?,
+        active_window_s: number(request, "active_window_s", defaults.active_window_s)?,
+        attention_window_s: number(request, "attention_window_s", defaults.attention_window_s)?,
+        burst_posts: number(request, "burst_posts", defaults.burst_posts)?,
+        burst_actors: number(request, "burst_actors", defaults.burst_actors)?,
+    };
+    let as_of = request
+        .query_first("as_of")
+        .map(str::parse::<jiff::Timestamp>)
+        .transpose()
+        .map_err(|error| ApiError::message(422, format!("invalid as_of timestamp: {error}")))?
+        .unwrap_or_else(jiff::Timestamp::now);
+    let pulse =
+        crate::discussion_pulse::build_discussion_pulse(state, Some(actor), as_of, parameters)
+            .map_err(|error| ApiError::message(422, error))?;
+    serde_json::to_value(pulse).map_err(ApiError::internal)
 }
 
 fn beads_json(state: &State, request: &Request) -> Result<Value, ApiError> {
@@ -1031,6 +1069,13 @@ fn board_json(state: &State, actor: String) -> Result<Value, ApiError> {
                 == Some(crate::state::ReservationExpiryPhase::Expired)
         })
         .collect();
+    let discussion_pulse = crate::discussion_pulse::build_discussion_pulse(
+        state,
+        Some(&actor),
+        as_of,
+        crate::discussion_pulse::DiscussionPulseParameters::default(),
+    )
+    .map_err(ApiError::internal)?;
     Ok(json!({
         "actor": actor,
         "as_of_ts": now,
@@ -1072,6 +1117,7 @@ fn board_json(state: &State, actor: String) -> Result<Value, ApiError> {
             "roles": state.roles.values().map(|role| crate::cli::role_json(state, role, &now)).collect::<Vec<_>>(),
             "inbox_unacked": state.inbox_for(&actor).len(),
         "discussion_unread": state.unread_board_posts_for(&actor, None).len(),
+        "discussion_pulse": discussion_pulse,
         "discussion": crate::cli::discussion_decisions_json(state, None),
         "actors": actors,
     }))
@@ -1249,6 +1295,16 @@ fn inflight_json(state: &State, actor: &str, request: &Request) -> Result<Value,
         now,
         window_secs.max(0).min(u32::MAX as i64) as u32,
     );
+    let discussion_pulse = crate::discussion_pulse::build_discussion_pulse(
+        state,
+        Some(actor),
+        now,
+        crate::discussion_pulse::DiscussionPulseParameters {
+            active_window_s: window_secs.clamp(1, u32::MAX as i64) as u32,
+            ..crate::discussion_pulse::DiscussionPulseParameters::default()
+        },
+    )
+    .map_err(ApiError::internal)?;
 
     Ok(json!({
         "actor": actor,
@@ -1299,6 +1355,7 @@ fn inflight_json(state: &State, actor: &str, request: &Request) -> Result<Value,
             value["unread"] = json!(state.unread_board_posts_for(actor, Some(&topic.topic)).len());
             value
         }).collect::<Vec<_>>(),
+        "discussion_pulse": discussion_pulse,
         "candidates": candidates.iter().map(|candidate| {
             let mut value = crate::cli::candidate_json_at(state, candidate, &now_ts);
             value["landability"] = json!(state.candidate_landability_at(

@@ -100,6 +100,13 @@ fn skills_install_repo_writes_both_agents_and_skills() {
                 s.contains(&format!("name: {skill}")),
                 "frontmatter wrong for {agent}/{skill}:\n{s}"
             );
+            if skill == "mote-message-board" {
+                assert!(
+                    s.contains("mote discuss pulse"),
+                    "installed board skill omits pulse"
+                );
+                assert!(s.contains("NEEDS EYES") && s.contains("ACTIVE NOW"));
+            }
         }
     }
 }

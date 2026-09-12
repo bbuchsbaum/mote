@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { DiscussionReference, Post, StructuredDecision } from "../api/types";
+import type { DiscussionPulse, DiscussionReference, Post, StructuredDecision } from "../api/types";
 import type { MoteClient } from "../api/client";
 import { relativeTime, shortId, useResource, useWrite } from "../store";
 import { BeadPicker, Empty, Modal, RouteChip } from "../components/ui";
@@ -21,6 +21,7 @@ export function DiscussionView({
   const [linking, setLinking] = useState<Post | null>(null);
 
   const { data: topics } = useResource("topics", actor, () => client.topics());
+  const { data: pulse } = useResource("pulse", actor, () => client.discussionPulse());
   const active = topic ?? topics?.[0]?.topic ?? null;
   const { data: posts } = useResource("posts", active ?? "-", () =>
     active ? client.posts(active) : Promise.resolve([]));
@@ -44,7 +45,9 @@ export function DiscussionView({
   };
 
   return (
-    <div className="app" style={{ gridTemplateColumns: "230px minmax(0,1fr)" }}>
+    <div className="discussion-shell">
+      <DiscussionPulsePanel pulse={pulse} onSelectTopic={onSelectTopic} />
+      <div className="app discussion-grid" style={{ gridTemplateColumns: "230px minmax(0,1fr)" }}>
       <div className="list-col">
         <div className="pane-head" style={{ padding: "10px 13px", background: "var(--surface-2)" }}>
           <span className="pane-title" style={{ fontSize: 13 }}>Topics</span>
@@ -199,7 +202,59 @@ export function DiscussionView({
           }}
         />
       )}
+      </div>
     </div>
+  );
+}
+
+function DiscussionPulsePanel({
+  pulse, onSelectTopic,
+}: {
+  pulse: DiscussionPulse | null;
+  onSelectTopic: (topic: string) => void;
+}) {
+  return (
+    <section className="pulse-board" aria-label="Discussion pulse">
+      <div className="pulse-lane needs-eyes">
+        <div className="pulse-heading">
+          <span>Needs eyes</span>
+          <b>{pulse?.totals.needs_eyes_topics ?? 0}</b>
+          <small>persistent attention · oldest unread first</small>
+        </div>
+        <div className="pulse-items">
+          {(pulse?.needs_eyes ?? []).slice(0, 6).map((item) => (
+            <button key={item.topic} className="pulse-item" onClick={() => onSelectTopic(item.topic)}>
+              <strong>{item.title || item.topic}</strong>
+              <span>{item.unread_count} unread</span>
+              {item.notification_count > 0 && <em>{item.notification_count} notified</em>}
+              {item.solitary_new_post_ids.length > 0 && <em>solitary new</em>}
+              {item.no_external_reply_post_ids.length > 0 && <em>{item.no_external_reply_post_ids.length} awaiting reply</em>}
+              {item.unresolved_question_count > 0 && <em>{item.unresolved_question_count} questions</em>}
+              {item.needs_bead_count > 0 && <em>{item.needs_bead_count} needs bead</em>}
+            </button>
+          ))}
+          {pulse && pulse.needs_eyes.length === 0 && <span className="pulse-empty">clear</span>}
+        </div>
+      </div>
+      <div className="pulse-lane active-now">
+        <div className="pulse-heading">
+          <span>Active now</span>
+          <b>{pulse?.totals.active_topics ?? 0}</b>
+          <small>5 / 15 / 60 minute activity</small>
+        </div>
+        <div className="pulse-items">
+          {(pulse?.active_now ?? []).slice(0, 6).map((item) => (
+            <button key={item.topic} className={`pulse-item ${item.burst ? "burst" : ""}`} onClick={() => onSelectTopic(item.topic)}>
+              <strong>{item.title || item.topic}</strong>
+              <span>{item.posts_5m} · {item.posts_15m} · {item.posts_60m} posts</span>
+              <em>{item.distinct_authors_60m} author{item.distinct_authors_60m === 1 ? "" : "s"}</em>
+              {item.burst && <em className="pulse-hot">burst</em>}
+            </button>
+          ))}
+          {pulse && pulse.active_now.length === 0 && <span className="pulse-empty">quiet</span>}
+        </div>
+      </div>
+    </section>
   );
 }
 

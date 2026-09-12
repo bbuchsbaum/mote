@@ -1236,6 +1236,33 @@ pub enum DiscussCmd {
     },
     /// List topics with post counts
     Topics,
+    /// Show where discussion is active and where posts still need attention
+    #[command(
+        long_about = "Show two independent lanes: ACTIVE NOW for current post volume and NEEDS EYES for durable actor-relative attention.\n\nsolitary-new means exactly one current active external post in a topic inside the active window, newer than the actor's effective cursor, with no descendant reply by another actor. Passive viewing never advances that cursor."
+    )]
+    Pulse {
+        /// Evaluate the projection at this RFC3339 instant (default: now)
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Short activity window in seconds
+        #[arg(long, default_value = "5m", value_parser = parse_duration_seconds)]
+        short_window: u32,
+        /// Burst-detection window in seconds
+        #[arg(long, default_value = "15m", value_parser = parse_duration_seconds)]
+        burst_window: u32,
+        /// Topic activity window in seconds
+        #[arg(long, default_value = "1h", value_parser = parse_duration_seconds)]
+        active_window: u32,
+        /// Window for authored posts awaiting an external reply
+        #[arg(long, default_value = "1h", value_parser = parse_duration_seconds)]
+        attention_window: u32,
+        /// Posts required inside the burst window
+        #[arg(long, default_value_t = 4)]
+        burst_posts: usize,
+        /// Distinct authors required inside the burst window
+        #[arg(long, default_value_t = 2)]
+        burst_actors: usize,
+    },
     /// Record a decision on a topic as a sticky, retrievable post
     Decision {
         #[arg(long, default_value = "general")]
@@ -4046,20 +4073,47 @@ fn cmd_actor(
                 None => current.clone().ok_or(MoteError::ActorUnresolved)?,
             };
             let state = reducer::replay_store(&store)?;
+            let as_of = Timestamp::now();
             let status = crate::actor_status::actor_status(
                 &state,
                 &actor,
                 current.as_deref(),
-                Timestamp::now(),
+                as_of,
                 recent_window,
             );
+            let pulse = crate::discussion_pulse::build_discussion_pulse(
+                &state,
+                Some(&actor),
+                as_of,
+                crate::discussion_pulse::DiscussionPulseParameters::default(),
+            )
+            .expect("default discussion pulse parameters are valid");
             if json_mode {
-                println!("{}", serde_json::to_string(&status)?);
+                let mut value = serde_json::to_value(&status)?;
+                value["discussion_pulse"] = serde_json::to_value(&pulse)?;
+                println!("{}", serde_json::to_string(&value)?);
             } else {
                 let identity_source = current_resolution.as_ref().and_then(|resolution| {
                     (resolution.actor == actor).then_some(resolution.source)
                 });
                 print_actor_status(&status, identity_source);
+                println!(
+                    "pulse:       {} active ({} burst), {} need eyes, {} solitary new, {} awaiting external reply",
+                    pulse.totals.active_topics,
+                    pulse.totals.burst_topics,
+                    pulse.totals.needs_eyes_topics,
+                    pulse.totals.solitary_new_posts,
+                    pulse.totals.no_external_reply_posts,
+                );
+                for topic in pulse.needs_eyes.iter().take(3) {
+                    println!(
+                        "  NEEDS EYES {} unread={} solitary={} awaiting-external-reply={}",
+                        topic.topic,
+                        topic.unread_count,
+                        display_ids(&topic.solitary_new_post_ids),
+                        display_ids(&topic.no_external_reply_post_ids),
+                    );
+                }
             }
             Ok(0)
         }
@@ -6215,6 +6269,40 @@ fn cmd_discuss(
             }
             Ok(0)
         }
+        DiscussCmd::Pulse {
+            as_of,
+            short_window,
+            burst_window,
+            active_window,
+            attention_window,
+            burst_posts,
+            burst_actors,
+        } => {
+            let actor = store.resolve_actor(actor_flag)?;
+            let state = reducer::replay_store(&store)?;
+            let as_of = as_of
+                .as_deref()
+                .map(str::parse::<Timestamp>)
+                .transpose()
+                .map_err(|error| MoteError::Invalid(format!("invalid --as-of timestamp: {error}")))?
+                .unwrap_or_else(Timestamp::now);
+            let parameters = crate::discussion_pulse::DiscussionPulseParameters {
+                short_window_s: short_window,
+                burst_window_s: burst_window,
+                active_window_s: active_window,
+                attention_window_s: attention_window,
+                burst_posts,
+                burst_actors,
+            };
+            let pulse = crate::discussion_pulse::build_discussion_pulse(
+                &state,
+                Some(&actor),
+                as_of,
+                parameters,
+            )
+            .map_err(MoteError::Invalid)?;
+            print_discussion_pulse(&pulse, json_mode)
+        }
         DiscussCmd::MarkRead { topic, through } => {
             let actor = store.resolve_actor(actor_flag)?;
             let state = reducer::replay_store(&store)?;
@@ -8080,6 +8168,91 @@ fn print_discussion_topics(
         }
     }
     Ok(0)
+}
+
+pub(crate) fn print_discussion_pulse(
+    pulse: &crate::discussion_pulse::DiscussionPulse,
+    json_mode: bool,
+) -> MoteResult<i32> {
+    if json_mode {
+        println!("{}", serde_json::to_string(pulse)?);
+        return Ok(0);
+    }
+
+    let parameters = pulse.parameters;
+    println!(
+        "ACTIVE NOW  window={}s  burst=>={} posts from >={} actors in {}s",
+        parameters.active_window_s,
+        parameters.burst_posts,
+        parameters.burst_actors,
+        parameters.burst_window_s
+    );
+    if pulse.active_now.is_empty() {
+        println!("  (quiet)");
+    } else {
+        for topic in &pulse.active_now {
+            let marker = if topic.burst { "*" } else { " " };
+            println!(
+                "{marker} {}  posts: 5m={} 15m={} 60m={}  authors={}  top={} replies={}  last={} ({})",
+                topic.topic,
+                topic.posts_5m,
+                topic.posts_15m,
+                topic.posts_60m,
+                topic.distinct_authors_60m,
+                topic.top_level_60m,
+                topic.replies_60m,
+                topic.last_post.post_id,
+                topic.last_post.sent_ts
+            );
+        }
+    }
+
+    println!(
+        "NEEDS EYES  actor={}",
+        pulse.actor.as_deref().unwrap_or("none")
+    );
+    if pulse.needs_eyes.is_empty() {
+        println!("  (clear)");
+    } else {
+        for topic in &pulse.needs_eyes {
+            let oldest = topic
+                .oldest_unread
+                .as_ref()
+                .map(|post| format!("{}@{}", post.post_id, post.sent_ts))
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "! {}  unread={} oldest={} notified={} watched={} questions={} needs-bead={} solitary={} awaiting-external-reply={}",
+                topic.topic,
+                topic.unread_count,
+                oldest,
+                topic.notification_count,
+                topic.watched_unread_count,
+                topic.unresolved_question_count,
+                topic.needs_bead_count,
+                display_ids(&topic.solitary_new_post_ids),
+                display_ids(&topic.no_external_reply_post_ids),
+            );
+        }
+    }
+    println!(
+        "as-of={} active-topics={} burst-topics={} needs-eyes={} unread={} solitary={} awaiting-external-reply={}",
+        pulse.as_of_ts,
+        pulse.totals.active_topics,
+        pulse.totals.burst_topics,
+        pulse.totals.needs_eyes_topics,
+        pulse.totals.unread_posts,
+        pulse.totals.solitary_new_posts,
+        pulse.totals.no_external_reply_posts,
+    );
+    Ok(0)
+}
+
+fn display_ids(ids: &[String]) -> String {
+    if ids.is_empty() {
+        "-".into()
+    } else {
+        ids.join(",")
+    }
 }
 
 pub(crate) fn topic_json(
@@ -10510,6 +10683,13 @@ fn cmd_board(
         .as_ref()
         .map(|a| state.unread_board_posts_for(a, None).len())
         .unwrap_or(0);
+    let discussion_pulse = crate::discussion_pulse::build_discussion_pulse(
+        &state,
+        actor.as_deref(),
+        as_of,
+        crate::discussion_pulse::DiscussionPulseParameters::default(),
+    )
+    .expect("default discussion pulse parameters are valid");
 
     if json_mode {
         let v = serde_json::json!({
@@ -10552,6 +10732,7 @@ fn cmd_board(
             "roles": state.roles.values().map(|role| role_json(&state, role, &now)).collect::<Vec<_>>(),
             "inbox_unacked": inbox_count,
             "discussion_unread": discussion_unread_count,
+            "discussion_pulse": discussion_pulse,
             "discussion": discussion_decisions_json(&state, None),
             "actors": actors,
         });
@@ -10624,6 +10805,22 @@ fn cmd_board(
             state.board_decisions.len(),
             question_counts.unresolved,
         );
+        println!(
+            "pulse:        {} active ({} burst), {} need eyes, {} solitary new",
+            discussion_pulse.totals.active_topics,
+            discussion_pulse.totals.burst_topics,
+            discussion_pulse.totals.needs_eyes_topics,
+            discussion_pulse.totals.solitary_new_posts,
+        );
+        for topic in discussion_pulse.needs_eyes.iter().take(5) {
+            println!(
+                "  NEEDS EYES {} unread={} solitary={} awaiting-external-reply={}",
+                topic.topic,
+                topic.unread_count,
+                display_ids(&topic.solitary_new_post_ids),
+                display_ids(&topic.no_external_reply_post_ids),
+            );
+        }
         println!("actors:       {} known", actors.len());
         for status in &actors {
             println!(
@@ -10732,6 +10929,17 @@ fn cmd_in_flight(
         now,
         window_secs.max(0).min(u32::MAX as i64) as u32,
     );
+    let pulse_parameters = crate::discussion_pulse::DiscussionPulseParameters {
+        active_window_s: window_secs.clamp(1, u32::MAX as i64) as u32,
+        ..crate::discussion_pulse::DiscussionPulseParameters::default()
+    };
+    let discussion_pulse = crate::discussion_pulse::build_discussion_pulse(
+        &state,
+        actor.as_deref(),
+        now,
+        pulse_parameters,
+    )
+    .expect("in-flight pulse parameters are valid");
 
     if json_mode {
         let v = serde_json::json!({
@@ -10787,6 +10995,7 @@ fn cmd_in_flight(
                 }
                 v
             }).collect::<Vec<_>>(),
+            "discussion_pulse": discussion_pulse,
             "candidates": candidates.iter().map(|candidate| {
                 let mut value = candidate_json_at(&state, candidate, &now_ts);
                 value["landability"] = serde_json::json!(
@@ -10933,6 +11142,34 @@ fn cmd_in_flight(
             t.post_count,
             t.route.state.as_str(),
             t.last_activity_ts
+        );
+    }
+
+    println!(
+        "\nDISCUSSION PULSE ({} active, {} burst, {} need eyes):",
+        discussion_pulse.totals.active_topics,
+        discussion_pulse.totals.burst_topics,
+        discussion_pulse.totals.needs_eyes_topics,
+    );
+    for topic in &discussion_pulse.needs_eyes {
+        println!(
+            "  NEEDS EYES {} unread={} notified={} solitary={} awaiting-external-reply={}",
+            topic.topic,
+            topic.unread_count,
+            topic.notification_count,
+            display_ids(&topic.solitary_new_post_ids),
+            display_ids(&topic.no_external_reply_post_ids),
+        );
+    }
+    for topic in &discussion_pulse.active_now {
+        println!(
+            "  ACTIVE{} {} 5m={} 15m={} 60m={} authors={}",
+            if topic.burst { "*" } else { "" },
+            topic.topic,
+            topic.posts_5m,
+            topic.posts_15m,
+            topic.posts_60m,
+            topic.distinct_authors_60m,
         );
     }
 

@@ -148,6 +148,7 @@ fn board_in_flight_and_status_share_explicit_actor_schema_and_are_read_only() {
         "active_reservations",
         "inbox_unacked",
         "discussion_unread",
+        "discussion_pulse",
     ] {
         assert!(board.get(legacy).is_some(), "missing board field {legacy}");
     }
@@ -165,6 +166,7 @@ fn board_in_flight_and_status_share_explicit_actor_schema_and_are_read_only() {
         "topics",
         "candidates",
         "recent_commits_advisory",
+        "discussion_pulse",
     ] {
         assert!(
             in_flight.get(legacy).is_some(),

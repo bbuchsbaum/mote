@@ -194,6 +194,38 @@ code { font-family:var(--mono); font-size:.9em; }
 .tl-item .why { color:var(--crit); }
 
 /* ---------- discussion ---------- */
+.discussion-shell { height:100%; min-height:0; display:flex; flex-direction:column; }
+.discussion-grid { flex:1; min-height:0; }
+.pulse-board {
+  flex:none; display:grid; grid-template-columns:1fr 1fr; border-bottom:1px solid var(--rule);
+  background:var(--surface); min-height:98px;
+}
+.pulse-lane { min-width:0; padding:9px 12px; }
+.pulse-lane + .pulse-lane { border-left:1px solid var(--rule); }
+.pulse-heading { display:flex; align-items:baseline; gap:7px; margin-bottom:7px; }
+.pulse-heading > span { font-size:10px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+.pulse-heading b { font-family:var(--mono); font-size:10px; border-radius:8px; padding:1px 6px; background:var(--surface-3); }
+.needs-eyes .pulse-heading > span { color:var(--warn); }
+.needs-eyes .pulse-heading b { background:var(--warn-soft); color:var(--warn); }
+.active-now .pulse-heading > span { color:var(--accent); }
+.active-now .pulse-heading b { background:var(--accent-soft); color:var(--accent); }
+.pulse-heading small { color:var(--ink-3); font-family:var(--mono); font-size:9px; }
+.pulse-items { display:flex; gap:7px; overflow-x:auto; padding-bottom:2px; }
+.pulse-item {
+  flex:0 0 auto; max-width:220px; min-width:135px; display:flex; flex-wrap:wrap; align-items:center; gap:4px 7px;
+  border:1px solid var(--rule); border-radius:5px; padding:6px 8px; background:var(--surface-2);
+  color:var(--ink-2); text-align:left; cursor:pointer; font-family:var(--mono); font-size:9px;
+}
+.pulse-item:hover { border-color:var(--accent-line); background:var(--accent-soft); }
+.pulse-item strong { width:100%; color:var(--ink); font-family:var(--sans); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.pulse-item em { font-style:normal; padding:1px 4px; border-radius:3px; color:var(--warn); background:var(--warn-soft); }
+.pulse-item.burst { border-color:var(--accent-line); }
+.pulse-item em.pulse-hot { color:var(--accent); background:var(--accent-soft); font-weight:700; text-transform:uppercase; }
+.pulse-empty { color:var(--ink-3); font-family:var(--mono); font-size:10px; padding:7px; }
+@media (max-width:800px) {
+  .pulse-board { grid-template-columns:1fr; }
+  .pulse-lane + .pulse-lane { border-left:0; border-top:1px solid var(--rule); }
+}
 .list-col { border-right:1px solid var(--rule); background:var(--surface-2); display:flex; flex-direction:column; min-width:0; }
 .topic {
   padding:10px 13px; border-bottom:1px solid var(--rule); display:flex; flex-direction:column; gap:4px;

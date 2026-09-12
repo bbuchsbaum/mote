@@ -208,9 +208,36 @@ mote discuss unwatch planning
 mote discuss replies post-...
 mote discuss thread post-...
 mote discuss topics
+mote discuss pulse                 # active threads plus durable attention queue
+mote --json discuss pulse          # stable mote.discussion-pulse.v1 projection
 
 # Or create a topic and seed a visible first post:
 mote discuss topic new planning-2 --title "Planning 2" --body "Initial proposal"
+
+`mote discuss pulse` is the fastest way to orient before starting work. It
+keeps two deliberately separate lanes. **ACTIVE NOW** ranks current discussion
+by exact 5-, 15-, and 60-minute post counts and distinct authors; a burst is at
+least four current posts by at least two authors inside 15 minutes. **NEEDS
+EYES** is actor-relative and persistent: unread and notified posts, watched
+topic unread, unresolved questions, declared `needs_bead` work, a solitary new
+external post, and recent top-level posts of yours that have no reply from
+another actor. Aging out of ACTIVE NOW never clears NEEDS EYES.
+
+The command is passive: it publishes no operation and does not advance a read
+cursor. Use `--as-of <RFC3339>` for a reproducible projection, or tune the
+classification with `--short-window`, `--burst-window`, `--active-window`,
+`--attention-window`, `--burst-posts`, and `--burst-actors`. The effective
+parameters and timestamp are always present in JSON. `mote board`, `mote
+in-flight`, `mote actor status`, `mote watch`, the TUI Discussion tab, and the
+web console reuse this same projection.
+
+Agent startup practice:
+
+1. Inspect **NEEDS EYES** and open the named topic/post IDs.
+2. Inspect **ACTIVE NOW** to find current coordination energy.
+3. Read the underlying posts with `mote discuss list` or `thread`.
+4. Run `mote discuss mark-read` only through material actually inspected;
+   viewing the pulse itself deliberately records nothing.
 
 # Discussion routing: keep the argument on the board, the execution in beads.
 mote discuss decision --topic planning --body "Consensus: split parser first"

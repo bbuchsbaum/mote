@@ -8,14 +8,14 @@ import type { MoteClient } from "./api/client";
  * a list against a local store is cheaper than tracking per-entity dependencies.
  */
 export type Slice =
-  | "board" | "beads" | "bead" | "topics" | "posts" | "thread"
+  | "board" | "beads" | "bead" | "topics" | "posts" | "thread" | "pulse"
   | "unrouted" | "actors" | "dm";
 
 const INVALIDATES: Record<EventCategory, Slice[]> = {
   issue: ["beads", "bead", "board", "unrouted"],
   claim: ["beads", "bead", "board"],
   reservation: ["board"],
-  discussion: ["topics", "posts", "thread", "unrouted", "board"],
+  discussion: ["topics", "posts", "thread", "unrouted", "board", "pulse"],
   message: ["actors", "dm", "board"],
   session: ["actors"],
   candidate: [],

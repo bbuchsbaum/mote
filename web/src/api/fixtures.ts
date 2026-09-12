@@ -1,5 +1,5 @@
 import type {
-  Actor, Board, BeadDetail, BeadQuery, BeadRow, DiscussionPostOptions, HistoryEntry,
+  Actor, Board, BeadDetail, BeadQuery, BeadRow, DiscussionPostOptions, DiscussionPulse, HistoryEntry,
   Message, MessageSendResult, MoteEvent, NewBeadInput, NoteKind, Post,
   PresenceEvidence, RouteState, ScalarField, Status, Topic, Unrouted,
 } from "./types";
@@ -310,6 +310,7 @@ export class FixtureClient implements MoteClient {
     const actor = this.getActor();
     const counts: Partial<Record<Status, number>> = {};
     for (const b of this.allBeads) counts[b.status] = (counts[b.status] ?? 0) + 1;
+    const discussion_pulse = await this.discussionPulse();
     return {
       actor,
       status_counts: counts,
@@ -323,6 +324,7 @@ export class FixtureClient implements MoteClient {
       }],
       orphaned_claims: [], orphaned_reservations: [],
       discussion_unread: this.unreadPosts(actor).length,
+      discussion_pulse,
       discussion: {
         structured_decision_count: this.allTopics.reduce((sum, topic) => sum + topic.structured_decision_count, 0),
         legacy_decision_count: this.allTopics.reduce((sum, topic) => sum + topic.legacy_decision_count, 0),
@@ -364,6 +366,123 @@ export class FixtureClient implements MoteClient {
     return this.allTopics
       .map((t) => ({ ...t, unread: unread.filter((p) => p.topic === t.topic).length }))
       .sort((a, b) => b.last_activity_ts.localeCompare(a.last_activity_ts));
+  }
+
+  async discussionPulse(): Promise<DiscussionPulse> {
+    const actor = this.getActor();
+    const asOf = Date.now();
+    const recent = (post: Post, seconds: number) =>
+      asOf - new Date(post.sent_ts).getTime() <= seconds * 1000;
+    const ref = (post: Post) => ({
+      post_id: post.post_id, sent_ts: post.sent_ts, sent_op_id: post.post_id,
+    });
+    const unread = this.unreadPosts(actor);
+    const unreadIds = new Set(unread.map((post) => post.post_id));
+    const active_now = this.allTopics.flatMap((topic) => {
+      const posts = this.allPosts.filter((post) => post.topic === topic.topic);
+      const within = (seconds: number) => posts.filter((post) => recent(post, seconds));
+      const posts60 = within(3600);
+      if (posts60.length === 0) return [];
+      const posts15 = within(900);
+      const authors15 = new Set(posts15.map((post) => post.from));
+      const last = [...posts60].sort((a, b) => b.sent_ts.localeCompare(a.sent_ts))[0];
+      const lastExternalReply = [...posts]
+        .filter((post) => post.reply_to !== null && post.from !== actor)
+        .sort((a, b) => b.sent_ts.localeCompare(a.sent_ts))[0];
+      return [{
+        topic: topic.topic, title: topic.title,
+        posts_5m: within(300).length, posts_15m: posts15.length, posts_60m: posts60.length,
+        distinct_authors_60m: new Set(posts60.map((post) => post.from)).size,
+        top_level_60m: posts60.filter((post) => post.reply_to === null).length,
+        replies_60m: posts60.filter((post) => post.reply_to !== null).length,
+        raw_posts_60m: posts60.length, active_posts_60m: posts60.length,
+        retracted_posts_60m: 0, superseded_posts_60m: 0,
+        posts_short_window: within(300).length, posts_burst_window: posts15.length,
+        distinct_authors_burst_window: authors15.size, posts_active_window: posts60.length,
+        distinct_authors_active_window: new Set(posts60.map((post) => post.from)).size,
+        burst: posts15.length >= 4 && authors15.size >= 2,
+        last_post_id: last.post_id, last_activity_ts: last.sent_ts, last_post: ref(last),
+        last_external_reply: lastExternalReply ? ref(lastExternalReply) : null,
+      }];
+    }).sort((a, b) => b.last_post.sent_ts.localeCompare(a.last_post.sent_ts));
+
+    const hasExternalDescendant = (root: Post) => {
+      const queue = [root.post_id];
+      const seen = new Set(queue);
+      while (queue.length > 0) {
+        const parent = queue.shift()!;
+        for (const child of this.allPosts.filter((post) => post.reply_to === parent)) {
+          if (seen.has(child.post_id)) continue;
+          if (child.from !== root.from) return true;
+          seen.add(child.post_id);
+          queue.push(child.post_id);
+        }
+      }
+      return false;
+    };
+    const needs_eyes = this.allTopics.flatMap((topic) => {
+      const posts = this.allPosts.filter((post) => post.topic === topic.topic);
+      const topicUnread = unread.filter((post) => post.topic === topic.topic)
+        .sort((a, b) => a.sent_ts.localeCompare(b.sent_ts));
+      const recentExternal = posts.filter((post) => post.from !== actor && recent(post, 3600));
+      const solitary = recentExternal.length === 1
+        && unreadIds.has(recentExternal[0].post_id)
+        && !hasExternalDescendant(recentExternal[0])
+        ? [recentExternal[0].post_id] : [];
+      const awaiting = posts
+        .filter((post) => post.from === actor && post.reply_to === null && recent(post, 3600))
+        .filter((post) => !hasExternalDescendant(post))
+        .map((post) => post.post_id);
+      const notification_count = topicUnread
+        .filter((post) => post.notification_recipients.includes(actor)).length;
+      const needs_bead_count = posts.filter((post) => post.route_state === "needs_bead").length
+        + (topic.route_state === "needs_bead" ? 1 : 0);
+      const explicit_attention = notification_count > 0
+        || topic.unresolved_question_count > 0 || needs_bead_count > 0;
+      if (topicUnread.length === 0 && solitary.length === 0 && awaiting.length === 0 && !explicit_attention) return [];
+      return [{
+        topic: topic.topic, title: topic.title, unread_count: topicUnread.length,
+        oldest_unread: topicUnread[0] ? ref(topicUnread[0]) : null,
+        newest_unread: topicUnread.at(-1) ? ref(topicUnread.at(-1)!) : null,
+        notification_count,
+        explicit_notification_count: topicUnread.filter((post) => post.explicit_notify.includes(actor)).length,
+        watched_unread_count: 0,
+        unresolved_question_count: topic.unresolved_question_count,
+        needs_bead_count, solitary_new_post_ids: solitary,
+        no_external_reply_post_ids: awaiting, explicit_attention,
+      }];
+    }).sort((a, b) => Number(b.explicit_attention) - Number(a.explicit_attention)
+      || (a.oldest_unread?.sent_ts ?? "~").localeCompare(b.oldest_unread?.sent_ts ?? "~")
+      || a.topic.localeCompare(b.topic));
+
+    return {
+      schema: "mote.discussion-pulse.v1", actor, as_of_ts: new Date(asOf).toISOString(),
+      parameters: {
+        short_window_s: 300, burst_window_s: 900, active_window_s: 3600,
+        attention_window_s: 3600, burst_posts: 4, burst_actors: 2,
+      },
+      definitions: {
+        active: "at least one current active post inside active_window_s",
+        burst: "at least burst_posts current active posts by at least burst_actors distinct authors inside burst_window_s",
+        solitary_new: "exactly one current active external post in the topic inside active_window_s, newer than the actor's effective cursor, with no descendant reply by another actor",
+        unread: "current active external post newer than the actor's effective global/topic cursor",
+        explicit_attention: "unread notification, watched-topic unread, unresolved structured question, or needs_bead route state",
+        no_external_reply: "current active top-level post by the actor inside attention_window_s with no descendant reply by another actor; self-replies do not clear it",
+      },
+      active_now, needs_eyes,
+      totals: {
+        active_topics: active_now.length,
+        burst_topics: active_now.filter((topic) => topic.burst).length,
+        needs_eyes_topics: needs_eyes.length,
+        unread_posts: needs_eyes.reduce((sum, topic) => sum + topic.unread_count, 0),
+        solitary_new_posts: needs_eyes.reduce((sum, topic) => sum + topic.solitary_new_post_ids.length, 0),
+        no_external_reply_posts: needs_eyes.reduce((sum, topic) => sum + topic.no_external_reply_post_ids.length, 0),
+      },
+      traversal: {
+        topics_scanned: this.allTopics.length, posts_scanned: this.allPosts.length,
+        reply_edges_scanned: this.allPosts.filter((post) => post.reply_to !== null).length,
+      },
+    };
   }
 
   async posts(topic: string): Promise<Post[]> {

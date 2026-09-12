@@ -88,7 +88,7 @@ export function App({ client: makeClient }: { client: (getActor: () => string) =
         </div>
 
         <RailItem label="Issues" shortcut="g i" count={openCount} on={route.view === "issues"} onClick={() => go("issues")} />
-        <RailItem label="Discussion" shortcut="g d" count={board?.discussion_unread ?? 0} hot on={route.view === "discussion"} onClick={() => go("discussion")} />
+        <RailItem label="Discussion" shortcut="g d" count={board?.discussion_pulse?.totals.needs_eyes_topics ?? board?.discussion_unread ?? 0} hot on={route.view === "discussion"} onClick={() => go("discussion")} />
         <RailItem label="Messages" shortcut="g m" count={board?.inbox_unacked ?? 0} hot on={route.view === "messages"} onClick={() => go("messages")} />
         <RailItem label="Triage" shortcut="g t" count={triageCount} amber on={route.view === "triage"} onClick={() => go("triage")} />
 

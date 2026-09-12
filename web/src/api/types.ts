@@ -87,8 +87,95 @@ export interface Board {
   orphaned_claims: ClaimRow[];
   orphaned_reservations: ReservationRow[];
   discussion_unread: number;
+  discussion_pulse: DiscussionPulse;
   discussion: DiscussionDecisionSummary;
   inbox_unacked: number;
+}
+
+export interface PulsePostRef {
+  post_id: string;
+  sent_ts: string;
+  sent_op_id: string;
+}
+
+export interface DiscussionPulseParameters {
+  short_window_s: number;
+  burst_window_s: number;
+  active_window_s: number;
+  attention_window_s: number;
+  burst_posts: number;
+  burst_actors: number;
+}
+
+export interface TopicActivityPulse {
+  topic: string;
+  title: string;
+  posts_5m: number;
+  posts_15m: number;
+  posts_60m: number;
+  distinct_authors_60m: number;
+  top_level_60m: number;
+  replies_60m: number;
+  raw_posts_60m: number;
+  active_posts_60m: number;
+  retracted_posts_60m: number;
+  superseded_posts_60m: number;
+  posts_short_window: number;
+  posts_burst_window: number;
+  distinct_authors_burst_window: number;
+  posts_active_window: number;
+  distinct_authors_active_window: number;
+  burst: boolean;
+  last_post_id: string;
+  last_activity_ts: string;
+  last_post: PulsePostRef;
+  last_external_reply: PulsePostRef | null;
+}
+
+export interface TopicAttentionPulse {
+  topic: string;
+  title: string;
+  unread_count: number;
+  oldest_unread: PulsePostRef | null;
+  newest_unread: PulsePostRef | null;
+  notification_count: number;
+  explicit_notification_count: number;
+  watched_unread_count: number;
+  unresolved_question_count: number;
+  needs_bead_count: number;
+  solitary_new_post_ids: string[];
+  no_external_reply_post_ids: string[];
+  explicit_attention: boolean;
+}
+
+export interface DiscussionPulse {
+  schema: "mote.discussion-pulse.v1";
+  actor: string | null;
+  as_of_ts: string;
+  parameters: DiscussionPulseParameters;
+  definitions: {
+    active: string;
+    burst: string;
+    solitary_new: string;
+    unread: string;
+    explicit_attention: string;
+    no_external_reply: string;
+  };
+  active_now: TopicActivityPulse[];
+  needs_eyes: TopicAttentionPulse[];
+  totals: {
+    active_topics: number;
+    burst_topics: number;
+    needs_eyes_topics: number;
+    unread_posts: number;
+    solitary_new_posts: number;
+    no_external_reply_posts: number;
+  };
+  traversal: {
+    topics_scanned: number;
+    posts_scanned: number;
+    reply_edges_scanned: number;
+  };
 }
 
 /** `mote --json discuss topics` */

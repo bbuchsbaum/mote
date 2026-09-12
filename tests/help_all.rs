@@ -48,6 +48,7 @@ fn help_all_is_sorted_complete_and_includes_deep_agent_surfaces() {
     assert!(actual.iter().any(|path| path == "actor list"));
     assert!(actual.iter().any(|path| path == "msg requests"));
     assert!(actual.iter().any(|path| path == "discuss supersede"));
+    assert!(actual.iter().any(|path| path == "discuss pulse"));
     assert!(
         actual
             .iter()
