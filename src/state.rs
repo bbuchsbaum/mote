@@ -2489,7 +2489,7 @@ impl State {
             .values()
             .filter(|question| question.decision_id == decision_id)
             .collect::<Vec<_>>();
-        questions.sort_by(|left, right| left.position.cmp(&right.position));
+        questions.sort_by_key(|question| question.position);
         questions
     }
 
