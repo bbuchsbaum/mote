@@ -95,6 +95,25 @@ fn skills_install_repo_writes_both_agents_and_skills() {
                 "missing openai.yaml for {agent}/{skill} at {}",
                 openai_yaml.display()
             );
+            let reference_paths: &[&str] = match skill {
+                "mote-tracker" => &[
+                    "references/candidates-and-recovery.md",
+                    "references/command-guide.md",
+                    "references/sessions-and-messaging.md",
+                ],
+                "mote-message-board" => &[
+                    "references/board-workflows.md",
+                    "references/command-guide.md",
+                ],
+                _ => unreachable!("unexpected bundled skill {skill}"),
+            };
+            for reference_path in reference_paths {
+                assert!(
+                    base.join(reference_path).is_file(),
+                    "missing {reference_path} for {agent}/{skill} at {}",
+                    base.display()
+                );
+            }
             let s = fs::read_to_string(&skill_md).unwrap();
             assert!(
                 s.contains(&format!("name: {skill}")),
@@ -109,6 +128,29 @@ fn skills_install_repo_writes_both_agents_and_skills() {
             }
         }
     }
+}
+
+#[test]
+fn installed_tracker_skill_documents_review_status_workflow() {
+    let td = TempDir::new().unwrap();
+    let out = Command::new(mote_bin())
+        .args(["skills", "install", "--agent", "codex", "--repo"])
+        .arg(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "install failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let skill = fs::read_to_string(td.path().join(".codex/skills/mote-tracker/SKILL.md")).unwrap();
+    assert!(
+        skill.contains("mote set <bd-id> status=review")
+            && skill.contains("mote ls --status review")
+            && skill.contains("mote set <bd-id> status=doing"),
+        "installed tracker skill omits the review-status workflow"
+    );
 }
 
 #[test]

@@ -11746,6 +11746,18 @@ const BUNDLED_SKILLS: &[BundledSkill] = &[
                 "agents/openai.yaml",
                 include_str!("../skills/mote-tracker/agents/openai.yaml"),
             ),
+            (
+                "references/candidates-and-recovery.md",
+                include_str!("../skills/mote-tracker/references/candidates-and-recovery.md"),
+            ),
+            (
+                "references/command-guide.md",
+                include_str!("../skills/mote-tracker/references/command-guide.md"),
+            ),
+            (
+                "references/sessions-and-messaging.md",
+                include_str!("../skills/mote-tracker/references/sessions-and-messaging.md"),
+            ),
         ],
     },
     BundledSkill {
@@ -11759,6 +11771,14 @@ const BUNDLED_SKILLS: &[BundledSkill] = &[
             (
                 "agents/openai.yaml",
                 include_str!("../skills/mote-message-board/agents/openai.yaml"),
+            ),
+            (
+                "references/board-workflows.md",
+                include_str!("../skills/mote-message-board/references/board-workflows.md"),
+            ),
+            (
+                "references/command-guide.md",
+                include_str!("../skills/mote-message-board/references/command-guide.md"),
             ),
         ],
     },
