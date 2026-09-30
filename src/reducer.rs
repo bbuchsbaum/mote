@@ -29,31 +29,37 @@ where
 {
     let mut state = State::default();
     for (filename, bytes) in ops {
-        let op_id = filename
-            .strip_suffix(".json")
-            .unwrap_or(&filename)
-            .to_string();
-        match serde_json::from_slice::<Op>(&bytes) {
-            Ok(op) => {
-                if let Some(reason) = envelope_violation(&op_id, &filename, &op) {
-                    let entity = op.entity().map(str::to_string);
-                    state.push_history(
-                        entity.as_deref(),
-                        HistoryEntry::rejected(&op_id, op.kind_name(), op.actor(), op.ts(), reason),
-                    );
-                    continue;
-                }
-                apply(&mut state, &op_id, op);
-            }
-            Err(e) => {
-                state.push_history(
-                    None,
-                    HistoryEntry::rejected(&op_id, "?", "?", "?", format!("malformed: {e}")),
-                );
-            }
-        }
+        apply_entry(&mut state, &filename, &bytes);
     }
     state
+}
+
+/// Apply one op file, identified by its filename, to `state`, exactly as one
+/// step of [`replay`]. Callers must apply entries in filename order.
+pub(crate) fn apply_entry(state: &mut State, filename: &str, bytes: &[u8]) {
+    let op_id = filename
+        .strip_suffix(".json")
+        .unwrap_or(filename)
+        .to_string();
+    match serde_json::from_slice::<Op>(bytes) {
+        Ok(op) => {
+            if let Some(reason) = envelope_violation(&op_id, filename, &op) {
+                let entity = op.entity().map(str::to_string);
+                state.push_history(
+                    entity.as_deref(),
+                    HistoryEntry::rejected(&op_id, op.kind_name(), op.actor(), op.ts(), reason),
+                );
+                return;
+            }
+            apply(state, &op_id, op);
+        }
+        Err(e) => {
+            state.push_history(
+                None,
+                HistoryEntry::rejected(&op_id, "?", "?", "?", format!("malformed: {e}")),
+            );
+        }
+    }
 }
 
 /// Verify the op envelope's `op` and `ts` fields agree with the filename.

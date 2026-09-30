@@ -414,6 +414,7 @@ pub fn accepted_events_for_names(
     let all_names = store.list_op_filenames()?;
     let state = reducer::replay_store(store)?;
     let store_id = store.read_format()?.store_id;
+    let mut prefix = PrefixReplay::new(store, &all_names);
     let mut out = Vec::new();
     for name in names {
         let op_id = name.strip_suffix(".json").unwrap_or(name);
@@ -458,26 +459,21 @@ pub fn accepted_events_for_names(
                 || message_delivery
                 || discussion_notification
             {
-                let prefix: Vec<String> = all_names
-                    .iter()
-                    .take_while(|candidate| candidate.as_str() <= name.as_str())
-                    .cloned()
-                    .collect();
-                let state_at_event = state_for_names(store, &prefix)?;
+                let state_at_event = prefix.through(name)?;
                 if let Some(entity) = invalidates_entity {
-                    add_orphaned_lease_effects(&mut event, &state_at_event, &entity);
+                    add_orphaned_lease_effects(&mut event, state_at_event, &entity);
                 }
                 if reservation_transition {
-                    add_reservation_binding(&mut event, &state_at_event);
+                    add_reservation_binding(&mut event, state_at_event);
                 }
                 if session_transition {
-                    add_session_snapshot(&mut event, &state_at_event);
+                    add_session_snapshot(&mut event, state_at_event);
                 }
                 if message_delivery {
-                    add_message_delivery(&mut event, &state_at_event);
+                    add_message_delivery(&mut event, state_at_event);
                 }
                 if discussion_notification {
-                    add_discussion_notification(&mut event, &state_at_event);
+                    add_discussion_notification(&mut event, state_at_event);
                 }
             }
             out.push(event);
@@ -624,6 +620,62 @@ fn add_orphaned_lease_effects(event: &mut EventEnvelope, state: &State, entity: 
     }
 }
 
+/// Forward-only replay of a store's op files in filename order.
+///
+/// Event enrichment needs the state as of each event's op. Replaying the whole
+/// prefix from disk per event made `mote events` quadratic in the op count;
+/// this cursor reads and applies each op file once while callers ask for
+/// non-decreasing positions. An earlier position restarts the replay, so the
+/// result never depends on call order.
+struct PrefixReplay<'a> {
+    store: &'a Store,
+    names: &'a [String],
+    applied: usize,
+    state: State,
+}
+
+impl<'a> PrefixReplay<'a> {
+    /// `names` must be the store's full, sorted op filename list.
+    fn new(store: &'a Store, names: &'a [String]) -> Self {
+        Self {
+            store,
+            names,
+            applied: 0,
+            state: State::default(),
+        }
+    }
+
+    /// State after every op whose filename sorts at or before `name`.
+    fn through(&mut self, name: &str) -> MoteResult<&State> {
+        let count = self
+            .names
+            .partition_point(|candidate| candidate.as_str() <= name);
+        self.advance_to(count)
+    }
+
+    /// State after every op whose filename sorts strictly before `name`.
+    fn before(&mut self, name: &str) -> MoteResult<&State> {
+        let count = self
+            .names
+            .partition_point(|candidate| candidate.as_str() < name);
+        self.advance_to(count)
+    }
+
+    fn advance_to(&mut self, count: usize) -> MoteResult<&State> {
+        if count < self.applied {
+            self.applied = 0;
+            self.state = State::default();
+        }
+        while self.applied < count {
+            let name = &self.names[self.applied];
+            let bytes = std::fs::read(self.store.ops_dir().join(name))?;
+            reducer::apply_entry(&mut self.state, name, &bytes);
+            self.applied += 1;
+        }
+        Ok(&self.state)
+    }
+}
+
 pub fn state_for_names(store: &Store, names: &[String]) -> MoteResult<State> {
     let mut entries = Vec::with_capacity(names.len());
     for name in names {
@@ -643,6 +695,7 @@ fn explicit_presence_events_for_names(
     let all_names = store.list_op_filenames()?;
     let final_state = reducer::replay_store(store)?;
     let store_id = store.read_format()?.store_id;
+    let mut prefix = PrefixReplay::new(store, &all_names);
     let mut events = Vec::new();
     for name in names {
         let op_id = name.strip_suffix(".json").unwrap_or(name);
@@ -660,31 +713,19 @@ fn explicit_presence_events_for_names(
         {
             continue;
         }
-        let before_names: Vec<String> = all_names
-            .iter()
-            .take_while(|candidate| candidate.as_str() < name.as_str())
-            .cloned()
-            .collect();
-        let after_names: Vec<String> = all_names
-            .iter()
-            .take_while(|candidate| candidate.as_str() <= name.as_str())
-            .cloned()
-            .collect();
-        let before = state_for_names(store, &before_names)?;
-        let after = state_for_names(store, &after_names)?;
         let at: jiff::Timestamp = op
             .ts()
             .parse()
             .map_err(|error: jiff::Error| MoteError::Other(error.to_string()))?;
         let before_status = crate::actor_status::actor_status(
-            &before,
+            prefix.before(name)?,
             op.actor(),
             None,
             at,
             crate::actor_status::DEFAULT_RECENT_WINDOW_S,
         );
         let after_status = crate::actor_status::actor_status(
-            &after,
+            prefix.through(name)?,
             op.actor(),
             None,
             at,
@@ -1402,6 +1443,8 @@ fn drain_for(rx: &Receiver<()>, window: Duration) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use jiff::Timestamp;
     use tempfile::TempDir;
 
@@ -1461,6 +1504,79 @@ mod tests {
         assert_eq!(event.data["msg_id"], msg_id);
         assert_eq!(event.data["to"], "bob");
         assert_eq!(event.data["body"], "take tests");
+    }
+
+    #[test]
+    fn prefix_replay_matches_a_fresh_replay_of_every_prefix_in_any_order() {
+        let td = TempDir::new().unwrap();
+        let store = Store::init(td.path()).unwrap();
+        let first = ids::new_bead_id();
+        let second = ids::new_bead_id();
+        let at = |s: &str| -> Timestamp { s.parse().unwrap() };
+        for op in [
+            make_create(
+                "alice".into(),
+                first.clone(),
+                ScalarSet {
+                    title: Some("one".into()),
+                    ..Default::default()
+                },
+                at("2026-01-01T00:00:00Z"),
+            ),
+            make_reserve_open(
+                "alice".into(),
+                ids::new_reservation_id(),
+                first.clone(),
+                vec!["src/a.rs".into()],
+                60,
+                at("2026-01-01T00:00:01Z"),
+            ),
+            make_create(
+                "bob".into(),
+                second.clone(),
+                ScalarSet {
+                    title: Some("two".into()),
+                    ..Default::default()
+                },
+                at("2026-01-01T00:00:02Z"),
+            ),
+            make_close(
+                "alice".into(),
+                first.clone(),
+                BTreeMap::new(),
+                at("2026-01-01T00:00:03Z"),
+            ),
+            make_reserve_open(
+                "bob".into(),
+                ids::new_reservation_id(),
+                second.clone(),
+                vec!["src/b.rs".into()],
+                60,
+                at("2026-01-01T00:00:04Z"),
+            ),
+        ] {
+            publish::publish_op(&store, &op).unwrap();
+        }
+        let names = store.list_op_filenames().unwrap();
+        let fresh =
+            |count: usize| format!("{:?}", state_for_names(&store, &names[..count]).unwrap());
+        let mut cursor = PrefixReplay::new(&store, &names);
+
+        // Forward, then backward (forcing a restart), then forward again.
+        let order = [0usize, 1, 2, 3, 4, 2, 0, 4, 3];
+        for &i in &order {
+            let name = names[i].as_str();
+            assert_eq!(
+                format!("{:?}", cursor.before(name).unwrap()),
+                fresh(i),
+                "before op {i}"
+            );
+            assert_eq!(
+                format!("{:?}", cursor.through(name).unwrap()),
+                fresh(i + 1),
+                "through op {i}"
+            );
+        }
     }
 
     #[test]
