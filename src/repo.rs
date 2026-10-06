@@ -37,6 +37,15 @@ pub struct Format {
     pub store_id: String,
     pub created_at: String,
     pub default_ttl_s: DefaultTtls,
+    /// Fenced stores must retain their admission journal when copied or restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<AuthorityFormat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorityFormat {
+    pub version: u32,
+    pub genesis_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +88,7 @@ impl Store {
             store_id: format!("st-{}", Ulid::new()),
             created_at: format_rfc3339(Timestamp::now()),
             default_ttl_s: DefaultTtls::default(),
+            authority: None,
         };
         let bytes = serde_json::to_vec_pretty(&format)?;
         fs::write(&format_path, bytes)?;
@@ -149,7 +159,8 @@ impl Store {
         Err(MoteError::ActorUnresolved)
     }
 
-    /// List `.json` filenames in `ops/` in lexicographic (replay) order.
+    /// List admitted op filenames in replay order (legacy filename order or
+    /// the durable shared-store admission order once authority is enabled).
     pub fn list_op_filenames(&self) -> MoteResult<Vec<String>> {
         let mut names: Vec<String> = fs::read_dir(self.ops_dir())?
             .filter_map(|e| e.ok())
@@ -158,7 +169,7 @@ impl Store {
             .filter(|n| n.ends_with(".json"))
             .collect();
         names.sort();
-        Ok(names)
+        crate::authority::ordered_names(self, names)
     }
 }
 

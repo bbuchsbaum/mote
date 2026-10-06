@@ -61,6 +61,12 @@ pub fn publish_value(store: &Store, mut op_value: Value, ts: Timestamp) -> MoteR
 /// `ts` is taken from the op's `ts` string (parsed back to a Timestamp), so
 /// callers should set it once when constructing the op.
 pub fn publish_op<T: Serialize>(store: &Store, op: &T) -> MoteResult<OpName> {
+    let (name, bytes) = encode_op(op)?;
+    publish_bytes(store, &name, &bytes)?;
+    Ok(name)
+}
+
+pub(crate) fn encode_op<T: Serialize>(op: &T) -> MoteResult<(OpName, Vec<u8>)> {
     let mut value = serde_json::to_value(op)?;
 
     // Validate shape and zero out the op field for hashing.
@@ -90,13 +96,21 @@ pub fn publish_op<T: Serialize>(store: &Store, op: &T) -> MoteResult<OpName> {
         .insert("op".to_string(), Value::String(name.as_str().to_string()));
 
     let bytes_final = canonical::encode(&value);
-    publish_bytes(store, &name, &bytes_final)?;
-    Ok(name)
+    Ok((name, bytes_final))
 }
 
 /// Publish raw canonical bytes as `<name>.json` in the store. Bytes are NOT
 /// validated; this is the low-level Maildir-style publish.
 pub fn publish_bytes(store: &Store, name: &OpName, bytes: &[u8]) -> MoteResult<()> {
+    let writer = crate::authority::Writer::acquire(store)?;
+    writer.ensure_no_landing()?;
+    writer.publish(&crate::authority::PreparedOp {
+        name: name.as_str().to_string(),
+        bytes: bytes.to_vec(),
+    })
+}
+
+pub(crate) fn publish_bytes_unlocked(store: &Store, name: &OpName, bytes: &[u8]) -> MoteResult<()> {
     let filename = format!("{}.json", name.as_str());
     let tmp_path = store.tmp_dir().join(&filename);
     let ops_path = store.ops_dir().join(&filename);

@@ -1398,7 +1398,12 @@ fn real_serve_process_preserves_protocol_and_store_boundaries() {
     );
     assert!(changed.contains(&"local/serve-token"));
     assert!(changed.iter().all(|path| *path == "local/serve-token"
+        || *path == "local/publication.lock"
         || (path.starts_with("ops/") && path.ends_with(".json"))));
+    assert_eq!(
+        std::fs::read(store.local_dir().join("publication.lock")).unwrap(),
+        Vec::<u8>::new()
+    );
 
     server.0.kill().unwrap();
     server.0.wait().unwrap();

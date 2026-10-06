@@ -5,7 +5,8 @@ coding agents on the same machine.
 
 The source of truth is not a database and not a single append-only file. It is
 a directory of immutable operation files — Maildir-inspired, deterministic on
-replay, with no mutable shared state on the write path.
+replay. Strict landing and handoff additionally use a shared-store publication
+fence and durable recovery journals.
 
 > **Status:** v0.2 working draft. POSIX-only (Linux/macOS), local filesystem,
 > single workstation. See `PRD.json` for the consolidated working spec.
@@ -30,7 +31,8 @@ developer plus a few local agents doing tiny task updates:
   FORMAT.json    # schema version, store id, default TTLs
   tmp/           # Maildir-style staging
   ops/           # immutable published ops, source of truth
-  local/         # convenience state (e.g. actor identity); not source of truth
+  authority/     # strict-mode admission order and durable recovery journals
+  local/         # actor identity and shared publication lock
 ```
 
 ### Repository policy
@@ -39,11 +41,13 @@ For normal single-workstation use, keep `.mote/` out of git and treat it like
 local coordination state. Add `.mote/` to the host repository's `.gitignore`
 unless you have explicitly decided to version the op log.
 
-If the task history matters, back up `.mote/ops/`; those immutable operation
-files are the source of truth. Do not hand-edit op files. Use `mote fsck` or
-`mote doctor` when you suspect storage damage.
+If the task history matters, back up `FORMAT.json`, `.mote/ops/`, and
+`.mote/authority/` together. Strict operations activate an admission journal that
+is also source of truth; op files alone are insufficient to restore that store.
+Do not hand-edit op files or journals. Use `mote fsck` or `mote doctor` when you
+suspect storage damage. See [shared-store authority](authority_protocol.md).
 
-Every mutation:
+Every publisher holds the shared store's OS lock. Its Maildir write steps are:
 
 1. write `tmp/<name>.json` with `O_CREAT|O_EXCL`, fsync the file
 2. `link()` from `tmp/` into `ops/` (fails on EEXIST — never silently overwrites)
@@ -63,7 +67,7 @@ All planes share the same publication mechanism and reducer.
 | Path     | `reserve_open`, `reserve_close`                                        |
 | Message  | `msg_send`, `msg_ack`                                                  |
 | Discussion | `board_topic`, `board_post`, `board_decision`, `board_question`, `board_sticky`, `board_read`, `board_route` |
-| Lease    | `claim`, `release`                                                     |
+| Lease    | `claim`, `release`, `handoff`                                                     |
 | Session  | `session_start`, `session_end`                                          |
 | Role | `role_define`, `role_assign`, `role_renew`, `role_release`, `role_retire` |
 | Candidate | `candidate_propose`, `candidate_evidence`, `candidate_review`, `candidate_review_policy_amend`, `candidate_landing_repository_bind`, `candidate_authorize`, `candidate_revoke`, `candidate_supersede`, `candidate_abandon`, `candidate_landed`, `candidate_reconcile` |
@@ -322,6 +326,13 @@ mote candidate show cand-...
 # command records the current successor phase and evidence op ids as CAS data.
 mote candidate supersede cand-OLD cand-NEW --expect-phase OP_ID \
   --containment-recovery --idempotency-key recover-old-1
+# Fenced, prospective landing of an exact reviewed fast-forward candidate.
+# Record target-scope evidence for main first, then use its exact observed OID.
+mote --actor landing-agent --json candidate land cand-... --target main \
+  --before FULL_OLD_OID --expect-phase OP_ID --expect-authorization OP_ID \
+  --idempotency-key land-1
+# Repeat that exact command/key to recover an interrupted landing.
+
 # After an external Git operation updates that same reflog-enabled ref directly
 # from the target-scope OID (or creates a merge with that OID first-parent) and
 # produces exactly the target-scope prospective tree:
@@ -362,6 +373,9 @@ mote session renew --ttl 2h
 mote begin   bd-... --paths src/auth/ --note "taking auth"
 mote begin   bd-... --paths src/auth/ --announce planning  # also post the claim
 mote handoff bd-... --to bob --note "tests remain" --release
+# Automation binds the originally observed claim and supplies a retry key:
+mote --json handoff bd-... --to bob --expect-holder alice \
+  --expect-claim CLAIM_OP --idempotency-key handoff-1
 mote done    bd-... --note "shipped"
 mote board
 mote in-flight            # sessions, reservations, doing work, topics, candidates
@@ -810,9 +824,10 @@ Requires Rust 1.85+ (edition 2024).
 
 - POSIX local filesystems only. No Windows. No NFS.
 - No glob-style reservation paths.
-- No Git mutation or distributed sync. Candidate and audit commands make
-  explicit read-only Git observations; use `git worktree add` when two agents
-  need separate `HEAD`/index state. Reservations remain advisory, not enforced.
+- `candidate land` can fast-forward a local branch under the shared-store
+  authority fence. It does not change the index/worktree or push. Other candidate
+  and audit commands make explicit read-only Git observations. Use separate Git
+  worktrees for separate `HEAD`/index state. Reservations remain advisory.
 - No distributed sync protocol. Versioning `.mote/` in git is a manual policy
   decision, not the default operational mode.
 - No snapshots; replay-from-scratch is the v0.2 read path.
@@ -824,6 +839,7 @@ Requires Rust 1.85+ (edition 2024).
 - `op_packs_rfc.md` — design-only RFC and reproducible Git experiment for
   immutable operation packs; no pack reader/writer is implemented yet
 - `candidate_protocol.md` — normative candidate, review, evidence, and landing protocol
+- `authority_protocol.md` — shared-store fencing, Git recovery, and holder-checked handoff
 - `role_protocol.md` — first-class role policy, session-bounded assignments,
   typed exclusions, capacity, and vacancy design
 - `operational_audit.md` — accepted boundary and schema for storage visibility

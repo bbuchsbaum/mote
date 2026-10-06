@@ -18,8 +18,11 @@ machine-readable answer to these questions:
 - Was authorization granted, made conditional, revoked, or consumed?
 
 Candidate protocol v1 answers those questions with immutable operations and a
-deterministic reducer. Mote records coordination state; it never merges, rebases,
-pushes, or mutates Git refs.
+deterministic reducer. Mote never merges, rebases, or pushes. The opt-in
+`candidate land` primitive can fast-forward a local branch under the
+[shared-store authority protocol](authority_protocol.md), which specifies the
+prospective fence, admission order, and durable recovery contract. The older
+`candidate landed` receipt remains an after-the-fact observation.
 
 The motivating failure is a candidate whose touched-path tree looked safe while
 its ancestry contained a separate blocked, unlanded candidate. Tree equality is

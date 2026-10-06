@@ -397,6 +397,9 @@ pub enum Command {
         /// Open target issue already claimed by this actor
         #[arg(long = "issue")]
         issue: String,
+        /// Exact reservation token observed by the caller
+        #[arg(long)]
+        expect_reservation: Option<String>,
         /// New TTL in seconds (default: reservation TTL)
         #[arg(long, value_parser = parse_duration_seconds)]
         ttl: Option<u32>,
@@ -429,7 +432,7 @@ pub enum Command {
         announce: Option<String>,
     },
 
-    /// Compound: handoff note + claim transfer + optional reservation release
+    /// Atomically hand off your live claim, with optional caller holder/token CAS
     Handoff {
         id: String,
         #[arg(long = "to")]
@@ -437,9 +440,18 @@ pub enum Command {
         /// Handoff note; pass - to read literal UTF-8 from stdin
         #[arg(long)]
         note: Option<String>,
-        /// Also close any current actor's reservations on this issue
+        /// Also close the sender's reservations in the same accepted operation
         #[arg(long)]
         release: bool,
+        /// Holder observed by the caller; requires --expect-claim
+        #[arg(long, requires = "expect_claim")]
+        expect_holder: Option<String>,
+        /// Exact claim token observed by the caller; requires --expect-holder
+        #[arg(long, requires = "expect_holder")]
+        expect_claim: Option<String>,
+        /// Stable retry key; retries reuse the original operation bytes
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
 
     /// Compound: completion note + close + reserve_close + release
@@ -693,6 +705,21 @@ pub enum CandidateCmd {
         expect_phase: String,
         #[arg(long)]
         reason: Option<String>,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Fast-forward a branch under fenced authorization; retry the exact request to recover
+    Land {
+        candidate_id: String,
+        #[arg(long)]
+        target: String,
+        /// Exact full OID of the expected target preimage
+        #[arg(long)]
+        before: String,
+        #[arg(long)]
+        expect_phase: String,
+        #[arg(long)]
+        expect_authorization: String,
         #[arg(long)]
         idempotency_key: String,
     },
@@ -1743,13 +1770,19 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         Command::Unreserve { rv, paths } => {
             cmd_unreserve(cli.actor.as_deref(), cli.store.as_deref(), rv, paths)
         }
-        Command::Adopt { rv, issue, ttl } => cmd_adopt(
+        Command::Adopt {
+            rv,
+            issue,
+            ttl,
+            expect_reservation,
+        } => cmd_adopt(
             cli.actor.as_deref(),
             cli.store.as_deref(),
             cli.json,
             rv,
             issue,
             ttl,
+            expect_reservation,
         ),
         Command::Preflight {
             issue,
@@ -1783,6 +1816,9 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             to,
             note,
             release,
+            expect_holder,
+            expect_claim,
+            idempotency_key,
         } => cmd_handoff(
             cli.actor.as_deref(),
             cli.store.as_deref(),
@@ -1790,6 +1826,10 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             to,
             note,
             release,
+            expect_holder,
+            expect_claim,
+            idempotency_key,
+            cli.json,
         ),
         Command::Done { id, note } => {
             cmd_done(cli.actor.as_deref(), cli.store.as_deref(), id, note)
@@ -2136,12 +2176,25 @@ fn print_candidate(
     candidate: &crate::state::CandidateRecord,
     json_mode: bool,
 ) -> MoteResult<()> {
-    let value = candidate_json(state, candidate);
+    print_candidate_for_actor(state, candidate, json_mode, None)
+}
+
+fn print_candidate_for_actor(
+    state: &crate::state::State,
+    candidate: &crate::state::CandidateRecord,
+    json_mode: bool,
+    actor: Option<&str>,
+) -> MoteResult<()> {
+    let mut value = candidate_json(state, candidate);
+    let now = ids::format_rfc3339(Timestamp::now());
+    value["landability_actor"] = serde_json::json!(actor);
+    value["landability"] =
+        serde_json::to_value(state.candidate_landability_at(&candidate.candidate_id, actor, &now))?;
     if json_mode {
         println!("{}", serde_json::to_string(&value)?);
     } else {
         let now = ids::format_rfc3339(Timestamp::now());
-        let landability = state.candidate_landability_at(&candidate.candidate_id, None, &now);
+        let landability = state.candidate_landability_at(&candidate.candidate_id, actor, &now);
         println!(
             "{}  {}  {}  issue={}  commit={}",
             candidate.candidate_id,
@@ -2375,9 +2428,12 @@ fn cmd_candidate(
             let candidate = state.candidates.get(&candidate_id).ok_or_else(|| {
                 MoteError::Invalid(format!("candidate `{candidate_id}` does not exist"))
             })?;
-            print_candidate(&state, candidate, json_mode)?;
+            let actor = store.resolve_actor(actor_flag).ok();
+            print_candidate_for_actor(&state, candidate, json_mode, actor.as_deref())?;
         }
         CandidateCmd::List { phase } => {
+            let actor = store.resolve_actor(actor_flag).ok();
+            let now = ids::format_rfc3339(Timestamp::now());
             let state = reducer::replay_store(&store)?;
             let phase = phase
                 .map(|value| match value.as_str() {
@@ -2395,7 +2451,16 @@ fn cmd_candidate(
                 .candidates
                 .values()
                 .filter(|candidate| phase.is_none_or(|wanted| candidate.phase == wanted))
-                .map(|candidate| candidate_json(&state, candidate))
+                .map(|candidate| {
+                    let mut value = candidate_json(&state, candidate);
+                    value["landability_actor"] = serde_json::json!(actor);
+                    value["landability"] = serde_json::json!(state.candidate_landability_at(
+                        &candidate.candidate_id,
+                        actor.as_deref(),
+                        &now
+                    ));
+                    value
+                })
                 .collect();
             if json_mode {
                 println!("{}", serde_json::to_string(&candidates)?);
@@ -2405,7 +2470,7 @@ fn cmd_candidate(
                     .values()
                     .filter(|candidate| phase.is_none_or(|wanted| candidate.phase == wanted))
                 {
-                    print_candidate(&state, candidate, false)?;
+                    print_candidate_for_actor(&state, candidate, false, actor.as_deref())?;
                 }
             }
         }
@@ -3088,6 +3153,29 @@ fn cmd_candidate(
             publish_candidate_op(&store, &mutation)?;
             let state = reducer::replay_store(&store)?;
             print_candidate(&state, &state.candidates[&candidate_id], json_mode)?;
+        }
+        CandidateCmd::Land {
+            candidate_id,
+            target,
+            before,
+            expect_phase,
+            expect_authorization,
+            idempotency_key,
+        } => {
+            let request = crate::landing::Request {
+                actor: store.resolve_actor(actor_flag)?,
+                candidate_id,
+                target,
+                before,
+                expect_phase,
+                expect_authorization,
+                idempotency_key,
+            };
+            let (code, result) =
+                crate::landing::execute(&store, &std::env::current_dir()?, request)?;
+            // Structured evidence is emitted on failure as well as success.
+            println!("{}", serde_json::to_string(&result)?);
+            return Ok(code);
         }
         CandidateCmd::Landed {
             candidate_id,
@@ -5678,11 +5766,12 @@ fn cmd_claim(
     // If a same-actor claim already exists, auto-fill expect_claim so renewal
     // succeeds against the strict reducer rule.
     let state = reducer::replay_store(&store)?;
+    let now = ids::format_rfc3339(Timestamp::now());
     let expect_claim = state
         .beads
         .get(&id)
         .and_then(|b| b.claim.as_ref())
-        .filter(|c| c.claimed_by == actor)
+        .filter(|c| c.claimed_by == actor && c.is_live(&now))
         .map(|c| c.claim_clock.clone());
 
     let op = make_claim(
@@ -8971,9 +9060,12 @@ fn cmd_adopt(
     rv: String,
     issue: String,
     ttl: Option<u32>,
+    expect_reservation: Option<String>,
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
+    let writer = crate::authority::Writer::acquire(&store)?;
+    writer.ensure_no_landing()?;
     let state = reducer::replay_store(&store)?;
     let reservation = state
         .reservations
@@ -8984,11 +9076,13 @@ fn cmd_adopt(
         actor,
         rv.clone(),
         issue,
-        reservation.clock.clone(),
+        expect_reservation.unwrap_or_else(|| reservation.clock.clone()),
         ttl_s,
         Timestamp::now(),
     );
-    let name = publish::publish_op(&store, &op)?;
+    let prepared = crate::authority::PreparedOp::new(&op)?;
+    writer.publish(&prepared)?;
+    let name = ids::OpName::from_string(prepared.name)?;
     let state = reducer::replay_store(&store)?;
     if !state.was_accepted(name.as_str()) {
         let reason = state
@@ -9229,7 +9323,7 @@ fn cmd_begin(
         .beads
         .get(&id)
         .and_then(|b| b.claim.as_ref())
-        .filter(|c| c.claimed_by == actor)
+        .filter(|c| c.claimed_by == actor && c.is_live(&ids::format_rfc3339(Timestamp::now())))
         .map(|c| c.claim_clock.clone());
     let claim_op = make_claim(
         actor.clone(),
@@ -9321,6 +9415,7 @@ fn cmd_begin(
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_handoff(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
@@ -9328,63 +9423,44 @@ fn cmd_handoff(
     to: String,
     note: Option<String>,
     release: bool,
+    expect_holder: Option<String>,
+    expect_claim: Option<String>,
+    idempotency_key: Option<String>,
+    json_mode: bool,
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
-    let note = resolve_optional_text(note)?;
-    let format = store.read_format()?;
-
-    // Note (handoff)
-    let text = note.unwrap_or_else(|| format!("handing off to {to}"));
-    let note_op = make_note(
-        actor.clone(),
-        id.clone(),
-        "handoff".into(),
-        text,
-        Timestamp::now(),
-    );
-    let _ = publish::publish_op(&store, &note_op);
-
-    // Claim reassignment (auto-fill expect_claim against current claim_clock if any)
-    let state = reducer::replay_store(&store)?;
-    let expect_claim = state
-        .beads
-        .get(&id)
-        .and_then(|b| b.claim.as_ref())
-        .map(|c| c.claim_clock.clone());
-    let claim = make_claim(
-        actor.clone(),
-        id.clone(),
-        to,
-        format.default_ttl_s.claim,
-        expect_claim,
-        Timestamp::now(),
-    );
-    let name = publish::publish_op(&store, &claim)?;
-    let state2 = reducer::replay_store(&store)?;
-    if !state2.was_accepted(name.as_str()) {
-        let reason = state2
-            .rejection_reason(name.as_str())
-            .unwrap_or_else(|| "unknown".into());
-        eprintln!("handoff claim rejected: {reason}");
-        return Ok(2);
+    let note = resolve_optional_text(note)?.unwrap_or_else(|| format!("handing off to {to}"));
+    let explicit = expect_holder.is_some();
+    let (code, result) = crate::handoff::execute(
+        &store,
+        crate::handoff::HandoffOp {
+            v: 1,
+            op: String::new(),
+            ts: String::new(),
+            actor,
+            entity: id,
+            to,
+            expect_holder: expect_holder.unwrap_or_default(),
+            expect_claim: expect_claim.unwrap_or_default(),
+            ttl_s: store.read_format()?.default_ttl_s.claim,
+            note,
+            release,
+            idempotency_key: idempotency_key
+                .unwrap_or_else(|| format!("handoff-{}", ulid::Ulid::new())),
+        },
+        explicit,
+    )?;
+    if json_mode {
+        println!("{}", serde_json::to_string(&result)?);
+    } else {
+        eprintln!(
+            "handoff {}: {}",
+            result["outcome"].as_str().unwrap_or("unknown"),
+            result["reason"].as_str().unwrap_or("accepted")
+        );
     }
-
-    if release {
-        let state3 = reducer::replay_store(&store)?;
-        let now = ids::format_rfc3339(Timestamp::now());
-        let mine: Vec<String> = state3
-            .reservations
-            .values()
-            .filter(|r| r.actor == actor && r.entity == id && r.is_active(&now))
-            .map(|r| r.reservation_id.clone())
-            .collect();
-        for rv in mine {
-            let close = make_reserve_close(actor.clone(), rv, None, Timestamp::now());
-            let _ = publish::publish_op(&store, &close);
-        }
-    }
-    Ok(0)
+    Ok(code)
 }
 
 fn cmd_done(

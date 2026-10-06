@@ -5,6 +5,7 @@
 
 pub mod actor_status;
 pub mod audit;
+pub mod authority;
 pub mod candidate;
 pub mod canonical;
 pub mod cli;
@@ -12,7 +13,9 @@ pub mod discussion_pulse;
 pub mod errors;
 pub mod events;
 pub mod fsck;
+pub mod handoff;
 pub mod ids;
+pub mod landing;
 pub mod op;
 pub mod paths;
 pub mod publish;

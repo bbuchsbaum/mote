@@ -259,6 +259,39 @@ impl StoreWatcher {
     }
 }
 
+// Fenced stores resume op cursors in admission order. A timed synthetic cursor
+// has no admission position: replay raw IDs conservatively rather than lose a
+// later admission with an earlier timestamp. Consumers already have stable IDs.
+fn cursor_position(names: &[String], cursor: &str) -> Option<usize> {
+    let stem = cursor.trim_end_matches(".json").split("~d-").next()?;
+    names
+        .iter()
+        .position(|name| name.trim_end_matches(".json") == stem)
+}
+
+fn follows_cursor(store: &Store, names: &[String], key: &str, cursor: &str) -> bool {
+    if crate::authority::enabled(store) {
+        if let Some(index) = cursor_position(names, key) {
+            return cursor_position(names, cursor)
+                .is_none_or(|before| index > before || index == before && key > cursor);
+        }
+    }
+    key > cursor
+}
+
+fn sort_events(store: &Store, names: &[String], events: &mut [EventEnvelope]) {
+    if crate::authority::enabled(store) {
+        events.sort_by_cached_key(|event| {
+            (
+                cursor_position(names, &event.event_id).unwrap_or(names.len()),
+                event.event_id.clone(),
+            )
+        });
+    } else {
+        events.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    }
+}
+
 /// Tracks op filenames already observed by a follow-mode consumer. It keeps a
 /// set rather than only a high-water filename so a clock-regressed op that is
 /// published later is still delivered during the running process.
@@ -278,7 +311,7 @@ impl EventTailer {
         let seen = match after_cursor.as_deref() {
             Some(cursor) => initial_names
                 .iter()
-                .filter(|name| name.as_str() <= cursor)
+                .filter(|name| !follows_cursor(store, &initial_names, name, cursor))
                 .cloned()
                 .collect(),
             None => initial_names.iter().cloned().collect(),
@@ -333,14 +366,14 @@ impl EventTailer {
             if self
                 .after_cursor
                 .as_ref()
-                .is_some_and(|cursor| key <= *cursor)
+                .is_some_and(|cursor| !follows_cursor(store, &names, &key, cursor))
                 || !self.seen_derived.insert(event.event_id.clone())
             {
                 continue;
             }
             events.push(event);
         }
-        events.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+        sort_events(store, &names, &mut events);
         Ok(events)
     }
 
@@ -375,7 +408,7 @@ pub fn accepted_events(
     let selected = match cursor.as_deref() {
         Some(cursor) => names
             .iter()
-            .filter(|name| name.as_str() > cursor)
+            .filter(|name| follows_cursor(store, &names, name, cursor))
             .cloned()
             .collect::<Vec<_>>(),
         None => names.clone(),
@@ -385,7 +418,10 @@ pub fn accepted_events(
     let store_id = store.read_format()?.store_id;
     for event in explicit_presence_events_for_names(store, &names, filter)? {
         let key = cursor_filename(&event.event_id)?;
-        if cursor.as_ref().is_none_or(|cursor| key > *cursor) {
+        if cursor
+            .as_ref()
+            .is_none_or(|cursor| follows_cursor(store, &names, &key, cursor))
+        {
             events.push(event);
         }
     }
@@ -395,11 +431,14 @@ pub fn accepted_events(
     projected.extend(derived_request_events(&state, &store_id, &now_ts, filter));
     for event in projected {
         let key = cursor_filename(&event.event_id)?;
-        if cursor.as_ref().is_none_or(|cursor| key > *cursor) {
+        if cursor
+            .as_ref()
+            .is_none_or(|cursor| follows_cursor(store, &names, &key, cursor))
+        {
             events.push(event);
         }
     }
-    events.sort_by(|a, b| a.event_id.cmp(&b.event_id));
+    sort_events(store, &names, &mut events);
     Ok(events)
 }
 
@@ -430,6 +469,7 @@ pub fn accepted_events_for_names(
             let invalidates_entity = matches!(
                 &op,
                 Op::Close(_)
+                    | Op::Handoff(_)
                     | Op::Delete(_)
                     | Op::CandidateRevoke(_)
                     | Op::CandidateSupersede(_)
@@ -649,7 +689,9 @@ impl<'a> PrefixReplay<'a> {
     fn through(&mut self, name: &str) -> MoteResult<&State> {
         let count = self
             .names
-            .partition_point(|candidate| candidate.as_str() <= name);
+            .iter()
+            .position(|candidate| candidate == name)
+            .map_or(self.names.len(), |index| index + 1);
         self.advance_to(count)
     }
 
@@ -657,7 +699,9 @@ impl<'a> PrefixReplay<'a> {
     fn before(&mut self, name: &str) -> MoteResult<&State> {
         let count = self
             .names
-            .partition_point(|candidate| candidate.as_str() < name);
+            .iter()
+            .position(|candidate| candidate == name)
+            .unwrap_or(self.names.len());
         self.advance_to(count)
     }
 
@@ -1161,7 +1205,7 @@ fn event_from_op(store_id: &str, op: Op) -> MoteResult<EventEnvelope> {
 
 fn event_category(op: &Op) -> &'static str {
     match op {
-        Op::Claim(_) | Op::Release(_) => "claim",
+        Op::Claim(_) | Op::Handoff(_) | Op::Release(_) => "claim",
         Op::MsgSend(_) | Op::MsgAck(_) | Op::MsgResolve(_) => "message",
         Op::BoardPost(_)
         | Op::BoardDecision(_)
@@ -1212,6 +1256,7 @@ fn event_type(op: &Op) -> &'static str {
         Op::Close(_) => "issue.closed",
         Op::Delete(_) => "issue.deleted",
         Op::Claim(_) => "claim.acquired",
+        Op::Handoff(_) => "claim.transferred",
         Op::Release(_) => "claim.released",
         Op::MsgSend(o) if o.msg_kind == "response" || !o.answers.is_empty() => "message.responded",
         Op::MsgSend(o) if o.msg_kind == "decline" => "message.declined",
@@ -1272,6 +1317,7 @@ fn op_relates_to_actor(op: &Op, state: &State, actor: &str) -> bool {
     }
     match op {
         Op::Claim(o) => o.to == actor,
+        Op::Handoff(o) => o.to == actor || o.expect_holder == actor,
         Op::MsgSend(o) => o.to == actor,
         Op::MsgAck(o) => state
             .messages

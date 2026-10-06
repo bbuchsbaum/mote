@@ -269,6 +269,7 @@ fn apply(state: &mut State, op_id: &str, op: Op) {
         Op::Close(o) => apply_close(state, op_id, kind, &actor, &ts, o),
         Op::Delete(o) => apply_delete(state, op_id, kind, &actor, &ts, o),
         Op::Claim(o) => apply_claim(state, op_id, kind, &actor, &ts, o),
+        Op::Handoff(o) => crate::handoff::apply(state, op_id, o),
         Op::Release(o) => apply_release(state, op_id, kind, &actor, &ts, o),
         Op::MsgSend(o) => apply_msg_send(state, op_id, kind, &actor, &ts, o),
         Op::MsgAck(o) => apply_msg_ack(state, op_id, kind, &actor, &ts, o),
@@ -905,9 +906,14 @@ fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
         Some(b) if b.is_deleted() => Decision::EntityDeleted,
         Some(b) if b.status == Status::Closed => Decision::EntityClosed,
         Some(b) => match (&b.claim, expect_claim.as_deref()) {
-            (None, _) => Decision::Accept,
-            (Some(c), Some(ec)) if ec == c.claim_clock => Decision::Accept,
-            (Some(c), _) if !c.is_live(ts) => Decision::Accept,
+            (None, None) => Decision::Accept,
+            (None, Some(_)) => Decision::Held("claim token no longer exists".into()),
+            (Some(c), Some(ec))
+                if ec == c.claim_clock && c.claimed_by == actor && c.is_live(ts) =>
+            {
+                Decision::Accept
+            }
+            (Some(c), None) if !c.is_live(ts) => Decision::Accept,
             (Some(c), _) => Decision::Held(c.claimed_by.clone()),
         },
         None => Decision::EntityMissing,
@@ -1029,8 +1035,10 @@ fn apply_release(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
     };
 
     let by_holder = claim.claimed_by == actor;
-    let by_expect = matches!(expect_claim.as_deref(), Some(ec) if ec == claim.claim_clock);
-    if !by_holder && !by_expect {
+    let expected = expect_claim
+        .as_deref()
+        .is_none_or(|ec| ec == claim.claim_clock);
+    if !by_holder || !expected {
         reject(
             state,
             &entity,
@@ -1039,7 +1047,7 @@ fn apply_release(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
             actor,
             ts,
             format!(
-                "release rejected: held by {}, expect_claim mismatch",
+                "release rejected: requires holder {} and matching expect_claim when supplied",
                 claim.claimed_by
             ),
         );
@@ -3746,6 +3754,7 @@ fn apply_reserve_adopt(
             to_actor: actor.to_string(),
             to_entity: entity.clone(),
         });
+    state.handoff_orphans.remove(&reservation_id);
     reservation.actor = actor.to_string();
     reservation.entity = entity.clone();
     reservation.ttl_s = ttl_s;

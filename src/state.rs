@@ -75,6 +75,10 @@ pub struct Note {
 
 #[derive(Debug, Clone, Default)]
 pub struct State {
+    /// Still-live carrier reservations left by an accepted claim handoff.
+    pub handoff_orphans: BTreeSet<String>,
+    /// Actor-scoped handoff request digests and original outcomes (including conflicts).
+    pub handoff_idempotency: BTreeMap<(String, String), (String, String)>,
     pub beads: BTreeMap<String, Bead>,
     /// Per-entity history in filename order. Includes both accepted and rejected
     /// ops so `mote history --include-rejected` is a simple lookup.
@@ -875,6 +879,8 @@ impl State {
             LeaseDisposition::Closed
         } else if !reservation.is_live(now_ts) {
             LeaseDisposition::Expired
+        } else if self.handoff_orphans.contains(&reservation.reservation_id) {
+            LeaseDisposition::Orphaned
         } else {
             match self.reservation_binding_kind(reservation) {
                 "bead" => {
