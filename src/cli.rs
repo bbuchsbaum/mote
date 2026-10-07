@@ -5796,6 +5796,11 @@ fn cmd_claim(
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
+    // Claim acquisition is a strict boundary: activate and retain the shared
+    // writer before observing a competing holder or minting a timestamp.
+    let writer = crate::authority::Writer::acquire(&store)?;
+    writer.enable()?;
+    writer.ensure_no_landing()?;
     let format = store.read_format()?;
     let ttl_s = ttl.unwrap_or(format.default_ttl_s.claim);
 
@@ -5818,7 +5823,9 @@ fn cmd_claim(
         expect_claim,
         Timestamp::now(),
     );
-    let name = publish::publish_op(&store, &op)?;
+    let prepared = crate::authority::PreparedOp::new(&op)?;
+    writer.publish(&prepared)?;
+    let name = ids::OpName::from_string(prepared.name)?;
     verify_accept(&store, &name)
 }
 

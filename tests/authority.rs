@@ -169,6 +169,57 @@ fn cli_status_is_read_only_enable_is_idempotent_and_begin_activates() {
 }
 
 #[test]
+fn fresh_cli_claim_activates_before_acquisition_and_freezes_late_timestamp_order() {
+    let root = TempDir::new().unwrap();
+    let store = Store::init(root.path()).unwrap();
+    let issue = ids::new_bead_id();
+    publish::publish_op(
+        &store,
+        &make_create(
+            "alice".into(),
+            issue.clone(),
+            ScalarSet {
+                title: Some("claim boundary".into()),
+                ..Default::default()
+            },
+            Timestamp::now(),
+        ),
+    )
+    .unwrap();
+    let claim = command(
+        root.path(),
+        &["--actor", "alice", "claim", &issue, "--ttl", "300"],
+    )
+    .output()
+    .unwrap();
+    assert!(claim.status.success(), "{claim:?}");
+    assert!(authority::status(&store).unwrap().enabled);
+    let before_late = store.list_op_filenames().unwrap();
+
+    let earlier: Timestamp = "2020-01-01T00:00:00Z".parse().unwrap();
+    let late = publish::publish_op(
+        &store,
+        &make_note(
+            "alice".into(),
+            issue.clone(),
+            "note".into(),
+            "admitted after claim despite earlier timestamp".into(),
+            earlier,
+        ),
+    )
+    .unwrap();
+    assert!(late.as_str() < before_late.last().unwrap().trim_end_matches(".json"));
+    let after_late = store.list_op_filenames().unwrap();
+    assert_eq!(&after_late[..before_late.len()], before_late.as_slice());
+    assert_eq!(after_late.last(), Some(&format!("{}.json", late.as_str())));
+    assert!(
+        reducer::replay_store(&store)
+            .unwrap()
+            .was_accepted(late.as_str())
+    );
+}
+
+#[test]
 fn missing_or_modified_authority_data_fails_closed() {
     let root = TempDir::new().unwrap();
     let store = Store::init(root.path()).unwrap();

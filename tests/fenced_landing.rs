@@ -6,6 +6,8 @@ use mote::{
     publish, reducer,
 };
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     path::Path,
     process::{Command, Output, Stdio},
@@ -456,6 +458,47 @@ fn archived_active_cleanup_observes_drift_then_releases_other_writers() {
     let historical = payload(&historical);
     assert_eq!(historical["outcome"], "historically_confirmed");
     assert_eq!(historical["receipt_context"], "archived_receipt");
+}
+
+#[test]
+#[cfg(unix)]
+fn confirmation_journal_write_failure_never_reports_landed() {
+    let f = Fixture::new();
+    let signal = f.root.path().join("confirmation-journal-io");
+    let child = f
+        .land("lander")
+        .env("MOTE_TEST_AUTHORITY_PAUSE", "landing-confirmed-op")
+        .env("MOTE_TEST_AUTHORITY_SIGNAL", &signal)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_signal(&signal);
+    let authority_dir = authority::directory(&f.store());
+    std::fs::set_permissions(&authority_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    std::fs::remove_file(&signal).unwrap();
+    let interrupted = child.wait_with_output().unwrap();
+    assert!(!interrupted.status.success(), "{interrupted:?}");
+    let receipt = payload(&interrupted);
+    assert_eq!(receipt["outcome"], "recovery_required");
+    assert_eq!(receipt["git_updated"], true);
+    assert_eq!(receipt["phase"], "Confirmed");
+    assert_eq!(f.tip(), f.after);
+
+    // The durable record remains Updated because the in-memory confirmation
+    // could not be persisted; it continues fencing unrelated writers.
+    let active: Value =
+        serde_json::from_slice(&std::fs::read(authority_dir.join("landing-active.json")).unwrap())
+            .unwrap();
+    assert_eq!(active["phase"], "Updated");
+    let blocked = f.revoke().output().unwrap();
+    assert!(!blocked.status.success(), "{blocked:?}");
+
+    std::fs::set_permissions(&authority_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let recovered = f.land("lander").output().unwrap();
+    assert!(recovered.status.success(), "{recovered:?}");
+    assert_eq!(payload(&recovered)["outcome"], "landed");
+    assert!(!authority_dir.join("landing-active.json").exists());
 }
 
 #[test]

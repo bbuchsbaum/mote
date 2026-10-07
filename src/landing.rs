@@ -311,8 +311,7 @@ fn result(
     // A current completion is successful only after its exact ref observation.
     // An archived receipt describes a completed prior attempt; preserve any
     // recorded cleanup/drift error instead of retrospectively claiming it won.
-    let succeeded =
-        terminally_confirmed && target_current && (current_completion || journal.detail.is_none());
+    let succeeded = terminally_confirmed && target_current && journal.detail.is_none();
     let outcome = if !current_completion && terminally_confirmed {
         "historically_confirmed"
     } else if succeeded {
@@ -581,6 +580,23 @@ fn execute_inner(store: &Store, cwd: &Path, request: Request) -> MoteResult<(i32
             retry,
             ReceiptContext::CurrentCompletion,
         ));
+    }
+    // A retry that completed the previously interrupted confirmation has a new
+    // successful execution result. Persist that fact before archiving so its
+    // old error cannot turn a completed retry into a historical failure.
+    if retry && journal.phase == Phase::Confirmed && journal.detail.is_some() {
+        journal.detail = None;
+        if let Err(error) = authority::write_json(&active, &journal) {
+            journal.detail = Some(error.to_string());
+            let _ = authority::write_json(&active, &journal);
+            return Ok(result(
+                cwd,
+                &journal,
+                &active,
+                retry,
+                ReceiptContext::CurrentCompletion,
+            ));
+        }
     }
     if let Err(error) = authority::write_json(&archive, &journal)
         .and_then(|()| authority::checkpoint("landing-archived"))
