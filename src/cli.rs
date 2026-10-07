@@ -9396,7 +9396,7 @@ fn cmd_begin(
         // Compensating reserve_close.
         let close = make_reserve_close(actor.clone(), rv_id, None, Timestamp::now());
         let close_prepared = crate::authority::PreparedOp::new(&close)?;
-        let _ = writer.publish(&close_prepared);
+        writer.publish(&close_prepared)?;
         return Ok(2);
     }
 
@@ -9421,16 +9421,17 @@ fn cmd_begin(
                 eprintln!("status update rejected: {reason}");
                 let close = make_reserve_close(actor.clone(), rv_id, None, Timestamp::now());
                 let close_prepared = crate::authority::PreparedOp::new(&close)?;
-                let _ = writer.publish(&close_prepared);
+                writer.publish(&close_prepared)?;
                 let release = make_release(actor, id, None, Timestamp::now());
                 let release_prepared = crate::authority::PreparedOp::new(&release)?;
-                let _ = writer.publish(&release_prepared);
+                writer.publish(&release_prepared)?;
                 return Ok(2);
             }
         }
     }
 
-    // Step 4: optional progress note (best effort).
+    // Step 4: optional progress note. Publication errors must stop the compound
+    // command, preserving the pending journal for the next writer to recover.
     if let Some(text) = note {
         let note_op = make_note(
             actor.clone(),
@@ -9440,7 +9441,7 @@ fn cmd_begin(
             Timestamp::now(),
         );
         let note_prepared = crate::authority::PreparedOp::new(&note_op)?;
-        let _ = writer.publish(&note_prepared);
+        writer.publish(&note_prepared)?;
     }
 
     // Step 5: optional claim announcement on the source topic, so board readers

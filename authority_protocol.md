@@ -50,7 +50,12 @@ Publication uses a durable `authority/publication.json` containing the exact
 operation name and bytes, then the existing Maildir publication protocol, then
 an atomic durable admission record. It finally removes the publication journal.
 After an interruption, the next writer finishes those exact bytes before any new
-mutation. A pending operation is not visible to readers until admitted. The
+mutation. A compound command retaining its writer also recovers any pending
+publication before publishing another operation. If recovery fails, the original
+journal remains intact and the new operation is not published. `begin` propagates
+publication errors in its optional note and compensation steps rather than
+continuing after a partial write. Work already admitted is retained.
+A pending operation is not visible to readers until admitted. The
 journal decision belongs before subsequent writers even if recovery happens
 later. Retries must retain the original request key and arguments.
 

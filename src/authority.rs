@@ -332,6 +332,10 @@ impl<'a> Writer<'a> {
         }
         // Validate the complete prefix before extending it.
         self.store.list_op_filenames()?;
+        // Compound commands retain this writer. A preceding failed publication
+        // must finish under the same lock before its recovery journal can be
+        // replaced; an unrecoverable error leaves that exact journal intact.
+        self.recover_publication()?;
         write_json(&directory(self.store).join("publication.json"), prepared)?;
         checkpoint("publication-prepared")?;
         self.finish_publication(prepared)
@@ -357,4 +361,105 @@ pub(crate) fn checkpoint(name: &str) -> MoteResult<()> {
     }
     let _ = name;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::op::{ScalarSet, make_create, make_note};
+    use jiff::Timestamp;
+
+    fn fixture() -> (tempfile::TempDir, Store, String) {
+        let root = tempfile::TempDir::new().unwrap();
+        let store = Store::init(root.path()).unwrap();
+        let issue = crate::ids::new_bead_id();
+        publish::publish_op(
+            &store,
+            &make_create(
+                "alice".into(),
+                issue.clone(),
+                ScalarSet {
+                    title: Some("publication recovery".into()),
+                    ..ScalarSet::default()
+                },
+                Timestamp::now(),
+            ),
+        )
+        .unwrap();
+        (root, store, issue)
+    }
+
+    fn note(issue: &str, text: &str) -> PreparedOp {
+        PreparedOp::new(&make_note(
+            "alice".into(),
+            issue.into(),
+            "note".into(),
+            text.into(),
+            Timestamp::now(),
+        ))
+        .unwrap()
+    }
+
+    fn linked_pending(store: &Store, prepared: &PreparedOp) {
+        // The production journal and publisher establish the state immediately
+        // after linking an operation, before its admission record is durable.
+        write_json(&directory(store).join("publication.json"), prepared).unwrap();
+        publish::publish_bytes_unlocked(
+            store,
+            &OpName::from_string(prepared.name.clone()).unwrap(),
+            &prepared.bytes,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reused_writer_recovers_linked_publication_before_next_operation() {
+        let (_root, store, issue) = fixture();
+        let writer = Writer::acquire(&store).unwrap();
+        writer.enable().unwrap();
+        let first = note(&issue, "pending note");
+        linked_pending(&store, &first);
+        let second = note(&issue, "next note");
+        writer.publish(&second).unwrap();
+        drop(writer);
+        let names = store.list_op_filenames().unwrap();
+        assert_eq!(
+            &names[1..],
+            &[
+                format!("{}.json", first.name),
+                format!("{}.json", second.name)
+            ]
+        );
+        assert!(!directory(&store).join("publication.json").exists());
+        let state = crate::reducer::replay_store(&store).unwrap();
+        assert_eq!(state.beads[&issue].notes.len(), 2);
+        Writer::acquire(&store).unwrap();
+    }
+
+    #[test]
+    fn failed_same_writer_recovery_preserves_original_journal() {
+        let (_root, store, issue) = fixture();
+        let writer = Writer::acquire(&store).unwrap();
+        writer.enable().unwrap();
+        let first = note(&issue, "pending note");
+        linked_pending(&store, &first);
+        let mut damaged = first.clone();
+        damaged.bytes.push(b' ');
+        let path = directory(&store).join("publication.json");
+        write_json(&path, &damaged).unwrap();
+        let original = fs::read(&path).unwrap();
+        let second = note(&issue, "must not publish");
+        let error = writer.publish(&second).unwrap_err();
+        assert!(
+            error.to_string().contains("recovery bytes disagree"),
+            "{error}"
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+        assert!(
+            !store
+                .ops_dir()
+                .join(format!("{}.json", second.name))
+                .exists()
+        );
+    }
 }
