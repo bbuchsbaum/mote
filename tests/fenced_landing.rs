@@ -396,6 +396,69 @@ fn changed_ref_after_git_update_reports_truth_and_does_not_reset() {
 }
 
 #[test]
+fn archived_active_cleanup_observes_drift_then_releases_other_writers() {
+    let f = Fixture::new();
+    let interrupted = f
+        .land("lander")
+        .env("MOTE_TEST_AUTHORITY_FAIL", "landing-archived")
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    assert_eq!(payload(&interrupted)["outcome"], "recovery_required");
+    assert!(
+        authority::directory(&f.store())
+            .join("landing-active.json")
+            .exists()
+    );
+    git(
+        f.root.path(),
+        &["update-ref", "refs/heads/main", &f.before, &f.after],
+    );
+
+    let cleaned = f.land("lander").output().unwrap();
+    assert!(!cleaned.status.success());
+    let receipt = payload(&cleaned);
+    assert_eq!(receipt["outcome"], "recovery_required");
+    assert_eq!(receipt["receipt_context"], "current_completion");
+    assert_eq!(receipt["target_current"], false);
+    assert!(
+        !authority::directory(&f.store())
+            .join("landing-active.json")
+            .exists()
+    );
+    assert!(
+        authority::directory(&f.store())
+            .join(format!(
+                "landing-{}.json",
+                blake3::hash(&serde_json::to_vec(&("lander", "landing")).unwrap()).to_hex()
+            ))
+            .exists()
+    );
+
+    // Cleanup must not leave the global writer barrier behind.
+    let issue = ids::new_bead_id();
+    publish::publish_op(
+        &f.store(),
+        &mote::op::make_create(
+            "author".into(),
+            issue,
+            mote::op::ScalarSet {
+                title: Some("unblocked writer".into()),
+                ..Default::default()
+            },
+            jiff::Timestamp::now(),
+        ),
+    )
+    .unwrap();
+
+    let historical = f.land("lander").output().unwrap();
+    assert!(!historical.status.success());
+    let historical = payload(&historical);
+    assert_eq!(historical["outcome"], "historically_confirmed");
+    assert_eq!(historical["receipt_context"], "archived_receipt");
+}
+
+#[test]
 #[cfg(debug_assertions)]
 fn killed_process_releases_lock_but_retains_authority_for_recovery() {
     for checkpoint in ["landing-before-update", "landing-after-update"] {

@@ -279,7 +279,19 @@ fn update_seen(cwd: &Path, journal: &Journal) -> MoteResult<bool> {
     }))
 }
 
-fn result(cwd: &Path, journal: &Journal, path: &Path, retry: bool) -> (i32, Value) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiptContext {
+    CurrentCompletion,
+    ArchivedReceipt,
+}
+
+fn result(
+    cwd: &Path,
+    journal: &Journal,
+    path: &Path,
+    retry: bool,
+    context: ReceiptContext,
+) -> (i32, Value) {
     let oid = current(cwd, &journal.target_ref);
     let seen = update_seen(cwd, journal).ok();
     let updated = match journal.phase {
@@ -293,17 +305,34 @@ fn result(cwd: &Path, journal: &Journal, path: &Path, retry: bool) -> (i32, Valu
             }
         }
     };
-    let confirmed = journal.phase == Phase::Confirmed;
+    let terminally_confirmed = journal.phase == Phase::Confirmed;
+    let target_current = oid.as_deref() == Some(journal.new_oid.as_str());
+    let current_completion = context == ReceiptContext::CurrentCompletion;
+    // A current completion is successful only after its exact ref observation.
+    // An archived receipt describes a completed prior attempt; preserve any
+    // recorded cleanup/drift error instead of retrospectively claiming it won.
+    let succeeded =
+        terminally_confirmed && target_current && (current_completion || journal.detail.is_none());
+    let outcome = if !current_completion && terminally_confirmed {
+        "historically_confirmed"
+    } else if succeeded {
+        "landed"
+    } else if journal.phase == Phase::Aborted {
+        "aborted"
+    } else {
+        "recovery_required"
+    };
     (
-        if confirmed { 0 } else { 2 },
+        if succeeded { 0 } else { 2 },
         json!({
-            "outcome": if confirmed { "landed" } else if journal.phase == Phase::Aborted { "aborted" } else { "recovery_required" },
+            "outcome": outcome,
             "git_updated": updated, "git_updated_unknown": updated.is_none(),
             "old_oid": journal.request.before, "new_oid": journal.new_oid, "current_oid": oid,
-            "target_current": oid.as_deref() == Some(journal.new_oid.as_str()),
+            "target_current": target_current,
             "candidate_id": journal.request.candidate_id, "actor": journal.request.actor,
             "target_ref": journal.target_ref, "repository_id": journal.repository_id,
             "journal": path, "phase": journal.phase, "detail": journal.detail, "retry": retry,
+            "receipt_context": if current_completion { "current_completion" } else { "archived_receipt" },
             "idempotency_key": journal.request.idempotency_key,
         }),
     )
@@ -434,7 +463,13 @@ pub fn execute(store: &Store, cwd: &Path, request: Request) -> MoteResult<(i32, 
                     {
                         Some(mut journal) => {
                             journal.detail = Some(error.to_string());
-                            let (_, mut value) = result(cwd, &journal, &path, true);
+                            let (_, mut value) = result(
+                                cwd,
+                                &journal,
+                                &path,
+                                true,
+                                ReceiptContext::CurrentCompletion,
+                            );
                             value["outcome"] = json!("recovery_required");
                             return Ok((2, value));
                         }
@@ -482,14 +517,39 @@ fn execute_inner(store: &Store, cwd: &Path, request: Request) -> MoteResult<(i32
         }
         if active.exists() {
             let pending: Journal = serde_json::from_slice(&fs::read(&active)?)?;
-            if pending.request == request
-                && matches!(pending.phase, Phase::Confirmed | Phase::Aborted)
-            {
+            if pending.request != request {
+                return Err(MoteError::Rejected(format!(
+                    "another landing requires recovery: {}",
+                    active.display()
+                )));
+            }
+            if matches!(pending.phase, Phase::Confirmed | Phase::Aborted) {
+                // The archive can have reached disk before active cleanup. Keep
+                // this retry in current-completion context until both durable
+                // records agree and the active barrier is removed.
+                authority::write_json(&archive, &pending)?;
                 fs::remove_file(&active)?;
                 crate::publish::fsync_dir(&authority::directory(store))?;
+                return Ok(result(
+                    cwd,
+                    &pending,
+                    &archive,
+                    true,
+                    ReceiptContext::CurrentCompletion,
+                ));
             }
+            return Err(MoteError::Rejected(format!(
+                "landing recovery remains active: {}",
+                active.display()
+            )));
         }
-        return Ok(result(cwd, &journal, &archive, true));
+        return Ok(result(
+            cwd,
+            &journal,
+            &archive,
+            true,
+            ReceiptContext::ArchivedReceipt,
+        ));
     }
     let retry = active.exists();
     let mut journal = if retry {
@@ -514,7 +574,13 @@ fn execute_inner(store: &Store, cwd: &Path, request: Request) -> MoteResult<(i32
         // Best effort only: the original durable prepare still proves recovery
         // is required if this write also fails. Never discard it or reset Git.
         let _ = authority::write_json(&active, &journal);
-        return Ok(result(cwd, &journal, &active, retry));
+        return Ok(result(
+            cwd,
+            &journal,
+            &active,
+            retry,
+            ReceiptContext::CurrentCompletion,
+        ));
     }
     if let Err(error) = authority::write_json(&archive, &journal)
         .and_then(|()| authority::checkpoint("landing-archived"))
@@ -522,9 +588,21 @@ fn execute_inner(store: &Store, cwd: &Path, request: Request) -> MoteResult<(i32
         .and_then(|()| crate::publish::fsync_dir(&authority::directory(store)))
     {
         journal.detail = Some(error.to_string());
-        let (_, mut value) = result(cwd, &journal, &active, retry);
+        let (_, mut value) = result(
+            cwd,
+            &journal,
+            &active,
+            retry,
+            ReceiptContext::CurrentCompletion,
+        );
         value["outcome"] = json!("recovery_required");
         return Ok((2, value));
     }
-    Ok(result(cwd, &journal, &archive, retry))
+    Ok(result(
+        cwd,
+        &journal,
+        &archive,
+        retry,
+        ReceiptContext::CurrentCompletion,
+    ))
 }

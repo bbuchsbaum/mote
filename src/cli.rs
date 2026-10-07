@@ -161,6 +161,12 @@ pub enum Command {
     /// Initialize a `.mote/` store in the current directory
     Init,
 
+    /// Inspect or activate the shared writer authority
+    Authority {
+        #[command(subcommand)]
+        cmd: AuthorityCmd,
+    },
+
     /// Manage actor identity and inspect actors observed in this store
     Actor {
         #[command(subcommand)]
@@ -1022,6 +1028,14 @@ pub enum ActorCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum AuthorityCmd {
+    /// Validate and print the authority contract without modifying the store
+    Status,
+    /// Acquire the shared writer lock and activate authority if needed
+    Enable,
+}
+
+#[derive(Subcommand, Debug)]
 pub enum DepCmd {
     /// Add a dependency edge: `child` is blocked by `parent`
     Add {
@@ -1489,6 +1503,7 @@ impl Command {
         !matches!(
             self,
             Command::Init
+                | Command::Authority { .. }
                 | Command::Actor { .. }
                 | Command::Show { .. }
                 | Command::Parents { .. }
@@ -1617,6 +1632,7 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
     warn_stale_requests_for_stateful_invocation(&cli)?;
     match cli.command {
         Command::Init => cmd_init(cli.quiet),
+        Command::Authority { cmd } => cmd_authority(cli.store.as_deref(), cmd),
         Command::Actor { cmd } => {
             cmd_actor(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
         }
@@ -4057,6 +4073,26 @@ fn cmd_init(quiet: bool) -> MoteResult<i32> {
         }
         Err(e) => return Err(e),
     }
+    Ok(0)
+}
+
+fn cmd_authority(store_flag: Option<&Path>, cmd: AuthorityCmd) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let (status, activated) = match cmd {
+        AuthorityCmd::Status => (crate::authority::status(&store)?, false),
+        AuthorityCmd::Enable => {
+            let was_enabled = crate::authority::enabled(&store);
+            let writer = crate::authority::Writer::acquire(&store)?;
+            writer.enable()?;
+            drop(writer);
+            (crate::authority::status(&store)?, !was_enabled)
+        }
+    };
+    let mut value = serde_json::to_value(status)?;
+    if activated {
+        value["activated"] = serde_json::Value::Bool(true);
+    }
+    println!("{}", serde_json::to_string(&value)?);
     Ok(0)
 }
 
@@ -9283,10 +9319,6 @@ fn cmd_begin(
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let note = resolve_optional_text(note)?;
-    let format = store.read_format()?;
-    let reserve_ttl = ttl.unwrap_or(format.default_ttl_s.reservation);
-    let claim_ttl = format.default_ttl_s.claim;
-
     if paths.is_empty() {
         return Err(MoteError::Invalid("at least one path required".into()));
     }
@@ -9296,6 +9328,16 @@ fn cmd_begin(
         .as_deref()
         .map(normalize_discussion_topic)
         .transpose()?;
+
+    // From here through the compound publication the one local POSIX lock
+    // serializes every upgraded writer. Activation happens before the first
+    // reservation timestamp and before reading claim state.
+    let writer = crate::authority::Writer::acquire(&store)?;
+    writer.enable()?;
+    writer.ensure_no_landing()?;
+    let format = store.read_format()?;
+    let reserve_ttl = ttl.unwrap_or(format.default_ttl_s.reservation);
+    let claim_ttl = format.default_ttl_s.claim;
 
     // Step 1: reserve_open
     let rv_id = ids::new_reservation_id();
@@ -9308,7 +9350,9 @@ fn cmd_begin(
         reserve_ttl,
         Timestamp::now(),
     );
-    let reserve_name = publish::publish_op(&store, &reserve)?;
+    let reserve_prepared = crate::authority::PreparedOp::new(&reserve)?;
+    writer.publish(&reserve_prepared)?;
+    let reserve_name = ids::OpName::from_string(reserve_prepared.name)?;
     let state1 = reducer::replay_store(&store)?;
     if !state1.was_accepted(reserve_name.as_str()) {
         let reason = state1
@@ -9333,7 +9377,9 @@ fn cmd_begin(
         expect_claim,
         Timestamp::now(),
     );
-    let claim_name = publish::publish_op(&store, &claim_op)?;
+    let claim_prepared = crate::authority::PreparedOp::new(&claim_op)?;
+    writer.publish(&claim_prepared)?;
+    let claim_name = ids::OpName::from_string(claim_prepared.name)?;
     let state2 = reducer::replay_store(&store)?;
     if !state2.was_accepted(claim_name.as_str()) {
         let reason = state2
@@ -9342,7 +9388,8 @@ fn cmd_begin(
         eprintln!("claim rejected: {reason}");
         // Compensating reserve_close.
         let close = make_reserve_close(actor.clone(), rv_id, None, Timestamp::now());
-        let _ = publish::publish_op(&store, &close);
+        let close_prepared = crate::authority::PreparedOp::new(&close)?;
+        let _ = writer.publish(&close_prepared);
         return Ok(2);
     }
 
@@ -9356,7 +9403,9 @@ fn cmd_begin(
             let mut expect = BTreeMap::new();
             expect.insert("status".to_string(), clock_for(bead, "status")?);
             let status_op = make_patch(actor.clone(), id.clone(), expect, set, Timestamp::now());
-            let status_name = publish::publish_op(&store, &status_op)?;
+            let status_prepared = crate::authority::PreparedOp::new(&status_op)?;
+            writer.publish(&status_prepared)?;
+            let status_name = ids::OpName::from_string(status_prepared.name)?;
             let state3 = reducer::replay_store(&store)?;
             if !state3.was_accepted(status_name.as_str()) {
                 let reason = state3
@@ -9364,9 +9413,11 @@ fn cmd_begin(
                     .unwrap_or_else(|| "unknown".into());
                 eprintln!("status update rejected: {reason}");
                 let close = make_reserve_close(actor.clone(), rv_id, None, Timestamp::now());
-                let _ = publish::publish_op(&store, &close);
+                let close_prepared = crate::authority::PreparedOp::new(&close)?;
+                let _ = writer.publish(&close_prepared);
                 let release = make_release(actor, id, None, Timestamp::now());
-                let _ = publish::publish_op(&store, &release);
+                let release_prepared = crate::authority::PreparedOp::new(&release)?;
+                let _ = writer.publish(&release_prepared);
                 return Ok(2);
             }
         }
@@ -9381,7 +9432,8 @@ fn cmd_begin(
             text,
             Timestamp::now(),
         );
-        let _ = publish::publish_op(&store, &note_op);
+        let note_prepared = crate::authority::PreparedOp::new(&note_op)?;
+        let _ = writer.publish(&note_prepared);
     }
 
     // Step 5: optional claim announcement on the source topic, so board readers
@@ -9397,7 +9449,9 @@ fn cmd_begin(
             None,
             Timestamp::now(),
         );
-        let post_name = publish::publish_op(&store, &post_op)?;
+        let post_prepared = crate::authority::PreparedOp::new(&post_op)?;
+        writer.publish(&post_prepared)?;
+        let post_name = ids::OpName::from_string(post_prepared.name)?;
         let state = reducer::replay_store(&store)?;
         if state.was_accepted(post_name.as_str()) {
             eprintln!("announced {post_id} in topic {topic}");

@@ -48,6 +48,65 @@ pub fn enabled(store: &Store) -> bool {
     directory(store).join("00000000000000000000.json").is_file()
 }
 
+/// Read-only description of the shared admission authority.  Callers use this
+/// as a contract boundary, so it validates an enabled store before reporting
+/// it as usable.
+#[derive(Debug, Clone, Serialize)]
+pub struct Status {
+    pub schema: &'static str,
+    pub store_id: String,
+    pub enabled: bool,
+    pub authority_version: u32,
+    pub genesis_digest: Option<String>,
+    pub capabilities: [&'static str; 3],
+}
+
+pub fn status(store: &Store) -> MoteResult<Status> {
+    let format = store.read_format()?;
+    let enabled = enabled(store);
+    let genesis_digest = if enabled {
+        let authority = format.authority.as_ref().ok_or_else(|| {
+            MoteError::Other("authority genesis exists without a FORMAT binding".into())
+        })?;
+        if authority.version != 1 {
+            return Err(MoteError::Other(
+                "unsupported authority format version".into(),
+            ));
+        }
+        // list_op_filenames verifies both the immutable FORMAT binding and
+        // every admitted operation without recovering or changing the store.
+        store.list_op_filenames()?;
+        let digest = blake3::hash(&fs::read(
+            directory(store).join("00000000000000000000.json"),
+        )?)
+        .to_hex()
+        .to_string();
+        if digest != authority.genesis_hash {
+            return Err(MoteError::Other("authority genesis mismatch".into()));
+        }
+        Some(digest)
+    } else {
+        if format.authority.is_some() {
+            return Err(MoteError::Other(
+                "authority format names a missing genesis journal".into(),
+            ));
+        }
+        None
+    };
+    Ok(Status {
+        schema: "mote.authority-status.v1",
+        store_id: format.store_id,
+        enabled,
+        authority_version: u32::from(enabled),
+        genesis_digest,
+        capabilities: [
+            "stable_claim_order",
+            "holder_checked_handoff",
+            "checked_landing_results",
+        ],
+    })
+}
+
 /// Atomically replace a journal and make both its bytes and directory durable.
 pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> MoteResult<()> {
     let parent = path

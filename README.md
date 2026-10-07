@@ -47,6 +47,17 @@ is also source of truth; op files alone are insufficient to restore that store.
 Do not hand-edit op files or journals. Use `mote fsck` or `mote doctor` when you
 suspect storage damage. See [shared-store authority](authority_protocol.md).
 
+Automation can inspect the authority contract without changing the store:
+
+```sh
+mote authority status
+# Deliberate, idempotent activation under the shared local writer lock.
+mote authority enable
+```
+
+Both commands print `mote.authority-status.v1` JSON. `status` is read-only;
+`enable` adds `activated: true` only when it created the authority journal.
+
 Every publisher holds the shared store's OS lock. Its Maildir write steps are:
 
 1. write `tmp/<name>.json` with `O_CREAT|O_EXCL`, fsync the file

@@ -6,7 +6,15 @@ use mote::{
     op::{ScalarSet, make_create, make_note},
     publish, reducer,
 };
+use serde_json::Value;
+use std::process::Command;
 use tempfile::TempDir;
+
+fn command(root: &std::path::Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mote"));
+    command.current_dir(root).args(args);
+    command
+}
 
 #[test]
 fn activation_preserves_prefix_and_admits_late_operations_after_it() {
@@ -71,6 +79,93 @@ fn activation_preserves_prefix_and_admits_late_operations_after_it() {
             .iter()
             .any(|e| e.event_id == note.as_str())
     );
+}
+
+#[test]
+fn status_is_read_only_and_activation_is_idempotent() {
+    let root = TempDir::new().unwrap();
+    let store = Store::init(root.path()).unwrap();
+    let before = authority::status(&store).unwrap();
+    assert_eq!(before.schema, "mote.authority-status.v1");
+    assert!(!before.enabled);
+    assert_eq!(before.authority_version, 0);
+    assert_eq!(before.genesis_digest, None);
+    assert_eq!(
+        before.capabilities,
+        [
+            "stable_claim_order",
+            "holder_checked_handoff",
+            "checked_landing_results",
+        ]
+    );
+    let writer = Writer::acquire(&store).unwrap();
+    writer.enable().unwrap();
+    writer.enable().unwrap();
+    drop(writer);
+    let after = authority::status(&store).unwrap();
+    assert!(after.enabled);
+    assert_eq!(after.authority_version, 1);
+    assert!(after.genesis_digest.is_some());
+}
+
+#[test]
+fn cli_status_is_read_only_enable_is_idempotent_and_begin_activates() {
+    let root = TempDir::new().unwrap();
+    Store::init(root.path()).unwrap();
+    let status = command(root.path(), &["authority", "status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["schema"], "mote.authority-status.v1");
+    assert_eq!(status["enabled"], false);
+    assert!(status["genesis_digest"].is_null());
+
+    let enabled = command(root.path(), &["authority", "enable"])
+        .output()
+        .unwrap();
+    assert!(enabled.status.success(), "{enabled:?}");
+    let enabled: Value = serde_json::from_slice(&enabled.stdout).unwrap();
+    assert_eq!(enabled["enabled"], true);
+    assert_eq!(enabled["activated"], true);
+    let repeated = command(root.path(), &["authority", "enable"])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success(), "{repeated:?}");
+    let repeated: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert!(repeated.get("activated").is_none());
+
+    let begin_root = TempDir::new().unwrap();
+    let begin_store = Store::init(begin_root.path()).unwrap();
+    let issue = ids::new_bead_id();
+    publish::publish_op(
+        &begin_store,
+        &make_create(
+            "alice".into(),
+            issue.clone(),
+            ScalarSet {
+                title: Some("begin".into()),
+                ..Default::default()
+            },
+            Timestamp::now(),
+        ),
+    )
+    .unwrap();
+    let begin = command(
+        begin_root.path(),
+        &[
+            "--actor",
+            "alice",
+            "begin",
+            &issue,
+            "--paths",
+            "src/authority.rs",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(begin.status.success(), "{begin:?}");
+    assert!(authority::status(&begin_store).unwrap().enabled);
 }
 
 #[test]

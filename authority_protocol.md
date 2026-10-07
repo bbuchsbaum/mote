@@ -7,6 +7,31 @@ and a local filesystem with working POSIX file locks. It is not a distributed
 consensus protocol or an authentication system. Actor names remain attributable
 strings, as in the candidate protocol.
 
+## Authority discovery and activation
+
+Automation can validate the local authority without activating or recovering it:
+
+```sh
+mote authority status
+```
+
+It prints `mote.authority-status.v1` JSON with `store_id`, `enabled`,
+`authority_version` (`0` or `1`), `genesis_digest`, and the capabilities
+`stable_claim_order`, `holder_checked_handoff`, and
+`checked_landing_results`. Enabled status validates the immutable admission
+prefix but does not acquire a writer lock, recover journals, or mutate the
+store. To activate deliberately, use the idempotent writer operation:
+
+```sh
+mote authority enable
+```
+
+`mote begin` activates under the same local writer lock after validating its
+arguments and before making its first reservation timestamp or reading claim
+state. Direct library publication against an unactivated store retains legacy
+filename ordering and is provisional; strict callers must activate or use an
+upgraded writer first.
+
 ## Publication and replay
 
 Every in-tree publisher, including library and server writers, takes an exclusive
@@ -79,8 +104,12 @@ journal path, exact `old_oid`, `new_oid`, and `current_oid`, and `git_updated=tr
 when the update is established. An indeterminate Git outcome uses
 `git_updated=null` and `git_updated_unknown=true`; it is never described as an
 unchanged-ref abort. A failed cleanup also returns nonzero, even after a confirmed
-landing. A retry reports the original result and current ref without updating it
-again. Preserve journals and reflogs until recovery finishes.
+landing. While a matching active journal remains, the retry is a
+`current_completion` and can succeed only after cleanup and an exact current-ref
+observation. Once only the archive remains, the retry is an `archived_receipt`:
+it reports `historically_confirmed` and the current ref without updating Git
+again. A cleanup or drift error retained in that archive remains nonzero.
+Preserve journals and reflogs until recovery finishes.
 
 `candidate show` and `candidate list` include `landability_actor` and evaluate a
 selected actor's grantee eligibility. A null actor identifies a generic policy
