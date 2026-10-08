@@ -1,0 +1,12 @@
+{
+  "AGENT_GUIDE.md": "33fcca1f60d218eb5d82ab5f31539d661fc12eb3eb92c16dff37d03ca0215901",
+  "VALIDATION.md": "48d3a72379dd4d93830f8c1d0c1f7cd54e3d0e08096a4de9536d227b79e9d6e4",
+  "agent-protocol.md": "7f712ee1038667c2106fd08c6c1aae6a49a3ffbf971dadb12b731562dfbb549a",
+  "architecture.md": "996145eef98d3a3cbe3eda3e6c8b4701b7b5abaea7982604dcb0f1619e32a066",
+  "checks/validate_run_plan.py": "5ac0ec5c299cb51f6312d173904fde42f85f7e17f1b18c63c9fc64582e66b5f5",
+  "decisions-and-migration.md": "25cd53abe63672c94fd7c8442f221ca648379bd31b4e153d184a66514e8ae4b4",
+  "implementation-plan.md": "2822de884af01f2bb627c4b418ac780b6627316e51a4cef0d2f5a025040d7621",
+  "mote-run-audit.md": "86e05cd1a30650c0ddb00a1bdb86bd8d50e994818eeaf7383b80e4496f5529fb",
+  "mote-run-prd.md": "8d31120cda421d1230055c92deae9771141af49c4721413cbd30672041e7e659",
+  "plan.json": "e18f10b88c10fa9ee9833ee64a3b47624aaa64238410a3f60693cc857a223669"
+}

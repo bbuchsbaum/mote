@@ -1,0 +1,785 @@
+{
+  "schema_version": 1,
+  "title": "Mote Run implementation plan",
+  "date": "2026-09-19",
+  "status": "proposed",
+  "source_head": "a790ca63dccacec3c68e696e980f965721a89130",
+  "planning_issue": "bd-01M2XNBKHQQA3BF05GF8CY9F65",
+  "scope": "Planning only. Task IDs below are stable design IDs, not imported Mote issues or execution authorization.",
+  "first_workload": "Code changes in one repository, selected by the user on 2026-09-19.",
+  "objective": "Complete one contracted task with recoverable execution, explicit resource assurance and independent exact-artifact acceptance.",
+  "exclusions": [
+    "No new task graph or generic workflow language",
+    "No model/provider activation from examples",
+    "No automatic Git integration in the first usable pilot",
+    "No parallel workers, automatic lessons, cross-provider routing or acceptance-grade cache transfer in the initial release"
+  ],
+  "execution_rules": [
+    "Recheck source, installed binary and applicable Mote review gates at implementation time; this plan does not qualify the current release.",
+    "Create or reuse one Mote issue per implementable slice when work starts, preserving MR IDs in tags/body. Use nonblocking parent relations for organization and dependency edges only for real prerequisites.",
+    "Before each edit, check and reserve exact paths. Do broad implementation in an isolated checkout when the shared checkout is dirty.",
+    "Every task below starts planned. Attach exact source/artifact identities, commands and failure cases before marking implementation complete.",
+    "MR-01 through MR-09 form the initial code path. MR-05 and MR-06 can proceed independently after MR-04; this is a dependency property, not an instruction to launch agents.",
+    "After each stage, retain failed cases and release claims. Stop dependent rollout on a failed gate rather than reducing assurance labels or acceptance requirements.",
+    "Run focused tests for each slice and the repository-required Rust fmt, strict clippy and all-target/all-feature tests for the integrated implementation. Run web checks only if web code changes.",
+    "No current production acceptance is inferred from historical tracker closure or a bare successful CLI exit."
+  ],
+  "requirements": [
+    "R-01",
+    "R-02",
+    "R-03",
+    "R-04",
+    "R-05",
+    "R-06",
+    "R-07",
+    "R-08",
+    "R-09",
+    "R-10",
+    "R-11",
+    "R-12",
+    "R-13",
+    "R-14",
+    "R-15",
+    "R-16",
+    "R-17",
+    "R-18",
+    "R-19",
+    "R-20",
+    "R-21",
+    "R-22",
+    "R-23",
+    "R-24"
+  ],
+  "stages": [
+    {
+      "id": "S0",
+      "title": "Freeze the small executable contract",
+      "gate": "Agree on the code-first slice, trust boundary and versioned minimal exchanges; distinguish unavailable historical files from current validation."
+    },
+    {
+      "id": "S1",
+      "title": "Complete the nonbillable loop",
+      "gate": "A fake task survives success, failure, a stale guard, a lost reply and a controller restart with exactly one logical launch and zero model calls."
+    },
+    {
+      "id": "S2",
+      "title": "Qualify one sequential execution path",
+      "gate": "One real harness passes process, access, accounting and cancellation conformance under explicitly stated assurance; no unattended use before its boundary passes."
+    },
+    {
+      "id": "S3",
+      "title": "Deliver independently accepted candidates",
+      "gate": "Protected checks and independent roles accept the exact candidate; failures/checkpoints remain explicit; manual integration is reconciled before any landing-required task completes."
+    },
+    {
+      "id": "S4",
+      "title": "Extend outcomes and measure product value",
+      "gate": "Each extension passes its own gate. Freeze and run paired evaluation before claiming economic gains or optimizing provider choice."
+    },
+    {
+      "id": "S5",
+      "title": "Add only measured optimizations",
+      "gate": "Additional profiles, lessons and view/cache optimization are individually qualified; none can change authority or success criteria."
+    },
+    {
+      "id": "S6",
+      "title": "Qualify bounded concurrency",
+      "gate": "Concurrent launches cannot oversubscribe resources, duplicate owned execution or bypass serialized integration; sequential mode remains a supported fallback."
+    }
+  ],
+  "milestones": [
+    {
+      "id": "M1",
+      "title": "Nonbillable demonstrator",
+      "requires": [
+        "MR-04"
+      ],
+      "claim": "Runnable fake observe-to-evidence loop; no real-provider or sandbox assurance."
+    },
+    {
+      "id": "M2",
+      "title": "First usable code pilot",
+      "requires": [
+        "MR-09"
+      ],
+      "claim": "Sequential qualified execution and independent candidate acceptance, with explicit external manual landing."
+    },
+    {
+      "id": "M3",
+      "title": "Automatic local integration",
+      "requires": [
+        "MR-10"
+      ],
+      "claim": "Exact authorized fast-forward into a controller-owned target with crash reconciliation; remote publication remains separately configured."
+    },
+    {
+      "id": "M4",
+      "title": "Analysis workflow",
+      "requires": [
+        "MR-11"
+      ],
+      "claim": "Independent exact-artifact acceptance without synthetic commits; separately piloted."
+    },
+    {
+      "id": "M5",
+      "title": "Measured ergonomics and economics",
+      "requires": [
+        "MR-12"
+      ],
+      "claim": "Report the observed comparison, including failure/human costs; an inconclusive result grants no optimization claim."
+    }
+  ],
+  "tasks": [
+    {
+      "id": "MR-01",
+      "title": "Freeze core exchanges and the contract model",
+      "stage": "S0",
+      "depends_on": [],
+      "requirements": [
+        "R-01",
+        "R-04",
+        "R-09",
+        "R-19",
+        "R-22"
+      ],
+      "outcome": "A minimal versioned design that the fake and real implementations can both satisfy.",
+      "touchpoints": [
+        "docs/architecture.md",
+        "docs/agent-protocol.md",
+        "docs/schemas/ (new)",
+        "docs/fixtures/ (new)",
+        "src/run/types.rs (new)",
+        "src/run/contract.rs (new)"
+      ],
+      "deliverables": [
+        "Strict types/schema for contract, situation, ticket, action result, receipt and resource assurance.",
+        "Task binding CAS, role mapping, parent counters, completion semantics and canonical idempotency payload definition.",
+        "Positive/negative fixtures and traceability to the initial subset of PRD requirements."
+      ],
+      "acceptance": [
+        "Missing or unknown critical authority/budget fields and unsupported versions are rejected.",
+        "Historical assertions, stale evidence and missing inputs cannot satisfy an obligation.",
+        "Document which PRD features are deferred; preserve current tracker/candidate wire behavior."
+      ],
+      "falsifiers": [
+        "A worker-provided actor or ticket grants authorizer privilege.",
+        "Changing a contract resets parent spending or attempt limits."
+      ],
+      "release_blockers": []
+    },
+    {
+      "id": "MR-02",
+      "title": "Build the durable journal and artifact substrate",
+      "stage": "S1",
+      "depends_on": [
+        "MR-01"
+      ],
+      "requirements": [
+        "R-06",
+        "R-08",
+        "R-10",
+        "R-11",
+        "R-19",
+        "R-20"
+      ],
+      "outcome": "Actions and coupled reservations survive crashes, and referenced bytes remain verifiable.",
+      "touchpoints": [
+        "src/run/journal.rs (new)",
+        "src/run/artifacts.rs (new)",
+        "tests/run_journal.rs (new)"
+      ],
+      "deliverables": [
+        "Single-writer local domain lock and versioned append-only transactions with replayable indices.",
+        "Atomic action/launch-intent/resource reservation and durable outbox identity.",
+        "Immutable objects/manifests, pinning, integrity and sensitivity-aware retrieval; no automatic GC."
+      ],
+      "acceptance": [
+        "Crash every write boundary; recover one committed intent or an explicit unresolved state, never a duplicate refund/launch.",
+        "Missing sequence, corrupt committed record and missing artifact fail closed without erasing historical evidence.",
+        "Same intent/key replays; different intent/key reuse rejects; revoked callers cannot retrieve protected results."
+      ],
+      "falsifiers": [
+        "Controller restart drops unsettled liability.",
+        "Corrupt evidence is replaced by a similarly named current file."
+      ],
+      "release_blockers": []
+    },
+    {
+      "id": "MR-03",
+      "title": "Implement situations and one admission evaluator",
+      "stage": "S1",
+      "depends_on": [
+        "MR-01",
+        "MR-02"
+      ],
+      "requirements": [
+        "R-02",
+        "R-03",
+        "R-04",
+        "R-05",
+        "R-07",
+        "R-13",
+        "R-14",
+        "R-15",
+        "R-21"
+      ],
+      "outcome": "One passive observation explains a scoped task and its genuinely admissible alternatives.",
+      "touchpoints": [
+        "src/run/situation.rs (new)",
+        "src/run/admission.rs (new)",
+        "src/state.rs (reuse APIs)",
+        "src/events.rs (reuse APIs)",
+        "tests/run_situation.rs (new)"
+      ],
+      "deliverables": [
+        "Full situation snapshots with declared basis/omissions and bounded inspect.",
+        "Shared typed admission result for preview, explanation and execution.",
+        "Dependency guards, semantic view cursor, expiry-aware bounded waiting and structured errors."
+      ],
+      "acceptance": [
+        "Same basis/principal/policy produces identical preview and execution reasons.",
+        "Contract or permission changes invalidate affected tickets; unrelated notes do not.",
+        "Required-context overflow blocks honestly; pinned inspect reads exact bytes.",
+        "Observe/inspect/wait produce no ops, renewals, external probes or inference calls; late Mote operations surface contradictions."
+      ],
+      "falsifiers": [
+        "Every timestamp tick wakes an agent.",
+        "A passive status request repairs the journal or acknowledges a message."
+      ],
+      "release_blockers": []
+    },
+    {
+      "id": "MR-04",
+      "title": "Ship the complete fake-runner vertical slice",
+      "stage": "S1",
+      "depends_on": [
+        "MR-02",
+        "MR-03"
+      ],
+      "requirements": [
+        "R-01",
+        "R-06",
+        "R-08",
+        "R-11",
+        "R-13",
+        "R-14",
+        "R-22",
+        "R-24"
+      ],
+      "outcome": "A user can exercise observe, inspect, propose, act, wait and recovery without credentials or spending.",
+      "touchpoints": [
+        "src/run/controller.rs (new)",
+        "src/run/adapter.rs (new)",
+        "src/cli.rs (thin dispatch)",
+        "src/lib.rs",
+        "tests/run_fake.rs (new)",
+        "tests/help_all.rs"
+      ],
+      "deliverables": [
+        "Fake adapter with controlled time, outcomes, process handles and usage events.",
+        "mote run commands backed by the same kernel; no production profiles enabled.",
+        "A reproducible regression-repair fixture with success, failed check, cancellation and unknown launch."
+      ],
+      "acceptance": [
+        "Lost reply and restart return the existing action and preserve evidence/usage state.",
+        "Stale guard launches nothing; unknown launch prevents replacement.",
+        "One observation plus targeted inspection reconstructs the fixture after cold start.",
+        "Existing command discovery, JSON envelopes and standalone tracker regression checks remain valid."
+      ],
+      "falsifiers": [
+        "A fake pass is displayed as real-profile qualification.",
+        "Success depends on retaining the original conversation."
+      ],
+      "release_blockers": []
+    },
+    {
+      "id": "MR-05",
+      "title": "Prove worker isolation and process recovery",
+      "stage": "S2",
+      "depends_on": [
+        "MR-04"
+      ],
+      "requirements": [
+        "R-09",
+        "R-11",
+        "R-19",
+        "R-21",
+        "R-24"
+      ],
+      "outcome": "One tested environment contains untrusted repository execution and surviving children.",
+      "touchpoints": [
+        "src/run/controller.rs",
+        "src/run/recovery.rs (new)",
+        "src/run/execution.rs (new)",
+        "tests/run_boundary.rs (new)"
+      ],
+      "deliverables": [
+        "A time-bounded platform spike selecting an enforceable sandbox/VM/OS boundary.",
+        "Attempt-isolated workspaces and recoverable owned launch identity.",
+        "Trusted adapter separation from repository tools, scoped worker API and documented assurance matrix."
+      ],
+      "acceptance": [
+        "Host/control files, policy/check definitions and credentials cannot be read or modified from repository commands.",
+        "Out-of-path writes, symlink escapes, nested model launches and inherited credential/network routes are denied under the claimed boundary.",
+        "Kill controller around spawn; successor contains or identifies old execution before replacement.",
+        "Prove child containment, reused-PID refusal, cancellation grace/fallback and sleep/resume behavior."
+      ],
+      "falsifiers": [
+        "A private directory or actor name is the only credential protection.",
+        "An old worker still writes after a successor treats it as fenced."
+      ],
+      "release_blockers": [
+        "No unattended real-worker rollout if the selected environment cannot enforce the required boundary."
+      ]
+    },
+    {
+      "id": "MR-06",
+      "title": "Implement parent budgets and unsettled accounting",
+      "stage": "S2",
+      "depends_on": [
+        "MR-04"
+      ],
+      "requirements": [
+        "R-06",
+        "R-10",
+        "R-13",
+        "R-18",
+        "R-24"
+      ],
+      "outcome": "Admission respects explicit resource guarantees and preserves uncertain liability.",
+      "touchpoints": [
+        "src/run/budget.rs (new)",
+        "src/run/profile.rs (new)",
+        "tests/run_budget.rs (new)"
+      ],
+      "deliverables": [
+        "Integer/unit-aware account, run, task and attempt ledger.",
+        "Raw usage observations and exactly-once normalization/partial settlement.",
+        "Separate assurance for observed usage, execution limits and strict per-request monetary control."
+      ],
+      "acceptance": [
+        "Duplicate/out-of-order cumulative and delta events cannot double count or refund twice.",
+        "Missing usage, local cancellation and provider timeout retain conservative liability.",
+        "Consultation/review/repair and infrastructure retries share parent ceilings and declared counters.",
+        "Unknown tariffs or unbounded request charges reject hard-bound admission; other account users are outside any local guarantee."
+      ],
+      "falsifiers": [
+        "Absent telemetry counts as zero.",
+        "A profile switch or contract revision renews the budget."
+      ],
+      "release_blockers": [
+        "Real paid conformance requires explicit account authorization and verified current tariff/charge bounds."
+      ]
+    },
+    {
+      "id": "MR-07",
+      "title": "Qualify one native harness adapter",
+      "stage": "S2",
+      "depends_on": [
+        "MR-05",
+        "MR-06"
+      ],
+      "requirements": [
+        "R-08",
+        "R-09",
+        "R-10",
+        "R-11",
+        "R-18",
+        "R-19",
+        "R-24"
+      ],
+      "outcome": "Exactly one real implementation route can be admitted at its proved assurance level.",
+      "touchpoints": [
+        "src/run/adapter/ (new)",
+        "docs/profiles/ (new)",
+        "tests/run_adapter_conformance.rs (new)"
+      ],
+      "deliverables": [
+        "Probe/start/observe/cancel/recover contract over a pinned harness/configuration.",
+        "Dated official-source profile record for actual model/auth/tool/price semantics; secrets external.",
+        "Recorded adapter fixtures plus small explicitly authorized live conformance evidence."
+      ],
+      "acceptance": [
+        "Inspect installed behavior and official current documentation before choosing the profile; examples do not enable it.",
+        "Verify effective model/configuration, bounded native tools, process recovery and usage semantics.",
+        "Cross-session recovery needs pinned artifacts/manifests, not private reasoning or raw transcripts.",
+        "Provider loss/checkpoint resumes only under the existing parent envelope; native delegation stays disabled."
+      ],
+      "falsifiers": [
+        "The harness reports cancellation while children or unknown provider effects are silently forgotten.",
+        "A model alias is recorded as an immutable vendor version."
+      ],
+      "release_blockers": [
+        "MR-05 boundary and MR-06 required assurance must pass for this exact adapter/auth mode."
+      ]
+    },
+    {
+      "id": "MR-08",
+      "title": "Bridge protected verification to current candidate semantics",
+      "stage": "S3",
+      "depends_on": [
+        "MR-07"
+      ],
+      "requirements": [
+        "R-01",
+        "R-04",
+        "R-09",
+        "R-12",
+        "R-17",
+        "R-20",
+        "R-21"
+      ],
+      "outcome": "Submitted source becomes a verifiable exact candidate with independent roles and no automatic landing.",
+      "touchpoints": [
+        "src/run/acceptance.rs (new)",
+        "src/run/mote_bridge.rs (new)",
+        "src/candidate.rs (reuse APIs)",
+        "src/state.rs (reuse APIs)",
+        "tests/run_acceptance.rs (new)"
+      ],
+      "deliverables": [
+        "Protected check executor and complete source/diff manifest import.",
+        "Trusted-principal to Mote-actor bridge, current portable proposal/target-scope evidence and independent review workflow.",
+        "Inventory of applicable core implementation/review gates and exact selected baseline evidence."
+      ],
+      "acceptance": [
+        "Worker test/policy edits, untracked files, deletion, rename, symlink and Git-hook tricks cannot evade protected acceptance.",
+        "Implementer cannot review or authorize itself; preserve current reviewer/authorizer separation.",
+        "A rewritten candidate cannot inherit review/authorization; unavailable or ambiguous checks never pass.",
+        "Use current candidate landability and target-scope checks; retain late-conflict incidents.",
+        "Reconcile the applicable open core gates against exact current source/binary rather than relying on stale issue status."
+      ],
+      "falsifiers": [
+        "A hand-written candidate evidence op is automatically trusted as runner-verifier output.",
+        "The visible diff excludes files affecting the actual landing target."
+      ],
+      "release_blockers": [
+        "Requalify applicable recovery/evidence identity/target-scope/provenance work before claiming release-grade acceptance."
+      ]
+    },
+    {
+      "id": "MR-09",
+      "title": "Run the first sequential code pilot",
+      "stage": "S3",
+      "depends_on": [
+        "MR-08"
+      ],
+      "requirements": [
+        "R-02",
+        "R-07",
+        "R-08",
+        "R-12",
+        "R-13",
+        "R-14",
+        "R-15",
+        "R-24"
+      ],
+      "outcome": "A small representative set yields accepted candidates or useful explicit checkpoints after restart.",
+      "touchpoints": [
+        "docs/run-pilot/ (new)",
+        "docs/AGENT_GUIDE.md",
+        "AGENTS.md (conditional installed-managed-mode guidance)",
+        "tests/run_end_to_end.rs (new)"
+      ],
+      "deliverables": [
+        "Operator quickstart and installation/assurance requirements; human controls compose the same kernel.",
+        "Pilot receipt bundle covering ordinary repair, failed check, missing input, interruption, lost reply, permission revocation and exhausted budget.",
+        "Manual landing handoff and exact observation path for contracts requiring integration."
+      ],
+      "acceptance": [
+        "Independent review accepts exact artifacts; request acceptance/process exit/task acceptance remain distinguishable.",
+        "Manual landing is stated as outstanding until observed; no managed completion is manufactured from an ordinary close.",
+        "Status, waiting and mechanical continuation make zero model calls.",
+        "Publish all pilot failures, checkpoints, usage uncertainty and human interventions; no economic victory claim yet."
+      ],
+      "falsifiers": [
+        "The cold-start operator needs transcript archaeology.",
+        "The pilot silently drops tasks that exceeded budget."
+      ],
+      "release_blockers": [
+        "Every enabled profile must have current conformance; retained unknown effects block replacements."
+      ]
+    },
+    {
+      "id": "MR-10",
+      "title": "Add serialized exact-commit integration",
+      "stage": "S4",
+      "depends_on": [
+        "MR-09"
+      ],
+      "requirements": [
+        "R-06",
+        "R-09",
+        "R-11",
+        "R-12",
+        "R-21"
+      ],
+      "outcome": "An authorized candidate can fast-forward a controller-owned target with recoverable Git/Mote effects.",
+      "touchpoints": [
+        "src/run/integration.rs (new)",
+        "src/run/mote_bridge.rs",
+        "tests/run_landing_crashes.rs (new)"
+      ],
+      "deliverables": [
+        "Journaled integration intent, expected-old-OID Git operation and exact landing receipts.",
+        "Controller-owned target/workspace policy; remote push separately configured and authorized.",
+        "Incident and reconciliation flow for Git success followed by log failure or external target movement."
+      ],
+      "acceptance": [
+        "Inject failure before/after ref mutation and before/after Mote publication; never duplicate effects or infer atomicity.",
+        "Refresh target scope and authorization; rewrite requires a successor candidate.",
+        "Refuse shared dirty/checked-out user target mutation and all force/reset rollback paths.",
+        "Out-of-band landing remains distinct from governed landing; late contradictions remain visible."
+      ],
+      "falsifiers": [
+        "A successful Git operation closes the task without current landing evidence.",
+        "Target movement is repaired by silently rebasing an approved commit."
+      ],
+      "release_blockers": [
+        "Applicable core candidate review/release gates must be independently discharged for the pinned baseline."
+      ]
+    },
+    {
+      "id": "MR-11",
+      "title": "Add independent analysis-artifact acceptance",
+      "stage": "S4",
+      "depends_on": [
+        "MR-07"
+      ],
+      "requirements": [
+        "R-04",
+        "R-08",
+        "R-09",
+        "R-12",
+        "R-19",
+        "R-20"
+      ],
+      "outcome": "A scientific task can be accepted against exact inputs and outputs without a synthetic code commit.",
+      "touchpoints": [
+        "src/run/contract.rs",
+        "src/run/acceptance.rs (analysis path)",
+        "tests/run_analysis.rs (new)",
+        "docs/run-pilot/analysis.md (new)"
+      ],
+      "deliverables": [
+        "Typed estimand, unit, data manifest, preprocessing, split/exclusion/missingness, seed and tolerance contract.",
+        "Independent artifact receipts and protected evaluation fixture access.",
+        "Separate analysis pilot with no hidden dependence on code-candidate completion."
+      ],
+      "acceptance": [
+        "Missing outputs and missing coverage fail; numerical tolerances and denominators stay frozen.",
+        "Independent reference calculations catch a plausible but wrong result.",
+        "Held-out answers never enter worker context or lessons; sanitation retains provenance.",
+        "Artifact, environment or input drift invalidates applicability without rewriting historical results."
+      ],
+      "falsifiers": [
+        "A successful scheduler/process exit substitutes for validated output.",
+        "Repeated attempts use leaked evaluation answers."
+      ],
+      "release_blockers": [
+        "If analysis becomes the first workload, complete this path and its pilot before claiming first usable release; MR-09 alone is insufficient."
+      ]
+    },
+    {
+      "id": "MR-12",
+      "title": "Freeze and run the paired product evaluation",
+      "stage": "S4",
+      "depends_on": [
+        "MR-09"
+      ],
+      "requirements": [
+        "R-02",
+        "R-07",
+        "R-10",
+        "R-14",
+        "R-18",
+        "R-23",
+        "R-24"
+      ],
+      "outcome": "Evidence separates interface value from model substitution and counts the whole workflow.",
+      "touchpoints": [
+        "evaluation/run/ (new)",
+        "docs/run-evaluation.md (new)"
+      ],
+      "deliverables": [
+        "Preregistered matched same-profile flat-CLI versus situation-interface protocol.",
+        "Frozen acceptance criteria, severity-based defect rubric, quality noninferiority margin and minimum worthwhile economic change.",
+        "Paired task results, all failures, confidence/uncertainty, contamination controls and human-time accounting."
+      ],
+      "acceptance": [
+        "Freeze thresholds before outcomes are viewed; do not choose them post hoc.",
+        "Include all assigned tasks and all construction, check, review, repair and maintenance costs.",
+        "Report acceptance fraction, escaped defects and resources per assigned task; report total resources divided by accepted outcomes with failed-task spending in the numerator.",
+        "Use paired/randomized order or fresh task variants; keep evaluator answers and future lessons separate.",
+        "A 30–50-task pilot reports limited precision and cannot certify rare-defect parity; inconclusive economics blocks benefit claims, not honest reliability reporting."
+      ],
+      "falsifiers": [
+        "Only successful runs enter the cost denominator.",
+        "Changing models between conditions is called an interface improvement."
+      ],
+      "release_blockers": [
+        "No empirical routing or promoted-lesson rollout justified solely by the aspirational 50% frontier reduction."
+      ]
+    },
+    {
+      "id": "MR-13",
+      "title": "Qualify a second profile and deterministic routing",
+      "stage": "S5",
+      "depends_on": [
+        "MR-12"
+      ],
+      "requirements": [
+        "R-08",
+        "R-09",
+        "R-10",
+        "R-18",
+        "R-19"
+      ],
+      "outcome": "Provider choice has a measured, inspectable basis within unchanged authority and quality policy.",
+      "touchpoints": [
+        "src/run/profile.rs",
+        "src/run/adapter/",
+        "evaluation/run/",
+        "docs/profiles/"
+      ],
+      "deliverables": [
+        "Second profile conformance under the same job/assurance contract.",
+        "Task-class eligibility table and deterministic policy selection.",
+        "Cross-provider artifact/context handoff and drift invalidation."
+      ],
+      "acceptance": [
+        "Privacy, capability, independence and assurance filter eligibility before cost selection.",
+        "Held-out stratified comparisons include review, repair, failures and human cost.",
+        "Fail provider/qualification and prove no silent forbidden fallback or parent-budget reset."
+      ],
+      "falsifiers": [
+        "Raw acceptance totals across unequal workloads determine the preferred model.",
+        "Subscription headroom is treated as freely exchangeable API money."
+      ],
+      "release_blockers": [
+        "One independently qualified route remains available; otherwise checkpoint."
+      ]
+    },
+    {
+      "id": "MR-14",
+      "title": "Qualify selective lesson reuse",
+      "stage": "S5",
+      "depends_on": [
+        "MR-12"
+      ],
+      "requirements": [
+        "R-04",
+        "R-16",
+        "R-19",
+        "R-20",
+        "R-23"
+      ],
+      "outcome": "Only independently supported, applicable knowledge enters later context automatically.",
+      "touchpoints": [
+        "src/run/lessons.rs (new)",
+        "src/run/situation.rs",
+        "evaluation/run/lessons/ (new)"
+      ],
+      "deliverables": [
+        "Proposed/promoted/retired lifecycle with separate applicability, provenance, sensitivity and invalidators.",
+        "Small lexical/path/tag retrieval and contradiction display.",
+        "Held-out ablation including promotion/maintenance costs and misleading retrieval."
+      ],
+      "acceptance": [
+        "Retirement, counterexample and source drift prevent future automatic inclusion.",
+        "A lesson never changes policy, authority or the active contract.",
+        "No mandatory summarizer; failed lessons remain auditable and evaluation material stays protected.",
+        "Predefined benefit threshold and error limits must pass before default-on inclusion."
+      ],
+      "falsifiers": [
+        "Several summaries of one source count as independent corroboration.",
+        "A retired instruction persists in cached context."
+      ],
+      "release_blockers": [
+        "Unmeasured or harmful retrieval stays disabled."
+      ]
+    },
+    {
+      "id": "MR-15",
+      "title": "Qualify two-worker execution",
+      "stage": "S6",
+      "depends_on": [
+        "MR-10",
+        "MR-13"
+      ],
+      "requirements": [
+        "R-05",
+        "R-06",
+        "R-09",
+        "R-10",
+        "R-11",
+        "R-21",
+        "R-24"
+      ],
+      "outcome": "Two bounded workers share resources safely while integration remains serialized.",
+      "touchpoints": [
+        "src/run/controller.rs",
+        "src/run/budget.rs",
+        "src/run/integration.rs",
+        "tests/run_concurrency.rs (new)"
+      ],
+      "deliverables": [
+        "Explicit worker slots, scoped ownership and parent/domain resource reservations.",
+        "Failure-injection tests with competing controllers, late Mote operations and overlapping tasks.",
+        "Sequential fallback and measured comparison with the same workload."
+      ],
+      "acceptance": [
+        "No duplicate launch or oversubscribed managed budget during controller death/recovery races.",
+        "Observed conflicting reservation blocks acceptance and contains affected work.",
+        "One frontier execution at most under the initial policy; native children stay accounted.",
+        "Concurrency must improve the frozen metric without worsening the acceptance floor."
+      ],
+      "falsifiers": [
+        "A lease expiring allows a replacement while the original worker continues.",
+        "Shared-account limits are claimed across unregistered controllers."
+      ],
+      "release_blockers": [
+        "Do not enable concurrency to mask poor single-worker economics or unresolved recovery."
+      ]
+    },
+    {
+      "id": "MR-16",
+      "title": "Optimize views and evidence reuse conservatively",
+      "stage": "S5",
+      "depends_on": [
+        "MR-12"
+      ],
+      "requirements": [
+        "R-05",
+        "R-07",
+        "R-17",
+        "R-20",
+        "R-22"
+      ],
+      "outcome": "Reduced context and redundant computation preserve exact provenance and dependency correctness.",
+      "touchpoints": [
+        "src/run/situation.rs",
+        "src/run/acceptance.rs",
+        "tests/run_reuse.rs (new)"
+      ],
+      "deliverables": [
+        "Exact-base deltas and explicit full-view recovery.",
+        "Complete check-input/environment closure and freshness rules where knowable.",
+        "Fresh candidate-bound receipts under an explicitly reviewed equivalence rule."
+      ],
+      "acceptance": [
+        "Wrong/missing delta base forces a full view; revocations and contradictions survive compaction.",
+        "Unknown dependency closure forbids acceptance-grade reuse.",
+        "Mutate source, check, environment, seed, policy and external dependency independently; affected reuse rejects.",
+        "No review or authorization transfers to a rewritten candidate."
+      ],
+      "falsifiers": [
+        "A matching file name or patch shape transfers an old pass.",
+        "The cached summary loses an uncertainty or required constraint."
+      ],
+      "release_blockers": [
+        "Keep exact-attempt reuse only if complete closure cannot be established."
+      ]
+    }
+  ]
+}
