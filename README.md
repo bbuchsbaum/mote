@@ -383,11 +383,14 @@ mote session renew --ttl 2h
 # Compounds (each is a sequence of single-mutation ops with compensation on partial failure).
 mote begin   bd-... --paths src/auth/ --note "taking auth"
 mote begin   bd-... --paths src/auth/ --announce planning  # also post the claim
+mote begin   bd-... --note "no files to reserve"            # claim + doing only
+mote next    --tag parser --ttl 30m   # claim the top ready bead; exit 5 if none
+mote next    --resume                 # restarted worker: own unfinished work first
 mote handoff bd-... --to bob --note "tests remain" --release
 # Automation binds the originally observed claim and supplies a retry key:
 mote --json handoff bd-... --to bob --expect-holder alice \
   --expect-claim CLAIM_OP --idempotency-key handoff-1
-mote done    bd-... --note "shipped"
+mote done    bd-... --note "shipped"   # exit 2 if another actor holds it; --force overrides
 mote board
 mote in-flight            # sessions, reservations, doing work, topics, candidates
 
@@ -725,12 +728,72 @@ generic actor names like `claude` or `agent`. It does not infer concurrency from
 process ids — every mote invocation is its own process, so that would flag
 ordinary sequential use.
 
-When separate Git worktrees should coordinate through one store, also export
-the same store root or its parent in both terminals:
+Linked Git worktrees coordinate through the main worktree's store by default.
+When `.mote/` is tracked in Git, every linked worktree carries a copy of it;
+discovery recognizes that copy by its `store_id` and resolves to the main
+worktree's store instead, so claims made in a worktree are visible everywhere.
+A worktree with no `.mote/` of its own also resolves to the main one, and a
+worktree store with a different `store_id` is treated as deliberately separate.
+`mote init` in such a worktree reports the shared store instead of creating a
+second one (`--separate` creates an independent store on purpose), and an
+explicit `--store`/`MOTE_STORE` still keeps the worktree's own identity.
+`mote doctor` reports the redirect and warns when the bypassed copy holds ops
+the shared store lacks (written by an older client). Actor identity stays with
+the checkout: `mote actor set` in a worktree writes the copy's `local/actor`,
+or the worktree's Git admin directory when it has no `.mote/`, never the main
+checkout's file. This also holds for worktrees nested inside the main checkout
+(for example `.claude/worktrees/<name>`), which reach the main store by walking
+up: such a worktree starts with no local identity, so set `MOTE_ACTOR` or run
+`mote actor set` there rather than inheriting the main checkout's name. `--store` and
+`MOTE_STORE` are always taken literally; set them to be explicit:
 
 ```sh
 export MOTE_STORE=/path/to/main-checkout/.mote
 ```
+
+Claims made while `MOTE_SESSION` names a live session are bound to that
+session. Another process under the same actor name cannot renew such a claim
+while the session lives (exit 2, naming the holding session); after the session
+ends or expires, any session of that actor may take it over. A session-bound
+claim lives at least as long as its session: its lease starts at no less than
+the session's lease, each accepted heartbeat extends both, and `session end`
+ends the session's claims at once, so in-progress work shows as stranded
+instead of staying held. Long-running sessions therefore need no separate claim
+renewal. The flip side: if a worker crashes without `session end`, its claims
+stay held until the session lease runs out, so crash-recovery latency equals the
+session TTL (four hours by default). Unattended loops should start short
+sessions and heartbeat them, for example `mote session start --as w1 --ttl 15m`
+plus a periodic `mote session heartbeat`; `claim --ttl` notes when the session
+lease outlives the requested TTL. `release`, `handoff`, `done`, and `close`
+refuse (exit 2) work bound to another live session of the same actor; from a
+shell without `MOTE_SESSION`, pass `--force` deliberately. Sessionless claims
+keep the old same-actor renewal behavior, with a warning when live sessions
+already share the actor. Session-bound claims are written as claim `v: 2`,
+and the first one raises the store's authority format version to 2 in
+`FORMAT.json`. Binaries that understand only authority version 1 then refuse
+the store ("unsupported authority format version") instead of replaying those
+claims without their session binding. Binaries that predate the authority
+journal cannot be fenced this way; upgrade every writer sharing a store
+together. The fence is raised as soon as a session-bound claim is published,
+even if the reducer then rejects it (for example a stale session).
+
+### Stranded work
+
+A bead left in `doing` with no live claim — released, expired, or never
+claimed — is *stranded*. It keeps its `doing` status for history, but `mote
+ready`, `ls --ready`, and `mote next` offer released or expired work again so
+unattended loops do not lose it. `ready --json` carries
+`stranded: {reason, last_holder, since_ts}` (`null` for ordinary open work), and
+`board`, `in-flight`, and `doctor` list every stranded bead.
+
+A bead is not stranded while its last holder still shows signs of life: a live
+reservation by that holder on the bead, or a still-live session the expired
+claim was bound to. Claim leases default to 30 minutes and sessions do not
+renew claims, so lease expiry alone does not mean the worker left. A `doing`
+bead that was never claimed (reason `unclaimed`) may be tracked by hand; it is
+reported but never handed out. Blocked beads are never stranded. To put the work back in plain `open` instead, `mote set <id>
+status=open`. (This is distinct from *orphaned* leases, which are live claims or
+reservations on closed work.)
 
 `mote actor status` returns the stable `mote.actor-status.v1` projection. It
 keeps valid session presence, substantive work, interaction, held work, and
@@ -779,6 +842,7 @@ Store location is resolved in this order:
 - `2` — op rejected by reducer (stale clock, path overlap, already-acked, etc.)
 - `3` — invalid command, validation error, or actor identity unresolved
 - `4` — repository / storage error
+- `5` — `mote next` found nothing claimable
 
 ## Install / Update
 

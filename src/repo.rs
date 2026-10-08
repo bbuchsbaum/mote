@@ -15,6 +15,7 @@ const FORMAT_FILE: &str = "FORMAT.json";
 const TMP_DIR: &str = "tmp";
 const OPS_DIR: &str = "ops";
 const LOCAL_DIR: &str = "local";
+const ACTOR_FILE: &str = "actor";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultTtls {
@@ -51,21 +52,125 @@ pub struct AuthorityFormat {
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    /// Set when discovery started in a linked Git worktree and resolved to the
+    /// main worktree's store: the worktree-local copy that was bypassed (if
+    /// any) and why.
+    worktree_redirect: Option<WorktreeRedirect>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorktreeRedirect {
+    /// The linked worktree's own `.mote/`, normally a Git-tracked copy of the
+    /// shared store. `None` when the worktree has no store of its own.
+    pub bypassed: Option<PathBuf>,
+    /// Per-checkout `local/actor` file. Identity stays with the worktree even
+    /// though coordination moves to the shared store.
+    pub actor_file: PathBuf,
 }
 
 impl Store {
     /// Walk up from `start_dir` looking for a `.mote/` directory. Returns the
     /// store rooted at the first match.
+    ///
+    /// Inside a linked Git worktree, a tracked `.mote/` is a private copy of
+    /// the shared store: writing to it would split coordination silently. When
+    /// the main worktree holds a store with the same `store_id`, discovery
+    /// resolves to that shared store instead. A worktree store with a
+    /// different `store_id` is deliberately separate and is used as found.
+    /// A worktree with no store of its own also falls back to the main one.
     pub fn discover(start_dir: &Path) -> MoteResult<Self> {
-        let mut p = fs::canonicalize(start_dir)?;
+        let start = fs::canonicalize(start_dir)?;
+        let mut p = start.clone();
         loop {
             let candidate = p.join(STORE_DIR);
             if candidate.is_dir() {
-                return Ok(Store { root: candidate });
+                if let Some(shared) = shared_store_for_worktree_copy(&candidate) {
+                    let actor_file = candidate.join(LOCAL_DIR).join(ACTOR_FILE);
+                    return Ok(Store {
+                        root: shared,
+                        worktree_redirect: Some(WorktreeRedirect {
+                            bypassed: Some(candidate),
+                            actor_file,
+                        }),
+                    });
+                }
+                // A linked worktree nested inside the main checkout (such as
+                // `.claude/worktrees/<name>`) reaches the main store by walking
+                // up. Coordination is already shared; identity must still stay
+                // with the worktree.
+                let enclosing = linked_worktree_roots(&start)
+                    .filter(|(worktree_root, _, _)| !candidate.starts_with(worktree_root));
+                if let Some((_, _, gitdir)) = enclosing {
+                    return Ok(Store {
+                        root: candidate,
+                        worktree_redirect: Some(WorktreeRedirect {
+                            bypassed: None,
+                            actor_file: gitdir.join("mote").join(ACTOR_FILE),
+                        }),
+                    });
+                }
+                return Ok(Store {
+                    root: candidate,
+                    worktree_redirect: None,
+                });
             }
             if !p.pop() {
+                if let Some((shared, gitdir)) = main_worktree_store(&start) {
+                    return Ok(Store {
+                        root: shared,
+                        worktree_redirect: Some(WorktreeRedirect {
+                            bypassed: None,
+                            // Git's per-worktree admin dir is private to this
+                            // checkout and never tracked.
+                            actor_file: gitdir.join("mote").join(ACTOR_FILE),
+                        }),
+                    });
+                }
                 return Err(MoteError::StoreNotFound(start_dir.to_path_buf()));
             }
+        }
+    }
+
+    /// Keep identity per checkout for a store opened explicitly (`--store`,
+    /// `MOTE_STORE`) from inside a linked worktree: when the store lies outside
+    /// the worktree that contains `cwd`, use that worktree's private actor
+    /// file, exactly as discovery would.
+    pub fn with_worktree_identity(mut self, cwd: &Path) -> Self {
+        if self.worktree_redirect.is_some() {
+            return self;
+        }
+        let Ok(cwd) = fs::canonicalize(cwd) else {
+            return self;
+        };
+        let root = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        if let Some((worktree_root, _, gitdir)) = linked_worktree_roots(&cwd) {
+            if !root.starts_with(&worktree_root) {
+                self.worktree_redirect = Some(WorktreeRedirect {
+                    bypassed: None,
+                    actor_file: gitdir.join("mote").join(ACTOR_FILE),
+                });
+            }
+        }
+        self
+    }
+
+    /// The main worktree's store when `dir` is inside a linked worktree that
+    /// would otherwise create its own (used by `mote init` to avoid forking).
+    pub fn main_worktree_store_for(dir: &Path) -> Option<PathBuf> {
+        let dir = fs::canonicalize(dir).ok()?;
+        main_worktree_store(&dir).map(|(shared, _)| shared)
+    }
+
+    pub fn worktree_redirect(&self) -> Option<&WorktreeRedirect> {
+        self.worktree_redirect.as_ref()
+    }
+
+    /// The checkout-local actor file read by actor resolution and written by
+    /// `mote actor set`. Under a worktree redirect it stays in the worktree.
+    pub fn actor_file(&self) -> PathBuf {
+        match &self.worktree_redirect {
+            Some(redirect) => redirect.actor_file.clone(),
+            None => self.local_dir().join(ACTOR_FILE),
         }
     }
 
@@ -92,7 +197,10 @@ impl Store {
         };
         let bytes = serde_json::to_vec_pretty(&format)?;
         fs::write(&format_path, bytes)?;
-        Ok(Store { root })
+        Ok(Store {
+            root,
+            worktree_redirect: None,
+        })
     }
 
     /// Open an existing store at exactly `root` (must contain `FORMAT.json`).
@@ -103,6 +211,7 @@ impl Store {
         }
         Ok(Store {
             root: root.to_path_buf(),
+            worktree_redirect: None,
         })
     }
 
@@ -148,7 +257,7 @@ impl Store {
                 return Ok(trimmed.to_string());
             }
         }
-        let actor_file = self.local_dir().join("actor");
+        let actor_file = self.actor_file();
         if actor_file.is_file() {
             let s = fs::read_to_string(&actor_file)?;
             let trimmed = s.trim();
@@ -171,6 +280,67 @@ impl Store {
         names.sort();
         crate::authority::ordered_names(self, names)
     }
+}
+
+/// Linked-worktree layout for `dir`: `(worktree_root, main_worktree_root,
+/// worktree_gitdir)`.
+///
+/// A linked worktree's `.git` is a file (`gitdir: <common>/worktrees/<name>`)
+/// whose target holds a `commondir` file; submodules have a `.git` file too but
+/// no `commondir`, and bare repositories have no main worktree. Both yield
+/// `None`. Reads Git's metadata directly so ordinary commands never spawn git.
+fn linked_worktree_roots(dir: &Path) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let mut p = dir.to_path_buf();
+    let dot_git = loop {
+        let candidate = p.join(".git");
+        if candidate.exists() {
+            break candidate;
+        }
+        if !p.pop() {
+            return None;
+        }
+    };
+    if !dot_git.is_file() {
+        return None;
+    }
+    let worktree_root = p;
+    let pointer = fs::read_to_string(&dot_git).ok()?;
+    let gitdir = pointer.trim().strip_prefix("gitdir:")?.trim();
+    let gitdir = worktree_root.join(gitdir);
+    let commondir = fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = fs::canonicalize(gitdir.join(commondir.trim())).ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    let main_root = common.parent()?.to_path_buf();
+    Some((worktree_root, main_root, gitdir))
+}
+
+fn store_id_at(store_root: &Path) -> Option<String> {
+    let data = fs::read(store_root.join(FORMAT_FILE)).ok()?;
+    let format: Format = serde_json::from_slice(&data).ok()?;
+    Some(format.store_id)
+}
+
+/// The main worktree's store when `store_root` is a same-identity copy of it
+/// inside a linked worktree.
+fn shared_store_for_worktree_copy(store_root: &Path) -> Option<PathBuf> {
+    let (worktree_root, main_root, _) = linked_worktree_roots(store_root.parent()?)?;
+    let relative = store_root.strip_prefix(&worktree_root).ok()?;
+    let shared = main_root.join(relative);
+    let copy_id = store_id_at(store_root)?;
+    (store_id_at(&shared)? == copy_id).then_some(shared)
+}
+
+/// The main worktree's top-level store, and this worktree's Git admin dir,
+/// when `dir` is inside a linked worktree.
+fn main_worktree_store(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let (_, main_root, gitdir) = linked_worktree_roots(dir)?;
+    let shared = main_root.join(STORE_DIR);
+    shared
+        .join(FORMAT_FILE)
+        .is_file()
+        .then_some((shared, gitdir))
 }
 
 #[cfg(test)]

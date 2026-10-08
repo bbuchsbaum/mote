@@ -442,6 +442,7 @@ fn apply_create(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &st
         clock,
         notes: Vec::new(),
         claim: None,
+        released_claim: None,
         created_at_op: op_id.to_string(),
         created_at_ts: ts.to_string(),
         deleted_at_ts: None,
@@ -887,12 +888,56 @@ fn apply_close(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
 
 fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str, o: ClaimOp) {
     let ClaimOp {
+        v,
         entity,
         to,
         ttl_s,
         expect_claim,
+        session,
         ..
     } = o;
+
+    let version_error = match (v, session.is_some()) {
+        (1, false) | (2, true) => None,
+        (1, true) => Some("claim v1 cannot carry a session; use v2".to_string()),
+        (2, false) => Some("claim v2 requires a session".to_string()),
+        (other, _) => Some(format!("unsupported claim version {other}")),
+    };
+    if let Some(reason) = version_error {
+        reject(state, &entity, op_id, kind, actor, ts, reason);
+        return;
+    }
+    if session.is_some() && to != actor {
+        reject(
+            state,
+            &entity,
+            op_id,
+            kind,
+            actor,
+            ts,
+            "a session-bound claim must be made for the claiming actor".into(),
+        );
+        return;
+    }
+
+    if let Some(sid) = session.as_deref() {
+        let valid = state
+            .sessions
+            .get(sid)
+            .is_some_and(|s| s.actor == actor && s.is_live(ts));
+        if !valid {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("session {sid} is not a live session of {actor}"),
+            );
+            return;
+        }
+    }
 
     // Inspect-only first to avoid mutable-borrow conflict with `reject(state, ...)`.
     enum Decision {
@@ -901,6 +946,7 @@ fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
         EntityClosed,
         EntityMissing,
         Held(String),
+        HeldBySession(String),
     }
     let decision = match state.beads.get(&entity) {
         Some(b) if b.is_deleted() => Decision::EntityDeleted,
@@ -911,7 +957,18 @@ fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
             (Some(c), Some(ec))
                 if ec == c.claim_clock && c.claimed_by == actor && c.is_live(ts) =>
             {
-                Decision::Accept
+                // Same-actor renewal: a claim bound to a still-live session
+                // belongs to that session, not to every process sharing the
+                // actor name.
+                match c.session.as_deref() {
+                    Some(holder)
+                        if session.as_deref() != Some(holder)
+                            && state.sessions.get(holder).is_some_and(|s| s.is_live(ts)) =>
+                    {
+                        Decision::HeldBySession(holder.to_string())
+                    }
+                    _ => Decision::Accept,
+                }
             }
             (Some(c), None) if !c.is_live(ts) => Decision::Accept,
             (Some(c), _) => Decision::Held(c.claimed_by.clone()),
@@ -968,6 +1025,18 @@ fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
             );
             return;
         }
+        Decision::HeldBySession(holder) => {
+            reject(
+                state,
+                &entity,
+                op_id,
+                kind,
+                actor,
+                ts,
+                format!("claim still held by {actor} in session {holder}"),
+            );
+            return;
+        }
         Decision::Accept => {}
     }
 
@@ -987,12 +1056,20 @@ fn apply_claim(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &str
         }
     };
 
+    // A session-bound claim lives at least as long as its session's current
+    // lease; heartbeats extend both together (see `extend_session_claims`).
+    let lease_until_ts = match session.as_deref().and_then(|sid| state.sessions.get(sid)) {
+        Some(s) if s.lease_until_ts > lease_until_ts => s.lease_until_ts.clone(),
+        _ => lease_until_ts,
+    };
     let bead = state.beads.get_mut(&entity).expect("checked above");
     bead.claim = Some(crate::state::ClaimState {
         claimed_by: to,
         claim_clock: op_id.to_string(),
         lease_until_ts,
+        session,
     });
+    bead.released_claim = None;
     accept(state, &entity, op_id, kind, actor, ts);
 }
 
@@ -1055,6 +1132,11 @@ fn apply_release(state: &mut State, op_id: &str, kind: &str, actor: &str, ts: &s
     }
 
     bead.claim = None;
+    bead.released_claim = Some(crate::state::ReleasedClaim {
+        released_by: actor.to_string(),
+        released_ts: ts.to_string(),
+        op_id: op_id.to_string(),
+    });
     accept(state, &entity, op_id, kind, actor, ts);
 }
 
@@ -3094,10 +3176,11 @@ fn apply_session_start(
                 ts: ts.to_string(),
                 op_id: op_id.to_string(),
                 ttl_s,
-                lease_until_ts,
+                lease_until_ts: lease_until_ts.clone(),
                 label: existing.label.clone(),
                 pid: existing.pid,
             });
+        extend_session_claims(state, &session_id, ts, &lease_until_ts);
         state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
         return;
     }
@@ -3199,11 +3282,32 @@ fn apply_session_heartbeat(
             ts: ts.to_string(),
             op_id: op_id.to_string(),
             ttl_s,
-            lease_until_ts,
+            lease_until_ts: lease_until_ts.clone(),
             label: session.label.clone(),
             pid: session.pid,
         });
+    extend_session_claims(state, &session_id, ts, &lease_until_ts);
     state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+/// A session heartbeat keeps the claims bound to that session alive for at
+/// least the renewed session lease. Only claims still live at the heartbeat
+/// are extended (an expired claim is not revived), and claims on closed or
+/// deleted work are left to expire.
+fn extend_session_claims(state: &mut State, session_id: &str, ts: &str, lease_until_ts: &str) {
+    for bead in state.beads.values_mut() {
+        if bead.is_deleted() || bead.status == Status::Closed {
+            continue;
+        }
+        if let Some(claim) = bead.claim.as_mut() {
+            if claim.session.as_deref() == Some(session_id)
+                && claim.is_live(ts)
+                && claim.lease_until_ts.as_str() < lease_until_ts
+            {
+                claim.lease_until_ts = lease_until_ts.to_string();
+            }
+        }
+    }
 }
 
 fn apply_session_status(
@@ -3360,8 +3464,22 @@ fn apply_session_end(
     if session.ended_ts.is_none() {
         session.ended_ts = Some(ts.to_string());
         session.ended_op_id = Some(op_id.to_string());
+        end_session_claims(state, &session_id, ts);
     }
     state.push_history(None, HistoryEntry::accepted(op_id, kind, actor, ts));
+}
+
+/// Ending a session ends the claims bound to it: their leases stop at the end
+/// timestamp, so the work becomes visible as stranded instead of staying held
+/// by a session that announced it is gone.
+fn end_session_claims(state: &mut State, session_id: &str, ts: &str) {
+    for bead in state.beads.values_mut() {
+        if let Some(claim) = bead.claim.as_mut() {
+            if claim.session.as_deref() == Some(session_id) && claim.is_live(ts) {
+                claim.lease_until_ts = ts.to_string();
+            }
+        }
+    }
 }
 
 fn apply_reserve_open(

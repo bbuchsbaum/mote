@@ -136,7 +136,31 @@ mote begin <bd-id> --paths <path> [<path> ...] --note "starting"
 ```
 
 `begin` reserves the paths, claims the bead, and moves open work to `doing`, so
-it leaves `mote ready` and a second session will not pull it.
+it leaves `mote ready` and a second session will not pull it. `--paths` is
+optional: `mote begin <bd-id>` claims and starts work that touches no shared
+files.
+
+Worker loops that just want the next item use one atomic step instead of
+listing `ready` and racing on `claim`:
+
+```sh
+mote --json next [--tag <tag>]... [--exclude <bd-id>]... [--ttl 30m]
+```
+
+It claims the highest-priority ready bead nobody holds (priority, then id),
+moves it to `doing`, and prints it; exit `5` (JSON `null`) means nothing is
+claimable. `resumed_from` is non-null when it picked up stranded work. A worker
+restarting under the same identity should pass `--resume`: its own unfinished
+work (a live claim not bound to another live session, or an expired claim it
+last held) comes back first, with `resumed_from.reason` `own_claim` or
+`own_expired_claim`. Without `--resume`, `next` never returns held work.
+
+A `doing` bead whose claim was released or expired is *stranded*: `ready` and
+`next` offer it again (and `board`, `in-flight`, and `doctor` show it with the
+last holder), so the work is not lost. It is not offered while the last holder
+still has a live reservation on it or a live session bound to the claim; renew
+long-running claims with `mote claim <bd-id>` rather than relying on that. `mote done` refuses (exit 2) to close a bead another actor
+holds live; coordinate first, or pass `--force` deliberately.
 
 TTL options accept bare seconds or whole-number `s`, `m`, `h`, and `d` forms
 such as `--ttl 900`, `--ttl 15m`, or `--ttl 2h`. JSON and the op log always
@@ -396,5 +420,6 @@ single precise answer in a script.
 - `2`: reducer rejected the op; inspect current state before retrying
 - `3`: invalid command, validation error, or unresolved actor
 - `4`: store/layout/storage problem; run `mote doctor` and `mote fsck`
+- `5`: `mote next` found nothing claimable (not an error)
 
 On conflicts, inspect and adapt. Do not blindly retry rejected mutations.

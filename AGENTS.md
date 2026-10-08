@@ -99,5 +99,6 @@ mote unreserve <rv-id>
 - `2`: reducer rejected the op; inspect the stderr reason and current state
 - `3`: invalid command, validation problem, or unresolved actor
 - `4`: repository or storage problem; run `mote doctor` and `mote fsck`
+- `5`: `mote next` found nothing claimable
 
 Never hand-edit `.mote/ops/*.json`. The op log is append-only source of truth.

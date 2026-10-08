@@ -931,12 +931,7 @@ fn beads_json(state: &State, request: &Request) -> Result<Value, ApiError> {
                 && status.is_none_or(|wanted| bead.status == wanted)
                 && tags.iter().all(|tag| bead.tags.contains(*tag))
                 && assignee.is_none_or(|wanted| bead.assignee.as_deref() == Some(wanted))
-                && (!ready
-                    || (state.is_ready(bead)
-                        && bead
-                            .claim
-                            .as_ref()
-                            .is_none_or(|claim| !claim.is_live(&now) || claim.claimed_by == actor)))
+                && (!ready || state.is_ready_for(bead, &actor, &now))
         })
         .collect();
     beads.sort_by(|left, right| {
@@ -980,7 +975,7 @@ fn bead_detail_json(state: &State, id: &str) -> Result<Value, ApiError> {
             "ts": note.ts, "text": note.text,
         })).collect::<Vec<_>>(),
         "discussion_sources": crate::cli::discussion_sources_json(state, id),
-        "ready": state.is_ready(bead),
+        "ready": state.is_ready_at(bead, &ids::format_rfc3339(jiff::Timestamp::now())),
         "deleted_at": bead.deleted_at_ts,
         "created_at": bead.created_at_ts,
         "clock": bead.clock,
@@ -1655,6 +1650,22 @@ fn close_bead(
     }
     let fresh = require_live_bead(context, id)?;
     let bead = &fresh.beads[id];
+    let now = ids::format_rfc3339(jiff::Timestamp::now());
+    if let Some(claim) = bead
+        .claim
+        .as_ref()
+        .filter(|c| c.claimed_by != actor && c.is_live(&now))
+    {
+        // Same rule as `mote close`/`mote done`: do not close work another
+        // actor is actively holding.
+        return Err(ApiError::message(
+            409,
+            format!(
+                "{id} is claimed by {} until {}; coordinate with the holder",
+                claim.claimed_by, claim.lease_until_ts
+            ),
+        ));
+    }
     let mut expect = BTreeMap::new();
     if let Some(clock) = bead.clock.get("status") {
         expect.insert("status".to_string(), clock.clone());

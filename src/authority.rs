@@ -44,6 +44,15 @@ pub fn directory(store: &Store) -> PathBuf {
     store.root().join("authority")
 }
 
+/// Highest authority format version this binary understands.
+///
+/// - 1: shared admission order, holder-checked handoff, checked landing.
+/// - 2: the log may contain session-bound claims (claim op `v: 2`). Binaries
+///   that only understand version 1 ignore the session binding and would
+///   replay those claims differently, so they must refuse the store; they do,
+///   because every replay checks this version first.
+pub const AUTHORITY_VERSION: u32 = 2;
+
 pub fn enabled(store: &Store) -> bool {
     directory(store).join("00000000000000000000.json").is_file()
 }
@@ -68,7 +77,7 @@ pub fn status(store: &Store) -> MoteResult<Status> {
         let authority = format.authority.as_ref().ok_or_else(|| {
             MoteError::Other("authority genesis exists without a FORMAT binding".into())
         })?;
-        if authority.version != 1 {
+        if !(1..=AUTHORITY_VERSION).contains(&authority.version) {
             return Err(MoteError::Other(
                 "unsupported authority format version".into(),
             ));
@@ -97,7 +106,11 @@ pub fn status(store: &Store) -> MoteResult<Status> {
         schema: "mote.authority-status.v1",
         store_id: format.store_id,
         enabled,
-        authority_version: u32::from(enabled),
+        authority_version: if enabled {
+            format.authority.as_ref().map_or(1, |a| a.version)
+        } else {
+            0
+        },
         genesis_digest,
         capabilities: [
             "stable_claim_order",
@@ -144,7 +157,7 @@ fn records(store: &Store) -> MoteResult<Vec<PathBuf>> {
 pub(crate) fn ordered_names(store: &Store, raw: Vec<String>) -> MoteResult<Vec<String>> {
     let format = store.read_format()?;
     if let Some(authority) = &format.authority {
-        if authority.version != 1 {
+        if !(1..=AUTHORITY_VERSION).contains(&authority.version) {
             return Err(MoteError::Other(
                 "unsupported authority format version".into(),
             ));
@@ -259,6 +272,19 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
+    fn raise_format_version(&self, version: u32) -> MoteResult<()> {
+        let mut format = self.store.read_format()?;
+        let authority = format
+            .authority
+            .as_mut()
+            .ok_or_else(|| MoteError::Other("authority enabled without a FORMAT binding".into()))?;
+        if authority.version < version {
+            authority.version = version;
+            write_json(&self.store.format_path(), &format)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_no_landing(&self) -> MoteResult<()> {
         if directory(self.store).join("landing-active.json").exists() {
             return Err(MoteError::Rejected("landing recovery required; retry the recorded candidate land request before publishing other mutations".into()));
@@ -323,6 +349,12 @@ impl<'a> Writer<'a> {
     }
 
     pub(crate) fn publish(&self, prepared: &PreparedOp) -> MoteResult<()> {
+        if is_session_claim(&prepared.bytes) {
+            // Fence version-1 readers before the first session-bound claim
+            // becomes visible. Pre-authority binaries cannot be fenced.
+            self.enable()?;
+            self.raise_format_version(2)?;
+        }
         if !enabled(self.store) {
             return publish::publish_bytes_unlocked(
                 self.store,
@@ -340,6 +372,13 @@ impl<'a> Writer<'a> {
         checkpoint("publication-prepared")?;
         self.finish_publication(prepared)
     }
+}
+
+fn is_session_claim(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|v| {
+        v.get("kind").and_then(|k| k.as_str()) == Some("claim")
+            && v.get("session").is_some_and(|s| !s.is_null())
+    })
 }
 
 /// Debug-build fault injection, used by process-level recovery courts. Production

@@ -15,10 +15,11 @@ use crate::ids;
 use crate::op::{
     self, ScalarSet, Status, make_board_post, make_board_read, make_board_read_through,
     make_board_retract, make_board_route, make_board_sticky, make_board_supersede,
-    make_board_topic, make_claim, make_close, make_create, make_delete, make_dep, make_msg_ack,
+    make_board_topic, make_close, make_create, make_delete, make_dep, make_msg_ack,
     make_msg_resolve, make_note, make_patch, make_rel, make_release, make_reserve_adopt,
-    make_reserve_close, make_reserve_open, make_session_end, make_session_heartbeat,
-    make_session_start, make_session_status, make_tag, validate_msg_kind, validate_note_kind,
+    make_reserve_close, make_reserve_open, make_session_claim, make_session_end,
+    make_session_heartbeat, make_session_start, make_session_status, make_tag, validate_msg_kind,
+    validate_note_kind,
 };
 use crate::reducer;
 use crate::state::{Bead, MsgRecord, RequestState};
@@ -159,7 +160,14 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Initialize a `.mote/` store in the current directory
-    Init,
+    ///
+    /// In a linked Git worktree whose main checkout already has a store, this
+    /// reports that shared store instead of forking a new one.
+    Init {
+        /// Create an independent store even inside a linked worktree
+        #[arg(long)]
+        separate: bool,
+    },
 
     /// Inspect or activate the shared writer authority
     Authority {
@@ -285,7 +293,15 @@ pub enum Command {
     },
 
     /// Set status=closed (idempotent)
-    Close { id: String },
+    ///
+    /// Refused (exit 2) while another actor, or another live session of this
+    /// actor, holds a live claim; pass --force to close it anyway.
+    Close {
+        id: String,
+        /// Close even though someone else holds a live claim
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Tombstone a bead
     Delete { id: String },
@@ -299,7 +315,35 @@ pub enum Command {
     },
 
     /// Release the current claim on a bead
-    Release { id: String },
+    Release {
+        id: String,
+        /// Release even though the claim is bound to another live session of
+        /// this actor (e.g. from a shell without MOTE_SESSION)
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Claim the highest-priority ready bead and set it to doing, atomically
+    ///
+    /// Picks by priority, then id, among ready beads nobody holds (including
+    /// stranded doing work). Prints the id (or a JSON object with --json).
+    /// Exits 5 when nothing is claimable (JSON: `null`).
+    Next {
+        /// Claim TTL in seconds (defaults to FORMAT.json default_ttl_s.claim)
+        #[arg(long, value_parser = parse_duration_seconds)]
+        ttl: Option<u32>,
+        /// Only consider beads carrying this tag; repeat to require several
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Skip this bead id; repeatable
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Prefer the caller's own unfinished work (a live claim not bound to
+        /// another live session, or an expired claim it last held) before new
+        /// work; for a worker restarting under the same identity
+        #[arg(long)]
+        resume: bool,
+    },
 
     /// Send a direct message (`msg send --to` shorthand)
     Send {
@@ -423,9 +467,10 @@ pub enum Command {
         paths: Vec<String>,
     },
 
-    /// Compound: reserve_open + claim + status=doing + optional progress note. Compensates on partial failure.
+    /// Compound: optional reserve_open + claim + status=doing + optional progress note. Compensates on partial failure.
     Begin {
         id: String,
+        /// Paths to reserve; omit to claim and start the bead without a reservation
         #[arg(long = "paths", num_args = 1..)]
         paths: Vec<String>,
         /// Progress note; pass - to read literal UTF-8 from stdin
@@ -443,6 +488,10 @@ pub enum Command {
         id: String,
         #[arg(long = "to")]
         to: String,
+        /// Hand off even though the claim is bound to another live session of
+        /// this actor
+        #[arg(long)]
+        force: bool,
         /// Handoff note; pass - to read literal UTF-8 from stdin
         #[arg(long)]
         note: Option<String>,
@@ -461,11 +510,17 @@ pub enum Command {
     },
 
     /// Compound: completion note + close + reserve_close + release
+    ///
+    /// Refused (exit 2) while another actor holds a live claim on the bead;
+    /// pass --force to close it anyway. Unclaimed beads may be closed by anyone.
     Done {
         id: String,
         /// Completion note; pass - to read literal UTF-8 from stdin
         #[arg(long)]
         note: Option<String>,
+        /// Close even though another actor holds a live claim
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show live reservations whose paths overlap a given path
@@ -1502,7 +1557,7 @@ impl Command {
     fn publishes_as_resolved_actor(&self) -> bool {
         !matches!(
             self,
-            Command::Init
+            Command::Init { .. }
                 | Command::Authority { .. }
                 | Command::Actor { .. }
                 | Command::Show { .. }
@@ -1631,7 +1686,7 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
     guard_concurrent_local_identity(&cli)?;
     warn_stale_requests_for_stateful_invocation(&cli)?;
     match cli.command {
-        Command::Init => cmd_init(cli.quiet),
+        Command::Init { separate } => cmd_init(cli.quiet, separate),
         Command::Authority { cmd } => cmd_authority(cli.store.as_deref(), cmd),
         Command::Actor { cmd } => {
             cmd_actor(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
@@ -1711,12 +1766,30 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         Command::Dep { cmd } => cmd_dep(cli.actor.as_deref(), cli.store.as_deref(), cli.quiet, cmd),
         Command::Rel { cmd } => cmd_rel(cli.actor.as_deref(), cli.store.as_deref(), cmd),
         Command::Tag { cmd } => cmd_tag(cli.actor.as_deref(), cli.store.as_deref(), cmd),
-        Command::Close { id } => cmd_close(cli.actor.as_deref(), cli.store.as_deref(), id),
+        Command::Close { id, force } => {
+            cmd_close(cli.actor.as_deref(), cli.store.as_deref(), id, force)
+        }
         Command::Delete { id } => cmd_delete(cli.actor.as_deref(), cli.store.as_deref(), id),
         Command::Claim { id, ttl } => {
             cmd_claim(cli.actor.as_deref(), cli.store.as_deref(), id, ttl)
         }
-        Command::Release { id } => cmd_release(cli.actor.as_deref(), cli.store.as_deref(), id),
+        Command::Release { id, force } => {
+            cmd_release(cli.actor.as_deref(), cli.store.as_deref(), id, force)
+        }
+        Command::Next {
+            ttl,
+            tags,
+            exclude,
+            resume,
+        } => cmd_next(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            ttl,
+            tags,
+            exclude,
+            resume,
+        ),
         Command::Send {
             to,
             issue,
@@ -1830,6 +1903,7 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
         Command::Handoff {
             id,
             to,
+            force,
             note,
             release,
             expect_holder,
@@ -1846,9 +1920,10 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             expect_claim,
             idempotency_key,
             cli.json,
+            force,
         ),
-        Command::Done { id, note } => {
-            cmd_done(cli.actor.as_deref(), cli.store.as_deref(), id, note)
+        Command::Done { id, note, force } => {
+            cmd_done(cli.actor.as_deref(), cli.store.as_deref(), id, note, force)
         }
         Command::WhoHas { path } => cmd_who_has(cli.store.as_deref(), cli.json, path),
         Command::Session { cmd } => {
@@ -4057,8 +4132,22 @@ fn cmd_candidate_evidence(
     Ok(0)
 }
 
-fn cmd_init(quiet: bool) -> MoteResult<i32> {
+fn cmd_init(quiet: bool, separate: bool) -> MoteResult<i32> {
     let cwd = std::env::current_dir()?;
+    if !separate && !cwd.join(".mote").exists() {
+        if let Some(shared) = Store::main_worktree_store_for(&cwd) {
+            // A fresh store here would silently fork coordination away from
+            // the main checkout; discovery already resolves to the shared one.
+            if !quiet {
+                println!(
+                    "linked worktree: using the main worktree's store at {} \
+                     (pass --separate to create an independent store here)",
+                    shared.display()
+                );
+            }
+            return Ok(0);
+        }
+    }
     match Store::init(&cwd) {
         Ok(store) => {
             if !quiet {
@@ -4103,12 +4192,14 @@ fn cmd_actor(
     cmd: ActorCmd,
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
-    let actor_path = store.local_dir().join("actor");
+    let actor_path = store.actor_file();
 
     match cmd {
         ActorCmd::Set { actor } => {
             let actor = normalize_actor(&actor)?;
-            fs::create_dir_all(store.local_dir())?;
+            if let Some(parent) = actor_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::write(&actor_path, format!("{actor}\n"))?;
 
             if json_mode {
@@ -4482,7 +4573,7 @@ fn resolve_actor_with_source(
             });
         }
     }
-    let actor_file = store.local_dir().join("actor");
+    let actor_file = store.actor_file();
     if actor_file.is_file() {
         let s = fs::read_to_string(&actor_file)?;
         let s = s.trim();
@@ -5287,7 +5378,7 @@ fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResul
                 "op_id": n.op_id, "kind": n.note_kind, "actor": n.actor, "ts": n.ts, "text": n.text,
             })).collect::<Vec<_>>(),
             "discussion_sources": discussion_sources_json(&state, &id),
-            "ready": state.is_ready(bead),
+            "ready": state.is_ready_at(bead, &ids::format_rfc3339(Timestamp::now())),
             "deleted_at": bead.deleted_at_ts,
             "created_at": bead.created_at_ts,
             "clock": bead.clock,
@@ -5366,7 +5457,7 @@ fn cmd_show(store_flag: Option<&Path>, json_mode: bool, id: String) -> MoteResul
                 println!("  [{}] {} {}: {}", n.note_kind, n.actor, n.ts, n.text);
             }
         }
-        if state.is_ready(bead) {
+        if state.is_ready_at(bead, &ids::format_rfc3339(Timestamp::now())) {
             println!("ready:    yes");
         }
         if let Some(ts) = &bead.deleted_at_ts {
@@ -5521,15 +5612,8 @@ fn cmd_ls(
                     return false;
                 }
             }
-            if ready {
-                if !state.is_ready(b) {
-                    return false;
-                }
-                if let Some(c) = &b.claim {
-                    if c.is_live(&now_ts) && c.claimed_by != actor {
-                        return false;
-                    }
-                }
+            if ready && !state.is_ready_for(b, &actor, &now_ts) {
+                return false;
             }
             true
         })
@@ -5634,16 +5718,22 @@ fn cmd_ready(
                     "id": b.id,
                     "title": b.title,
                     "priority": b.priority,
+                    "status": b.status.as_str(),
                     "tags": b.tags.iter().collect::<Vec<_>>(),
                     "assignee": b.assignee,
+                    "stranded": state.stranded(b, &now).map(|s| stranded_json(&s)),
                 })
             })
             .collect();
         println!("{}", serde_json::to_string(&arr)?);
     } else {
         for b in &beads {
+            let marker = state
+                .stranded(b, &now)
+                .map(|s| format!("  [stranded: {}]", stranded_summary(&s)))
+                .unwrap_or_default();
             println!(
-                "{:<24} p{} {:<8} {}",
+                "{:<24} p{} {:<8} {}{marker}",
                 b.id,
                 b.priority,
                 b.status.as_str(),
@@ -5652,6 +5742,21 @@ fn cmd_ready(
         }
     }
     Ok(0)
+}
+
+fn stranded_json(s: &crate::state::Stranded) -> serde_json::Value {
+    serde_json::json!({
+        "reason": s.reason.as_str(),
+        "last_holder": s.last_holder,
+        "since_ts": s.since_ts,
+    })
+}
+
+fn stranded_summary(s: &crate::state::Stranded) -> String {
+    match (&s.last_holder, &s.since_ts) {
+        (Some(holder), Some(since)) => format!("{} by {holder} at {since}", s.reason.as_str()),
+        _ => s.reason.as_str().to_string(),
+    }
 }
 
 fn cmd_note(
@@ -5760,10 +5865,34 @@ fn cmd_tag(actor_flag: Option<&str>, store_flag: Option<&Path>, cmd: TagCmd) -> 
     Ok(if had_failure { 2 } else { 0 })
 }
 
-fn cmd_close(actor_flag: Option<&str>, store_flag: Option<&Path>, id: String) -> MoteResult<i32> {
+fn cmd_close(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    id: String,
+    force: bool,
+) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
+    // Check the holder and admit the close in one Writer critical section.
+    let writer = crate::authority::Writer::acquire(&store)?;
+    writer.enable()?;
+    writer.ensure_no_landing()?;
     let state = reducer::replay_store(&store)?;
+    let now = ids::format_rfc3339(Timestamp::now());
+    if let Some(conflict) = live_claim_conflict(&state, &id, &actor, &now) {
+        if !force {
+            eprintln!(
+                "close rejected: {id} is claimed by {} until {}; coordinate with the holder, \
+                 or pass --force to close it anyway",
+                conflict.holder, conflict.lease_until_ts
+            );
+            return Ok(2);
+        }
+        eprintln!(
+            "warning: closing {id} while {} holds a live claim (--force)",
+            conflict.holder
+        );
+    }
     let bead = state
         .beads
         .get(&id)
@@ -5776,7 +5905,10 @@ fn cmd_close(actor_flag: Option<&str>, store_flag: Option<&Path>, id: String) ->
         expect.insert("status".to_string(), c.clone());
     }
     let op = make_close(actor, id, expect, Timestamp::now());
-    let name = publish::publish_op(&store, &op)?;
+    let prepared = crate::authority::PreparedOp::new(&op)?;
+    writer.publish(&prepared)?;
+    drop(writer);
+    let name = ids::OpName::from_string(prepared.name)?;
     verify_accept(&store, &name)
 }
 
@@ -5814,13 +5946,30 @@ fn cmd_claim(
         .and_then(|b| b.claim.as_ref())
         .filter(|c| c.claimed_by == actor && c.is_live(&now))
         .map(|c| c.claim_clock.clone());
+    let session = claim_session(&state, &actor, &now);
+    if let (Some(requested), Some(sid)) = (ttl, session.as_deref()) {
+        let claim_until = ids::format_rfc3339(
+            Timestamp::now() + jiff::SignedDuration::from_secs(i64::from(requested)),
+        );
+        if let Some(s) = state.sessions.get(sid) {
+            if s.lease_until_ts > claim_until {
+                eprintln!(
+                    "note: claim bound to session {sid} lives until the session lease \
+                     ({}), longer than --ttl; end the session or shorten its --ttl to \
+                     release work sooner",
+                    s.lease_until_ts
+                );
+            }
+        }
+    }
 
-    let op = make_claim(
+    let op = make_session_claim(
         actor.clone(),
         id,
         actor,
         ttl_s,
         expect_claim,
+        session,
         Timestamp::now(),
     );
     let prepared = crate::authority::PreparedOp::new(&op)?;
@@ -5829,9 +5978,295 @@ fn cmd_claim(
     verify_accept(&store, &name)
 }
 
-fn cmd_release(actor_flag: Option<&str>, store_flag: Option<&Path>, id: String) -> MoteResult<i32> {
+struct ClaimConflict {
+    holder: String,
+    lease_until_ts: String,
+    /// The caller's own actor holds it, under a different live session.
+    same_actor_other_session: bool,
+}
+
+/// A live claim on `id` that `actor`, in this process's session, must not
+/// override: one held by another actor, or by `actor` under a different
+/// session that is still live.
+fn live_claim_conflict(
+    state: &crate::state::State,
+    id: &str,
+    actor: &str,
+    now: &str,
+) -> Option<ClaimConflict> {
+    let claim = state.beads.get(id)?.claim.as_ref()?;
+    if !claim.is_live(now) {
+        return None;
+    }
+    let (holder, same_actor_other_session) = if claim.claimed_by != actor {
+        (claim.claimed_by.clone(), false)
+    } else {
+        let sid = claim.session.as_deref()?;
+        let live = state.sessions.get(sid).is_some_and(|s| s.is_live(now));
+        if !live || env_session_id().as_deref() == Some(sid) {
+            return None;
+        }
+        (format!("{actor} in session {sid}"), true)
+    };
+    Some(ClaimConflict {
+        holder,
+        lease_until_ts: claim.lease_until_ts.clone(),
+        same_actor_other_session,
+    })
+}
+
+/// Shared refusal for release and handoff: only the session that holds a
+/// session-bound claim may give it up.
+fn refuse_foreign_session(
+    state: &crate::state::State,
+    id: &str,
+    actor: &str,
+    verb: &str,
+    force: bool,
+) -> Option<i32> {
+    let now = ids::format_rfc3339(Timestamp::now());
+    let conflict = live_claim_conflict(state, id, actor, &now)?;
+    if !conflict.same_actor_other_session {
+        // Another actor's claim: the reducer's holder check reports it.
+        return None;
+    }
+    if force {
+        eprintln!(
+            "warning: {verb} of {id} on behalf of {} (--force)",
+            conflict.holder
+        );
+        return None;
+    }
+    eprintln!(
+        "{verb} rejected: {id} is claimed by {} until {}; run from that session \
+         (MOTE_SESSION), end it first, or pass --force",
+        conflict.holder, conflict.lease_until_ts
+    );
+    Some(2)
+}
+
+/// The session a new claim is bound to: `MOTE_SESSION` when it names a live
+/// session of `actor`. Warns when the claim cannot be told apart from other
+/// live sessions sharing the actor.
+fn claim_session(state: &crate::state::State, actor: &str, now: &str) -> Option<String> {
+    let live = state.live_sessions_for(actor, now);
+    match env_session_id() {
+        Some(sid) if live.iter().any(|s| s.session_id == sid) => Some(sid),
+        Some(sid) => {
+            eprintln!(
+                "warning: MOTE_SESSION={sid} is not a live session of {actor}; \
+                 claiming without a session binding"
+            );
+            None
+        }
+        None => {
+            if !live.is_empty() {
+                eprintln!(
+                    "warning: {} live session(s) share actor {actor} but this claim is not bound \
+                     to one; another process under the same name could renew it \
+                     (activate a session with `mote session start`)",
+                    live.len()
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Claim the highest-priority ready bead (priority, then id) in one writer
+/// critical section, set it to `doing`, and report it. Exit 5 when nothing
+/// matches.
+fn cmd_next(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    ttl: Option<u32>,
+    tags: Vec<String>,
+    exclude: Vec<String>,
+    resume: bool,
+) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
+    let writer = crate::authority::Writer::acquire(&store)?;
+    writer.enable()?;
+    writer.ensure_no_landing()?;
+    let format = store.read_format()?;
+    let ttl_s = ttl.unwrap_or(format.default_ttl_s.claim);
+
+    let state = reducer::replay_store(&store)?;
+    let now = ids::format_rfc3339(Timestamp::now());
+    let session = claim_session(&state, &actor, &now);
+    // Work already held by anyone, the caller included, is not "next".
+    let mut candidates: Vec<&Bead> = state
+        .ready_beads_for(&actor, &now)
+        .filter(|b| !b.claim.as_ref().is_some_and(|c| c.is_live(&now)))
+        .filter(|b| tags.iter().all(|t| b.tags.contains(t)))
+        .filter(|b| !exclude.contains(&b.id))
+        .collect();
+    candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+    let mut candidates: Vec<(String, Option<serde_json::Value>, Option<String>)> = candidates
+        .into_iter()
+        .map(|b| {
+            let from = state.stranded(b, &now).map(|s| stranded_json(&s));
+            (b.id.clone(), from, None)
+        })
+        .collect();
+    if resume {
+        // The caller's own unfinished work goes first: a live claim this
+        // process may renew, or an expired claim it last held (possibly kept
+        // out of `ready` by the caller's own live reservation).
+        let mut own: Vec<&Bead> = state
+            .live_beads()
+            .filter(|b| matches!(b.status, Status::Open | Status::Doing))
+            .filter(|b| state.deps_satisfied(b))
+            .filter(|b| tags.iter().all(|t| b.tags.contains(t)))
+            .filter(|b| !exclude.contains(&b.id))
+            .filter(|b| {
+                b.claim.as_ref().is_some_and(|c| {
+                    c.claimed_by == actor
+                        && (!c.is_live(&now)
+                            || live_claim_conflict(&state, &b.id, &actor, &now).is_none())
+                })
+            })
+            .collect();
+        own.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+        let own: Vec<_> = own
+            .into_iter()
+            .map(|b| {
+                let c = b.claim.as_ref().expect("filtered on claim");
+                let expect = c.is_live(&now).then(|| c.claim_clock.clone());
+                let from = serde_json::json!({
+                    "reason": if expect.is_some() { "own_claim" } else { "own_expired_claim" },
+                    "last_holder": c.claimed_by,
+                    "since_ts": if expect.is_some() { None } else { Some(&c.lease_until_ts) },
+                });
+                (b.id.clone(), Some(from), expect)
+            })
+            .collect();
+        candidates.retain(|(id, _, _)| !own.iter().any(|(o, _, _)| o == id));
+        candidates.splice(0..0, own);
+    }
+
+    for (id, resumed_from, expect_claim) in candidates {
+        let renewing = expect_claim.is_some();
+        let claim = make_session_claim(
+            actor.clone(),
+            id.clone(),
+            actor.clone(),
+            ttl_s,
+            expect_claim,
+            session.clone(),
+            Timestamp::now(),
+        );
+        let prepared = crate::authority::PreparedOp::new(&claim)?;
+        writer.publish(&prepared)?;
+        let mut claim_name = ids::OpName::from_string(prepared.name)?;
+        let mut after = reducer::replay_store(&store)?;
+        if renewing && !after.was_accepted(claim_name.as_str()) {
+            // The caller's own claim expired between selection and admission;
+            // take it afresh rather than skipping it.
+            let retry = make_session_claim(
+                actor.clone(),
+                id.clone(),
+                actor.clone(),
+                ttl_s,
+                None,
+                session.clone(),
+                Timestamp::now(),
+            );
+            let retry_prepared = crate::authority::PreparedOp::new(&retry)?;
+            writer.publish(&retry_prepared)?;
+            claim_name = ids::OpName::from_string(retry_prepared.name)?;
+            after = reducer::replay_store(&store)?;
+        }
+        if !after.was_accepted(claim_name.as_str()) {
+            let reason = after
+                .rejection_reason(claim_name.as_str())
+                .unwrap_or_default();
+            if reason.starts_with("session ") {
+                // The caller's session lapsed mid-selection; every remaining
+                // candidate would be rejected the same way.
+                eprintln!("claim rejected: {reason}");
+                return Ok(2);
+            }
+            // Selection and publication share the Writer lock, so this is a
+            // reducer-level refusal (e.g. a lease that changed state between
+            // replay and admission); try the next candidate.
+            continue;
+        }
+        let bead = after.beads.get(&id).expect("accepted claim names a bead");
+        if bead.status == Status::Open {
+            let set = ScalarSet {
+                status: Some(Status::Doing),
+                ..ScalarSet::default()
+            };
+            let mut expect = BTreeMap::new();
+            expect.insert("status".to_string(), clock_for(bead, "status")?);
+            let patch = make_patch(actor.clone(), id.clone(), expect, set, Timestamp::now());
+            let patch_prepared = crate::authority::PreparedOp::new(&patch)?;
+            writer.publish(&patch_prepared)?;
+            let patch_name = ids::OpName::from_string(patch_prepared.name)?;
+            let patched = reducer::replay_store(&store)?;
+            if !patched.was_accepted(patch_name.as_str()) {
+                let release = make_release(actor.clone(), id.clone(), None, Timestamp::now());
+                writer.publish(&crate::authority::PreparedOp::new(&release)?)?;
+                continue;
+            }
+        }
+        let state = reducer::replay_store(&store)?;
+        let bead = &state.beads[&id];
+        let claim = bead.claim.as_ref().expect("claimed above");
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "id": bead.id,
+                    "title": bead.title,
+                    "priority": bead.priority,
+                    "status": bead.status.as_str(),
+                    "tags": bead.tags.iter().collect::<Vec<_>>(),
+                    "claimed_by": claim.claimed_by,
+                    "claim_clock": claim.claim_clock,
+                    "lease_until_ts": claim.lease_until_ts,
+                    "session": claim.session,
+                    "resumed_from": resumed_from,
+                }))?
+            );
+        } else {
+            println!("{id}");
+            if let Some(from) = &resumed_from {
+                eprintln!(
+                    "resuming {id} ({} by {})",
+                    from["reason"].as_str().unwrap_or("unknown"),
+                    from["last_holder"].as_str().unwrap_or("unknown")
+                );
+            }
+        }
+        return Ok(0);
+    }
+    if json_mode {
+        println!("null");
+    } else {
+        eprintln!("nothing claimable for {actor}");
+    }
+    Ok(NOTHING_CLAIMABLE)
+}
+
+/// Exit status of `mote next` when no ready bead matches.
+const NOTHING_CLAIMABLE: i32 = 5;
+
+fn cmd_release(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    id: String,
+    force: bool,
+) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let actor = store.resolve_actor(actor_flag)?;
+    let state = reducer::replay_store(&store)?;
+    if let Some(code) = refuse_foreign_session(&state, &id, &actor, "release", force) {
+        return Ok(code);
+    }
     let op = make_release(actor, id, None, Timestamp::now());
     let name = publish::publish_op(&store, &op)?;
     verify_accept(&store, &name)
@@ -9326,9 +9761,6 @@ fn cmd_begin(
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let note = resolve_optional_text(note)?;
-    if paths.is_empty() {
-        return Err(MoteError::Invalid("at least one path required".into()));
-    }
     // Validate the topic before anything is published, so a typo cannot leave
     // a reservation open with no matching board claim.
     let announce = announce
@@ -9346,42 +9778,51 @@ fn cmd_begin(
     let reserve_ttl = ttl.unwrap_or(format.default_ttl_s.reservation);
     let claim_ttl = format.default_ttl_s.claim;
 
-    // Step 1: reserve_open
-    let rv_id = ids::new_reservation_id();
+    // Step 1: reserve_open, skipped when the work needs no path reservation.
     let paths_for_announce = paths.join(", ");
-    let reserve = make_reserve_open(
-        actor.clone(),
-        rv_id.clone(),
-        id.clone(),
-        paths,
-        reserve_ttl,
-        Timestamp::now(),
-    );
-    let reserve_prepared = crate::authority::PreparedOp::new(&reserve)?;
-    writer.publish(&reserve_prepared)?;
-    let reserve_name = ids::OpName::from_string(reserve_prepared.name)?;
+    let rv_id = if paths.is_empty() {
+        None
+    } else {
+        let rv_id = ids::new_reservation_id();
+        let reserve = make_reserve_open(
+            actor.clone(),
+            rv_id.clone(),
+            id.clone(),
+            paths,
+            reserve_ttl,
+            Timestamp::now(),
+        );
+        let reserve_prepared = crate::authority::PreparedOp::new(&reserve)?;
+        writer.publish(&reserve_prepared)?;
+        let reserve_name = ids::OpName::from_string(reserve_prepared.name)?;
+        let state = reducer::replay_store(&store)?;
+        if !state.was_accepted(reserve_name.as_str()) {
+            let reason = state
+                .rejection_reason(reserve_name.as_str())
+                .unwrap_or_else(|| "unknown".into());
+            eprintln!("reserve_open rejected: {reason}");
+            return Ok(2);
+        }
+        Some(rv_id)
+    };
     let state1 = reducer::replay_store(&store)?;
-    if !state1.was_accepted(reserve_name.as_str()) {
-        let reason = state1
-            .rejection_reason(reserve_name.as_str())
-            .unwrap_or_else(|| "unknown".into());
-        eprintln!("reserve_open rejected: {reason}");
-        return Ok(2);
-    }
 
     // Step 2: claim
+    let now1 = ids::format_rfc3339(Timestamp::now());
     let expect_claim = state1
         .beads
         .get(&id)
         .and_then(|b| b.claim.as_ref())
-        .filter(|c| c.claimed_by == actor && c.is_live(&ids::format_rfc3339(Timestamp::now())))
+        .filter(|c| c.claimed_by == actor && c.is_live(&now1))
         .map(|c| c.claim_clock.clone());
-    let claim_op = make_claim(
+    let session = claim_session(&state1, &actor, &now1);
+    let claim_op = make_session_claim(
         actor.clone(),
         id.clone(),
         actor.clone(),
         claim_ttl,
         expect_claim,
+        session,
         Timestamp::now(),
     );
     let claim_prepared = crate::authority::PreparedOp::new(&claim_op)?;
@@ -9394,9 +9835,11 @@ fn cmd_begin(
             .unwrap_or_else(|| "unknown".into());
         eprintln!("claim rejected: {reason}");
         // Compensating reserve_close.
-        let close = make_reserve_close(actor.clone(), rv_id, None, Timestamp::now());
-        let close_prepared = crate::authority::PreparedOp::new(&close)?;
-        writer.publish(&close_prepared)?;
+        if let Some(rv_id) = rv_id {
+            let close = make_reserve_close(actor.clone(), rv_id, None, Timestamp::now());
+            let close_prepared = crate::authority::PreparedOp::new(&close)?;
+            writer.publish(&close_prepared)?;
+        }
         return Ok(2);
     }
 
@@ -9419,9 +9862,11 @@ fn cmd_begin(
                     .rejection_reason(status_name.as_str())
                     .unwrap_or_else(|| "unknown".into());
                 eprintln!("status update rejected: {reason}");
-                let close = make_reserve_close(actor.clone(), rv_id, None, Timestamp::now());
-                let close_prepared = crate::authority::PreparedOp::new(&close)?;
-                writer.publish(&close_prepared)?;
+                if let Some(rv_id) = rv_id {
+                    let close = make_reserve_close(actor.clone(), rv_id, None, Timestamp::now());
+                    let close_prepared = crate::authority::PreparedOp::new(&close)?;
+                    writer.publish(&close_prepared)?;
+                }
                 let release = make_release(actor, id, None, Timestamp::now());
                 let release_prepared = crate::authority::PreparedOp::new(&release)?;
                 writer.publish(&release_prepared)?;
@@ -9448,7 +9893,10 @@ fn cmd_begin(
     // see the claim at the same moment `mote ready` stops offering the work.
     if let Some(topic) = announce {
         let post_id = ids::new_post_id();
-        let body = format!("claiming {id} for {rv_id} on {}", paths_for_announce);
+        let body = match &rv_id {
+            Some(rv_id) => format!("claiming {id} for {rv_id} on {paths_for_announce}"),
+            None => format!("claiming {id}"),
+        };
         let post_op = make_board_post(
             actor,
             post_id.clone(),
@@ -9473,7 +9921,11 @@ fn cmd_begin(
         }
     }
 
-    println!("{rv_id}");
+    // Stdout carries the reservation id for scripts; a pathless begin has none.
+    match rv_id {
+        Some(rv_id) => println!("{rv_id}"),
+        None => eprintln!("began {id} (no paths reserved)"),
+    }
     Ok(0)
 }
 
@@ -9489,10 +9941,15 @@ fn cmd_handoff(
     expect_claim: Option<String>,
     idempotency_key: Option<String>,
     json_mode: bool,
+    force: bool,
 ) -> MoteResult<i32> {
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let note = resolve_optional_text(note)?.unwrap_or_else(|| format!("handing off to {to}"));
+    let state = reducer::replay_store(&store)?;
+    if let Some(code) = refuse_foreign_session(&state, &id, &actor, "handoff", force) {
+        return Ok(code);
+    }
     let explicit = expect_holder.is_some();
     let (code, result) = crate::handoff::execute(
         &store,
@@ -9530,22 +9987,31 @@ fn cmd_done(
     store_flag: Option<&Path>,
     id: String,
     note: Option<String>,
+    force: bool,
 ) -> MoteResult<i32> {
     use std::collections::BTreeMap;
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let note = resolve_optional_text(note)?;
 
-    // Completion note (note_kind=note). Best effort.
-    let text = note.unwrap_or_else(|| "done".into());
-    let note_op = make_note(
-        actor.clone(),
-        id.clone(),
-        "note".into(),
-        text,
-        Timestamp::now(),
-    );
-    let note_name = publish::publish_op(&store, &note_op)?;
+    // Refuse before publishing anything: a confused agent must not close work
+    // another actor is actively holding.
+    let state0 = reducer::replay_store(&store)?;
+    let now0 = ids::format_rfc3339(Timestamp::now());
+    if let Some(conflict) = live_claim_conflict(&state0, &id, &actor, &now0) {
+        if !force {
+            eprintln!(
+                "done rejected: {id} is claimed by {} until {}; coordinate with the holder, \
+                 or pass --force to close it anyway",
+                conflict.holder, conflict.lease_until_ts
+            );
+            return Ok(2);
+        }
+        eprintln!(
+            "warning: closing {id} while {} holds a live claim (--force)",
+            conflict.holder
+        );
+    }
 
     // Close (with expect.status). MUST be accepted for `done` to mean closed.
     let state = reducer::replay_store(&store)?;
@@ -9562,8 +10028,28 @@ fn cmd_done(
     // observation and the close publish, deterministically reproducing a
     // stale-clock race. No effect when the env var is unset.
     maybe_test_sleep("MOTE_TEST_DELAY_BEFORE_CLOSE_MS");
+    // Re-check the holder and admit the close under one Writer critical
+    // section, so a claim cannot land between the check and the close.
+    let writer = crate::authority::Writer::acquire(&store)?;
+    writer.enable()?;
+    writer.ensure_no_landing()?;
+    if !force {
+        let fresh = reducer::replay_store(&store)?;
+        let now = ids::format_rfc3339(Timestamp::now());
+        if let Some(conflict) = live_claim_conflict(&fresh, &id, &actor, &now) {
+            eprintln!(
+                "done rejected: {id} was claimed by {} until {} while closing; \
+                 coordinate with the holder, or pass --force to close it anyway",
+                conflict.holder, conflict.lease_until_ts
+            );
+            return Ok(2);
+        }
+    }
     let close = make_close(actor.clone(), id.clone(), expect, Timestamp::now());
-    let close_name = publish::publish_op(&store, &close)?;
+    let close_prepared = crate::authority::PreparedOp::new(&close)?;
+    writer.publish(&close_prepared)?;
+    drop(writer);
+    let close_name = ids::OpName::from_string(close_prepared.name)?;
     let state_post_close = reducer::replay_store(&store)?;
     if !state_post_close.was_accepted(close_name.as_str()) {
         let reason = state_post_close
@@ -9571,6 +10057,20 @@ fn cmd_done(
             .unwrap_or_else(|| "unknown".into());
         eprintln!("close rejected: {reason}");
         return Ok(2);
+    }
+
+    // Completion note, published only once the close is admitted so a refused
+    // `done` leaves nothing behind. Best effort.
+    let text = note.unwrap_or_else(|| "done".into());
+    let note_op = make_note(
+        actor.clone(),
+        id.clone(),
+        "note".into(),
+        text,
+        Timestamp::now(),
+    );
+    if let Err(error) = publish::publish_op(&store, &note_op) {
+        eprintln!("warning: completion note not recorded: {error}");
     }
 
     // Close any reservations this actor holds on this issue. Each is required
@@ -9612,7 +10112,6 @@ fn cmd_done(
         }
     }
 
-    let _ = note_name; // kept for symmetry; intentionally unused
     Ok(0)
 }
 
@@ -10783,6 +11282,7 @@ fn cmd_board(
         .values()
         .filter(|b| state.claim_disposition(b, &now) == crate::state::LeaseDisposition::Orphaned)
         .collect();
+    let stranded: Vec<_> = state.stranded_beads(&now).collect();
     let active_reservations: Vec<_> = state
         .reservations
         .values()
@@ -10843,6 +11343,10 @@ fn cmd_board(
                 "reservation_id": r.reservation_id, "actor": r.actor, "entity": r.entity,
                 "binding_kind": state.reservation_binding_kind(r),
                 "paths": r.live_paths(), "lease_until_ts": r.lease_until_ts,
+            })).collect::<Vec<_>>(),
+            "stranded": stranded.iter().map(|(b, s)| serde_json::json!({
+                "id": b.id, "title": b.title, "priority": b.priority,
+                "stranded": stranded_json(s),
             })).collect::<Vec<_>>(),
             "orphaned_claims": orphaned_claims.iter().map(|b| serde_json::json!({
                 "id": b.id, "title": b.title,
@@ -10913,6 +11417,19 @@ fn cmd_board(
                 coverage.capacity,
                 coverage.demanded_count,
                 coverage.coverage_shortfall,
+            );
+        }
+        println!(
+            "stranded:     {} doing with no live claim (offered by `mote ready`)",
+            stranded.len()
+        );
+        for (b, st) in &stranded {
+            println!(
+                "  STRANDED {} p{} {}: {}",
+                b.id,
+                b.priority,
+                stranded_summary(st),
+                b.title
             );
         }
         println!(
@@ -11094,6 +11611,7 @@ fn cmd_in_flight(
                 "id": b.id, "title": b.title, "priority": b.priority,
                 "claimed_by": b.claim.as_ref().filter(|c| c.is_live(&now_ts)).map(|c| &c.claimed_by),
                 "lease_until_ts": b.claim.as_ref().filter(|c| c.is_live(&now_ts)).map(|c| &c.lease_until_ts),
+                "stranded": state.stranded(b, &now_ts).map(|s| stranded_json(&s)),
             })).collect::<Vec<_>>(),
             "claims": claims.iter().map(|b| serde_json::json!({
                 "id": b.id, "status": b.status.as_str(),
@@ -11259,13 +11777,16 @@ fn cmd_in_flight(
 
     println!("\nDOING ({}):", doing.len());
     for b in &doing {
-        let holder = b
-            .claim
-            .as_ref()
-            .filter(|c| c.is_live(&now_ts))
-            .map(|c| c.claimed_by.as_str())
-            .unwrap_or("unclaimed");
-        println!("  {}  p{}  by {holder}  {}", b.id, b.priority, b.title);
+        let holder = match state.stranded(b, &now_ts) {
+            Some(st) => format!("STRANDED ({})", stranded_summary(&st)),
+            None => b
+                .claim
+                .as_ref()
+                .filter(|c| c.is_live(&now_ts))
+                .map(|c| format!("by {}", c.claimed_by))
+                .unwrap_or_else(|| "unclaimed".into()),
+        };
+        println!("  {}  p{}  {holder}  {}", b.id, b.priority, b.title);
     }
 
     println!("\nACTIVE TOPICS ({}):", topics.len());
@@ -11507,6 +12028,19 @@ fn identity_warnings(store: &Store, actor: &ActorResolution) -> MoteResult<Vec<S
     let state = reducer::replay_store(store)?;
     let now_ts = ids::format_rfc3339(Timestamp::now());
 
+    let stranded: Vec<String> = state
+        .stranded_beads(&now_ts)
+        .map(|(b, st)| format!("{} ({})", b.id, stranded_summary(&st)))
+        .collect();
+    if !stranded.is_empty() {
+        warnings.push(format!(
+            "{} bead(s) left in `doing` with no live claim: {}; `mote ready` offers them again \
+             (claim to resume, or `mote set <id> status=open` to reset)",
+            stranded.len(),
+            stranded.join(", ")
+        ));
+    }
+
     // Stores written by older Mote versions may contain same-actor overlaps.
     // New reserve_open v2 operations reject these, but doctor keeps historical
     // state actionable until those leases close or expire.
@@ -11691,6 +12225,19 @@ fn cmd_doctor(
     if let Some(warning) = git_backing.warning() {
         warnings.push(warning);
     }
+    let worktree = worktree_redirect_report(&store);
+    if let Some(report) = &worktree {
+        if report.copy_only_ops > 0 {
+            warnings.push(format!(
+                "worktree store copy {} holds {} op(s) missing from the shared store {}; \
+                 they were written while this worktree coordinated against its private copy \
+                 and are invisible to other agents",
+                report.bypassed.as_deref().unwrap_or_default(),
+                report.copy_only_ops,
+                store.root().display()
+            ));
+        }
+    }
     // Warnings describe a coordination hazard, not a broken store, so they do
     // not change the exit code — a shared identity still works, it is just
     // ambiguous.
@@ -11701,6 +12248,11 @@ fn cmd_doctor(
             "ok": ok,
             "warnings": warnings,
             "store_root": store.root().display().to_string(),
+            "worktree": worktree.as_ref().map(|w| serde_json::json!({
+                "redirected": true,
+                "bypassed_store": w.bypassed,
+                "copy_only_ops": w.copy_only_ops,
+            })),
             "git_backing": git_backing,
             "layout": {
                 "root": root_ok,
@@ -11723,6 +12275,15 @@ fn cmd_doctor(
         println!("{}", serde_json::to_string(&v)?);
     } else {
         println!("store:  {}", store.root().display());
+        if let Some(w) = &worktree {
+            match &w.bypassed {
+                Some(copy) => println!(
+                    "worktree: linked; using the main worktree's shared store (copy {copy} bypassed, {} op(s) only in copy)",
+                    w.copy_only_ops
+                ),
+                None => println!("worktree: linked; using the main worktree's shared store"),
+            }
+        }
         match (format_ok, schema_version, format_error.as_deref()) {
             (true, Some(version), _) => println!("format: ok (schema_version {version})"),
             (_, Some(version), _) => println!("format: bad schema_version {version}"),
@@ -12084,6 +12645,53 @@ fn cmd_skills_install(
     Ok(0)
 }
 
+struct WorktreeRedirectReport {
+    bypassed: Option<String>,
+    copy_only_ops: usize,
+}
+
+fn worktree_redirect_report(store: &Store) -> Option<WorktreeRedirectReport> {
+    let redirect = store.worktree_redirect()?;
+    let copy_only_ops = redirect
+        .bypassed
+        .as_ref()
+        .map(|copy| {
+            let names = |dir: &Path| -> std::collections::BTreeSet<String> {
+                fs::read_dir(dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .filter_map(|e| e.file_name().into_string().ok())
+                            .filter(|n| n.ends_with(".json"))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let shared = names(&store.ops_dir());
+            names(&copy.join("ops"))
+                .into_iter()
+                .filter(|n| !shared.contains(n))
+                .count()
+        })
+        .unwrap_or(0);
+    Some(WorktreeRedirectReport {
+        bypassed: redirect.bypassed.as_ref().map(|p| p.display().to_string()),
+        copy_only_ops,
+    })
+}
+
+/// Remedy for an unresolved actor in a linked worktree, where the main
+/// checkout's identity is deliberately not inherited.
+pub fn unresolved_actor_hint(override_path: Option<&Path>) -> Option<String> {
+    let store = open_store(override_path).ok()?;
+    let redirect = store.worktree_redirect()?;
+    Some(format!(
+        "this linked worktree keeps its own identity ({}); the main checkout's actor is not \
+         inherited. Set MOTE_ACTOR, or run `mote actor set <name>` here",
+        redirect.actor_file.display()
+    ))
+}
+
 fn open_store(override_path: Option<&Path>) -> MoteResult<Store> {
     let env_path = std::env::var_os("MOTE_STORE")
         .filter(|value| !value.is_empty())
@@ -12095,7 +12703,11 @@ fn open_store(override_path: Option<&Path>) -> MoteResult<Store> {
             p.join(".mote")
         };
         if candidate.is_dir() {
-            return Store::open(&candidate);
+            let store = Store::open(&candidate)?;
+            return Ok(match std::env::current_dir() {
+                Ok(cwd) => store.with_worktree_identity(&cwd),
+                Err(_) => store,
+            });
         }
         return Err(MoteError::StoreNotFound(p.to_path_buf()));
     }

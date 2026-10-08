@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use mote::cli::{Cli, near_miss_hint, run, run_help_all};
+use mote::cli::{Cli, near_miss_hint, run, run_help_all, unresolved_actor_hint};
 use mote::errors::MoteError;
 
 fn main() {
@@ -36,10 +36,16 @@ fn main() {
             std::process::exit(exit_code);
         }
     };
+    let store_flag = cli.store.clone();
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("mote: {e}");
+            if matches!(e, MoteError::ActorUnresolved) {
+                if let Some(hint) = unresolved_actor_hint(store_flag.as_deref()) {
+                    eprintln!("hint: {hint}");
+                }
+            }
             let code = match e {
                 MoteError::Rejected(_) => 2,
                 MoteError::ActorUnresolved

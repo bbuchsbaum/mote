@@ -97,7 +97,9 @@ pub(crate) fn apply(state: &mut state::State, id: &str, o: HandoffOp) {
         claimed_by: o.to,
         claim_clock: id.into(),
         lease_until_ts: ids::format_rfc3339(until),
+        session: None,
     });
+    bead.released_claim = None;
     bead.notes.push(state::Note {
         op_id: id.into(),
         note_kind: "handoff".into(),

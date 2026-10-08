@@ -37,6 +37,9 @@ pub struct Bead {
     pub clock: BTreeMap<String, String>,
     pub notes: Vec<Note>,
     pub claim: Option<ClaimState>,
+    /// The most recent explicit release, kept until the next claim so a
+    /// `doing` bead left without a holder can say who walked away from it.
+    pub released_claim: Option<ReleasedClaim>,
     pub created_at_op: String,
     pub created_at_ts: String,
     pub deleted_at_ts: Option<String>,
@@ -49,6 +52,8 @@ pub struct ClaimState {
     /// RFC3339 microsecond UTC string. Comparable lexicographically against any
     /// other RFC3339 timestamp produced by `ids::format_rfc3339`.
     pub lease_until_ts: String,
+    /// Session that made the claim, when it was made under a live session.
+    pub session: Option<String>,
 }
 
 impl ClaimState {
@@ -56,6 +61,44 @@ impl ClaimState {
     pub fn is_live(&self, now_ts: &str) -> bool {
         now_ts < self.lease_until_ts.as_str()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReleasedClaim {
+    pub released_by: String,
+    pub released_ts: String,
+    pub op_id: String,
+}
+
+/// Why a `doing` bead has no live holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrandReason {
+    /// The holder released the claim without moving the bead off `doing`.
+    Released,
+    /// The claim lease ran out.
+    Expired,
+    /// The bead was set to `doing` without ever being claimed (or the release
+    /// predates this projection).
+    Unclaimed,
+}
+
+impl StrandReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Released => "released",
+            Self::Expired => "expired",
+            Self::Unclaimed => "unclaimed",
+        }
+    }
+}
+
+/// A `doing` bead with satisfied dependencies and no live claim. It stays in
+/// `doing` for history, but `ready` offers it again so the work is not lost.
+#[derive(Debug, Clone)]
+pub struct Stranded {
+    pub reason: StrandReason,
+    pub last_holder: Option<String>,
+    pub since_ts: Option<String>,
 }
 
 impl Bead {
@@ -2324,11 +2367,94 @@ impl State {
         if bead.is_deleted() || bead.status != Status::Open {
             return false;
         }
+        self.deps_satisfied(bead)
+    }
+
+    /// Every blocking dependency of `bead` is closed or deleted.
+    pub fn deps_satisfied(&self, bead: &Bead) -> bool {
         bead.deps.iter().all(|(parent_id, _)| {
             self.beads
                 .get(parent_id)
                 .is_none_or(|p| p.is_deleted() || p.status == Status::Closed)
         })
+    }
+
+    /// `Some` iff `bead` is unblocked, in `doing`, and has no live claim as-of
+    /// `now_ts`: work someone started and then released or let expire.
+    ///
+    /// A bead whose last holder still shows signs of life is not stranded: a
+    /// live reservation by that holder on the bead, or (for an expired claim) a
+    /// still-live session the claim was bound to. Claim leases are shorter than
+    /// reservation leases and sessions do not renew claims, so expiry alone
+    /// does not mean the worker is gone.
+    pub fn stranded(&self, bead: &Bead, now_ts: &str) -> Option<Stranded> {
+        if bead.is_deleted() || bead.status != Status::Doing || !self.deps_satisfied(bead) {
+            return None;
+        }
+        let holder_active = |holder: &str| {
+            self.reservations
+                .values()
+                .any(|r| r.actor == holder && r.entity == bead.id && r.is_active(now_ts))
+        };
+        match &bead.claim {
+            Some(c) if c.is_live(now_ts) => None,
+            Some(c)
+                if holder_active(&c.claimed_by)
+                    || c.session.as_deref().is_some_and(|sid| {
+                        self.sessions.get(sid).is_some_and(|s| s.is_live(now_ts))
+                    }) =>
+            {
+                None
+            }
+            None if bead
+                .released_claim
+                .as_ref()
+                .is_some_and(|r| holder_active(&r.released_by)) =>
+            {
+                None
+            }
+            Some(c) => Some(Stranded {
+                reason: StrandReason::Expired,
+                last_holder: Some(c.claimed_by.clone()),
+                since_ts: Some(c.lease_until_ts.clone()),
+            }),
+            None => Some(match &bead.released_claim {
+                Some(r) => Stranded {
+                    reason: StrandReason::Released,
+                    last_holder: Some(r.released_by.clone()),
+                    since_ts: Some(r.released_ts.clone()),
+                },
+                None => Stranded {
+                    reason: StrandReason::Unclaimed,
+                    last_holder: None,
+                    since_ts: None,
+                },
+            }),
+        }
+    }
+
+    /// Stranded work that `ready` and `next` offer again. A `doing` bead that
+    /// was never claimed may be tracked by hand, so it is reported but not
+    /// handed out.
+    pub fn offers_stranded(&self, bead: &Bead, now_ts: &str) -> bool {
+        self.stranded(bead, now_ts)
+            .is_some_and(|s| s.reason != StrandReason::Unclaimed)
+    }
+
+    /// `is_ready` as of `now_ts`: open unblocked work plus offered stranded
+    /// work. The predicate behind every "ready" view.
+    pub fn is_ready_at(&self, bead: &Bead, now_ts: &str) -> bool {
+        self.is_ready(bead) || self.offers_stranded(bead, now_ts)
+    }
+
+    /// Stranded `doing` beads as-of `now_ts`, in id order.
+    pub fn stranded_beads<'a>(
+        &'a self,
+        now_ts: &'a str,
+    ) -> impl Iterator<Item = (&'a Bead, Stranded)> {
+        self.beads
+            .values()
+            .filter_map(move |b| self.stranded(b, now_ts).map(|s| (b, s)))
     }
 
     /// Non-blocking relation children of `parent_id`, in bead id order.
@@ -2373,18 +2499,26 @@ impl State {
     }
 
     /// Filtering variant of `ready_beads` that also rejects beads currently
-    /// claimed by another actor (with a non-expired lease as-of `now_ts`).
+    /// claimed by another actor (with a non-expired lease as-of `now_ts`), and
+    /// adds stranded `doing` beads (see [`State::stranded`]) so released or
+    /// expired work returns to every actor's queue.
     pub fn ready_beads_for<'a>(
         &'a self,
         actor: &'a str,
         now_ts: &'a str,
     ) -> impl Iterator<Item = &'a Bead> {
-        self.beads.values().filter(move |b| {
-            if !self.is_ready(b) {
-                return false;
-            }
-            !matches!(&b.claim, Some(c) if c.is_live(now_ts) && c.claimed_by != actor)
-        })
+        self.beads
+            .values()
+            .filter(move |b| self.is_ready_for(b, actor, now_ts))
+    }
+
+    /// Whether `ready` would offer `bead` to `actor` as-of `now_ts`.
+    pub fn is_ready_for(&self, bead: &Bead, actor: &str, now_ts: &str) -> bool {
+        if self.offers_stranded(bead, now_ts) {
+            return true;
+        }
+        self.is_ready(bead)
+            && !matches!(&bead.claim, Some(c) if c.is_live(now_ts) && c.claimed_by != actor)
     }
 
     /// All un-acked messages whose recipient is `actor`, in send-order.

@@ -1409,3 +1409,36 @@ fn real_serve_process_preserves_protocol_and_store_boundaries() {
     server.0.wait().unwrap();
     assert_eq!(directory_snapshot(store.root()), before_kill);
 }
+
+#[test]
+fn http_close_refuses_work_another_actor_holds() {
+    let temp = TempDir::new().unwrap();
+    let store = Store::init(temp.path()).unwrap();
+    let (_, created) = write_json(
+        &store,
+        "POST",
+        "/api/beads",
+        "web-alice",
+        serde_json::json!({"title": "held", "priority": 1}),
+    );
+    let bead_id = created.unwrap()["id"].as_str().unwrap().to_string();
+    run_mote(&temp, &["claim", &bead_id, "--actor", "alice"]);
+    let before = store.list_op_filenames().unwrap().len();
+    let (status, body) = write_json(
+        &store,
+        "POST",
+        &format!("/api/beads/{bead_id}/close"),
+        "web-bob",
+        serde_json::json!({"note": "not mine"}),
+    );
+    assert_eq!(status, 409, "{body:?}");
+    assert_eq!(store.list_op_filenames().unwrap().len(), before);
+    let (status, _) = write_json(
+        &store,
+        "POST",
+        &format!("/api/beads/{bead_id}/close"),
+        "alice",
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 204);
+}

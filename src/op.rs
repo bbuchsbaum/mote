@@ -227,6 +227,10 @@ pub struct ClaimOp {
     pub ttl_s: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_claim: Option<String>,
+    /// Live session of `actor` making the claim. A claim bound to a session
+    /// can be renewed only from that session while it stays live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1351,8 +1355,23 @@ pub fn make_claim(
     expect_claim: Option<String>,
     ts: jiff::Timestamp,
 ) -> Op {
+    make_session_claim(actor, entity, to, ttl_s, expect_claim, None, ts)
+}
+
+/// `make_claim` bound to the caller's live session (see [`ClaimOp::session`]).
+pub fn make_session_claim(
+    actor: String,
+    entity: BeadId,
+    to: String,
+    ttl_s: u32,
+    expect_claim: Option<String>,
+    session: Option<String>,
+    ts: jiff::Timestamp,
+) -> Op {
     Op::Claim(ClaimOp {
-        v: 1,
+        // v2 marks session-bound claims so a reducer can tell them apart; a
+        // sessionless claim keeps the v1 bytes older stores already contain.
+        v: if session.is_some() { 2 } else { 1 },
         op: String::new(),
         ts: ids::format_rfc3339(ts),
         actor,
@@ -1360,6 +1379,7 @@ pub fn make_claim(
         to,
         ttl_s,
         expect_claim,
+        session,
     })
 }
 
