@@ -13,6 +13,7 @@ pub mod discussion_pulse;
 pub mod errors;
 pub mod events;
 pub mod fsck;
+pub mod graph;
 pub mod handoff;
 pub mod ids;
 pub mod landing;

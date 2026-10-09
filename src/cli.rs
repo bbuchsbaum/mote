@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -248,10 +248,32 @@ pub enum Command {
         /// Combines as an additional filter on top of --status / --tag / --assignee.
         #[arg(long)]
         ready: bool,
+        /// Show relationships, retaining prerequisites and parents as context
+        #[arg(long)]
+        graph: bool,
     },
 
     /// List ready beads (open + no open blockers)
-    Ready,
+    Ready {
+        /// Show ready work and what it can unblock, with relationship context
+        #[arg(long)]
+        graph: bool,
+    },
+
+    /// Visualize issue dependencies and non-blocking hierarchy
+    Graph {
+        /// Focus on this issue's connected component
+        id: Option<String>,
+        /// Include closed issues (closed prerequisites always appear as context)
+        #[arg(long)]
+        all: bool,
+        /// Select ready work and show what it can unblock
+        #[arg(long)]
+        ready: bool,
+        /// Output a terminal graph or a styled Mermaid diagram
+        #[arg(long, value_parser = ["text", "mermaid"])]
+        format: Option<String>,
+    },
 
     /// Append a note to a bead
     Note {
@@ -1565,7 +1587,8 @@ impl Command {
                 | Command::Children { .. }
                 | Command::Dependents { .. }
                 | Command::Ls { .. }
-                | Command::Ready
+                | Command::Ready { .. }
+                | Command::Graph { .. }
                 | Command::History { .. }
                 | Command::Msg {
                     cmd: MsgCmd::Thread { .. } | MsgCmd::Requests { .. },
@@ -1735,6 +1758,7 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             assignee,
             all,
             ready,
+            graph,
         } => cmd_ls(
             cli.actor.as_deref(),
             cli.store.as_deref(),
@@ -1744,8 +1768,25 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             assignee,
             all,
             ready,
+            graph,
         ),
-        Command::Ready => cmd_ready(cli.actor.as_deref(), cli.store.as_deref(), cli.json),
+        Command::Ready { graph } => {
+            cmd_ready(cli.actor.as_deref(), cli.store.as_deref(), cli.json, graph)
+        }
+        Command::Graph {
+            id,
+            all,
+            ready,
+            format,
+        } => cmd_graph(
+            cli.actor.as_deref(),
+            cli.store.as_deref(),
+            cli.json,
+            id,
+            all,
+            ready,
+            format.as_deref(),
+        ),
         Command::Note {
             id,
             note_kind,
@@ -5571,7 +5612,13 @@ fn cmd_ls(
     assignee: Option<String>,
     all: bool,
     ready: bool,
+    graph: bool,
 ) -> MoteResult<i32> {
+    if graph && json_mode {
+        return Err(MoteError::Invalid(
+            "--graph cannot be combined with --json; use mote graph --json".into(),
+        ));
+    }
     let store = open_store(store_flag)?;
     let state = reducer::replay_store(&store)?;
 
@@ -5583,7 +5630,7 @@ fn cmd_ls(
     };
 
     // For the --ready filter we need actor identity to exclude foreign claims.
-    let (actor, now_ts) = if ready {
+    let (actor, now_ts) = if ready || graph {
         let actor = store.resolve_actor(actor_flag).unwrap_or_default();
         let now = ids::format_rfc3339(Timestamp::now());
         (actor, now)
@@ -5620,6 +5667,14 @@ fn cmd_ls(
         .collect();
 
     beads.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+
+    if graph {
+        let selected = beads.iter().map(|b| b.id.clone()).collect();
+        print_issue_graph(&crate::graph::IssueGraph::build(
+            &state, &selected, ready, &actor, &now_ts,
+        ));
+        return Ok(0);
+    }
 
     if json_mode {
         let arr: Vec<_> = beads
@@ -5700,7 +5755,13 @@ fn cmd_ready(
     actor_flag: Option<&str>,
     store_flag: Option<&Path>,
     json_mode: bool,
+    graph: bool,
 ) -> MoteResult<i32> {
+    if graph && json_mode {
+        return Err(MoteError::Invalid(
+            "--graph cannot be combined with --json; use mote graph --json".into(),
+        ));
+    }
     let store = open_store(store_flag)?;
     let state = reducer::replay_store(&store)?;
     // If actor is unresolved, fall back to "" so any non-empty `claimed_by`
@@ -5709,6 +5770,14 @@ fn cmd_ready(
     let now = ids::format_rfc3339(Timestamp::now());
     let mut beads: Vec<&Bead> = state.ready_beads_for(&actor, &now).collect();
     beads.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+
+    if graph {
+        let selected = beads.iter().map(|b| b.id.clone()).collect();
+        print_issue_graph(&crate::graph::IssueGraph::build(
+            &state, &selected, true, &actor, &now,
+        ));
+        return Ok(0);
+    }
 
     if json_mode {
         let arr: Vec<_> = beads
@@ -5740,6 +5809,54 @@ fn cmd_ready(
                 b.title
             );
         }
+    }
+    Ok(0)
+}
+
+fn print_issue_graph(graph: &crate::graph::IssueGraph) {
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    print!("{}", graph.text(color));
+}
+
+fn cmd_graph(
+    actor_flag: Option<&str>,
+    store_flag: Option<&Path>,
+    json_mode: bool,
+    id: Option<String>,
+    all: bool,
+    ready: bool,
+    format: Option<&str>,
+) -> MoteResult<i32> {
+    if json_mode && format.is_some() {
+        return Err(MoteError::Invalid(
+            "--format cannot be combined with --json".into(),
+        ));
+    }
+    let store = open_store(store_flag)?;
+    let state = reducer::replay_store(&store)?;
+    let actor = store.resolve_actor(actor_flag).unwrap_or_default();
+    let now = ids::format_rfc3339(Timestamp::now());
+    let mut selected: BTreeSet<_> = state
+        .live_beads()
+        .filter(|b| all || b.status != Status::Closed)
+        .map(|b| b.id.clone())
+        .collect();
+    if let Some(id) = id {
+        if state.beads.get(&id).is_none_or(|b| b.is_deleted()) {
+            return Err(MoteError::Invalid(format!("no such live bead {id}")));
+        }
+        crate::graph::component(&state, &mut selected, &id);
+    }
+    if ready {
+        selected.retain(|id| state.is_ready_for(&state.beads[id], &actor, &now));
+    }
+    let graph = crate::graph::IssueGraph::build(&state, &selected, ready, &actor, &now);
+    if json_mode {
+        println!("{}", serde_json::to_string(&graph)?);
+    } else if format == Some("mermaid") {
+        print!("{}", graph.mermaid());
+    } else {
+        print_issue_graph(&graph);
     }
     Ok(0)
 }

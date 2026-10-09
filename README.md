@@ -68,6 +68,48 @@ Every publisher holds the shared store's OS lock. Its Maildir write steps are:
 Op filenames are sortable: `YYYYMMDDTHHMMSS.UUUUUUZ-p<pid>-c<ctr>-r<rand>-h<hash6>.json`.
 The 6-hex content hash is a corruption / debug aid, not the primary identity.
 
+## See the relationships
+
+```sh
+mote graph                       # Active issues, dependencies, and hierarchy
+mote graph <id>                  # Focus on one connected component
+mote ready --graph               # Ready work and what it can unblock
+mote ls --tag backend --graph    # Filtered work, with its prerequisites/parents
+mote graph --all                 # Include closed work
+mote graph --format mermaid > issues.mmd
+mote graph --json                # Nodes and typed edges for other tools
+```
+
+The terminal view follows prerequisites toward their dependents. For example:
+
+```text
+● Design  design · p1 · open · ready
+├── → ◌ API  api · p2 · open · waiting
+│   └── → ◌ Ship  ship · p2 · open · waiting
+└── → ◌ Client  client · p2 · open · waiting
+    └── → ↩ ship  Ship
+```
+
+`→` is a blocking dependency; `┄ (parent)` is a non-blocking hierarchy link.
+`✓→` marks a satisfied dependency. Shared descendants and cycles use `↩`
+references, so every link remains visible without repeating entire subgraphs.
+Long chains use `↪` continuations below to keep indentation within four levels.
+Readiness uses the same actor and lease rules as `mote ready`.
+
+Filtered views retain ancestors as `[context]`, including closed or deleted
+prerequisites. Ready graphs also include downstream dependents and their other
+prerequisites. Context issues are not additional matches or ready-work offers.
+A focused graph follows connections among active issues; use `--all` to also
+traverse closed work. Terminal color is automatic and respects `NO_COLOR`;
+piped output contains no ANSI escapes.
+
+Mermaid export uses solid dependency arrows, dashed hierarchy arrows, and
+status colors. Paste it into a Mermaid code block in Markdown to render it.
+`--json graph` emits full IDs, node status/readiness/context, and edges with
+`from` (prerequisite/parent), `to` (dependent/child), `kind`, `blocking`, and
+`satisfied`. Existing flat `ls`/`ready` output and their JSON arrays are unchanged;
+`--graph` cannot be combined with `--json` on those list commands.
+
 ## Coordination planes
 
 All planes share the same publication mechanism and reducer.
