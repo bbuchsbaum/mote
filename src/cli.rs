@@ -1722,7 +1722,12 @@ fn warn_stale_requests_for_stateful_invocation(cli: &Cli) -> MoteResult<()> {
 pub fn run(cli: Cli) -> MoteResult<i32> {
     guard_concurrent_local_identity(&cli)?;
     warn_stale_requests_for_stateful_invocation(&cli)?;
-    match cli.command {
+    // Activation is per replica; detect it here so every activating command
+    // (begin, claim, handoff, land, a session-bound claim) reports it.
+    let unfenced_store = open_store(cli.store.as_deref())
+        .ok()
+        .filter(|store| !crate::authority::enabled(store));
+    let code = match cli.command {
         Command::Init { separate } => cmd_init(cli.quiet, separate),
         Command::Authority { cmd } => cmd_authority(cli.store.as_deref(), cmd),
         Command::Admit => cmd_admit(cli.store.as_deref(), cli.json),
@@ -2049,7 +2054,11 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             cmd_import(cli.actor.as_deref(), cli.store.as_deref(), cli.json, input)
         }
         Command::Skills { cmd } => cmd_skills(cli.json, cli.quiet, cmd),
+    };
+    if let Some(store) = unfenced_store {
+        note_git_versioned_activation(&store);
     }
+    code
 }
 
 #[derive(Debug, Serialize)]
@@ -4226,10 +4235,11 @@ fn cmd_authority(store_flag: Option<&Path>, cmd: AuthorityCmd) -> MoteResult<i32
     let (status, activated) = match cmd {
         AuthorityCmd::Status => (crate::authority::status(&store)?, false),
         AuthorityCmd::Enable => {
+            let was_enabled = crate::authority::enabled(&store);
             let writer = crate::authority::Writer::acquire(&store)?;
-            let activated = enable_authority(&writer)?;
+            writer.enable()?;
             drop(writer);
-            (crate::authority::status(&store)?, activated)
+            (crate::authority::status(&store)?, !was_enabled)
         }
         AuthorityCmd::Migrate {
             discard_foreign_format,
@@ -4256,23 +4266,16 @@ fn cmd_authority(store_flag: Option<&Path>, cmd: AuthorityCmd) -> MoteResult<i32
     Ok(0)
 }
 
-/// Activate authority under `writer`, returning whether this call created it.
-/// Activation is per replica; when the op log is versioned in Git, say so,
-/// because ops pulled from other clones must then be admitted explicitly.
-fn enable_authority(writer: &crate::authority::Writer<'_>) -> MoteResult<bool> {
-    let was_enabled = crate::authority::enabled(writer.store);
-    writer.enable()?;
-    if was_enabled {
-        return Ok(false);
-    }
-    if crate::audit::ops_tracked_by_git(writer.store) {
+/// When a command activated authority in a replica of a Git-versioned op log,
+/// say so: ops pulled from other clones must then be admitted explicitly.
+fn note_git_versioned_activation(store: &Store) {
+    if crate::authority::enabled(store) && crate::audit::ops_tracked_by_git(store) {
         eprintln!(
             "note: activated authority fencing for this replica of a Git-versioned op log; \
              after pulling ops from other clones run `mote admit` (for example from a \
              post-merge hook); keep .mote/authority/ and .mote/local/ out of Git"
         );
     }
-    Ok(true)
 }
 
 fn cmd_admit(store_flag: Option<&Path>, json_mode: bool) -> MoteResult<i32> {
@@ -6069,7 +6072,7 @@ fn cmd_close(
     let actor = store.resolve_actor(actor_flag)?;
     // Check the holder and admit the close in one Writer critical section.
     let writer = crate::authority::Writer::acquire(&store)?;
-    enable_authority(&writer)?;
+    writer.enable()?;
     writer.ensure_no_landing()?;
     let state = reducer::replay_store(&store)?;
     let now = ids::format_rfc3339(Timestamp::now());
@@ -6125,7 +6128,7 @@ fn cmd_claim(
     // Claim acquisition is a strict boundary: activate and retain the shared
     // writer before observing a competing holder or minting a timestamp.
     let writer = crate::authority::Writer::acquire(&store)?;
-    enable_authority(&writer)?;
+    writer.enable()?;
     writer.ensure_no_landing()?;
     let format = store.read_format()?;
     let ttl_s = ttl.unwrap_or(format.default_ttl_s.claim);
@@ -6282,7 +6285,7 @@ fn cmd_next(
     let store = open_store(store_flag)?;
     let actor = store.resolve_actor(actor_flag)?;
     let writer = crate::authority::Writer::acquire(&store)?;
-    enable_authority(&writer)?;
+    writer.enable()?;
     writer.ensure_no_landing()?;
     let format = store.read_format()?;
     let ttl_s = ttl.unwrap_or(format.default_ttl_s.claim);
@@ -9966,7 +9969,7 @@ fn cmd_begin(
     // serializes every upgraded writer. Activation happens before the first
     // reservation timestamp and before reading claim state.
     let writer = crate::authority::Writer::acquire(&store)?;
-    enable_authority(&writer)?;
+    writer.enable()?;
     writer.ensure_no_landing()?;
     let format = store.read_format()?;
     let reserve_ttl = ttl.unwrap_or(format.default_ttl_s.reservation);
@@ -10225,7 +10228,7 @@ fn cmd_done(
     // Re-check the holder and admit the close under one Writer critical
     // section, so a claim cannot land between the check and the close.
     let writer = crate::authority::Writer::acquire(&store)?;
-    enable_authority(&writer)?;
+    writer.enable()?;
     writer.ensure_no_landing()?;
     if !force {
         let fresh = reducer::replay_store(&store)?;

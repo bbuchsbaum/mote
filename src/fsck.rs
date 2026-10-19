@@ -61,7 +61,9 @@ pub fn run(store: &Store, clean_tmp: bool) -> MoteResult<FsckReport> {
                 OpDefect::Hash { expected, got } => {
                     report.bad_hash.push((name.clone(), expected, got))
                 }
-                OpDefect::Shape(error) => report.bad_op_shape.push((name.clone(), error)),
+                OpDefect::Shape(error) | OpDefect::Envelope(error) => {
+                    report.bad_op_shape.push((name.clone(), error))
+                }
             }
         }
     }
@@ -102,7 +104,10 @@ pub(crate) enum OpDefect {
         expected: String,
         got: String,
     },
+    /// The bytes do not parse as an op kind this binary knows.
     Shape(String),
+    /// The envelope's `op` or `ts` disagrees with the filename.
+    Envelope(String),
 }
 
 impl std::fmt::Display for OpDefect {
@@ -114,6 +119,7 @@ impl std::fmt::Display for OpDefect {
                 write!(f, "hash mismatch: expected {expected}, got {got}")
             }
             OpDefect::Shape(error) => write!(f, "bad op shape: {error}"),
+            OpDefect::Envelope(error) => write!(f, "bad envelope: {error}"),
         }
     }
 }
@@ -126,10 +132,11 @@ pub(crate) fn check_op(name: &str, bytes: &[u8]) -> Vec<OpDefect> {
         Ok(p) => p,
         Err(_) => return vec![OpDefect::Filename],
     };
-    let mut value: Value = match serde_json::from_slice(bytes) {
+    let raw: Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(_) => return vec![OpDefect::Json],
     };
+    let mut value = raw.clone();
     match value.as_object_mut() {
         Some(obj) => {
             obj.insert("op".to_string(), Value::String(String::new()));
@@ -147,37 +154,36 @@ pub(crate) fn check_op(name: &str, bytes: &[u8]) -> Vec<OpDefect> {
         });
     }
 
-    // Op-shape check: bytes parse as JSON, but do they match a known kind?
-    match serde_json::from_slice::<Op>(bytes) {
-        Ok(op) => {
-            let op_id_from_filename = name.trim_end_matches(".json");
-            if op.op_id() != op_id_from_filename {
-                defects.push(OpDefect::Shape(format!(
-                    "envelope op `{}` does not match filename stem `{}`",
-                    op.op_id(),
-                    op_id_from_filename
+    // Envelope invariants, read from the raw JSON so they hold for op kinds
+    // this binary does not know: op == filename stem, ts matches filename ts.
+    let op_id_from_filename = name.trim_end_matches(".json");
+    let envelope_op = raw.get("op").and_then(Value::as_str).unwrap_or_default();
+    if envelope_op != op_id_from_filename {
+        defects.push(OpDefect::Envelope(format!(
+            "envelope op `{envelope_op}` does not match filename stem `{op_id_from_filename}`"
+        )));
+    }
+    let envelope_ts = raw.get("ts").and_then(Value::as_str).unwrap_or_default();
+    match envelope_ts.parse::<jiff::Timestamp>() {
+        Ok(parsed) => {
+            let expected_basic = ids::format_op_timestamp(parsed);
+            if expected_basic != parts.ts {
+                defects.push(OpDefect::Envelope(format!(
+                    "envelope ts `{envelope_ts}` does not match filename ts `{}`",
+                    parts.ts
                 )));
             }
-            match op.ts().parse::<jiff::Timestamp>() {
-                Ok(parsed) => {
-                    let expected_basic = ids::format_op_timestamp(parsed);
-                    if expected_basic != parts.ts {
-                        defects.push(OpDefect::Shape(format!(
-                            "envelope ts `{}` does not match filename ts `{}`",
-                            op.ts(),
-                            parts.ts
-                        )));
-                    }
-                }
-                Err(e) => {
-                    defects.push(OpDefect::Shape(format!(
-                        "envelope ts `{}` is unparseable: {e}",
-                        op.ts()
-                    )));
-                }
-            }
         }
-        Err(e) => defects.push(OpDefect::Shape(format!("{e}"))),
+        Err(e) => {
+            defects.push(OpDefect::Envelope(format!(
+                "envelope ts `{envelope_ts}` is unparseable: {e}"
+            )));
+        }
+    }
+
+    // Op-shape check: bytes parse as JSON, but do they match a known kind?
+    if let Err(e) = serde_json::from_slice::<Op>(bytes) {
+        defects.push(OpDefect::Shape(format!("{e}")));
     }
     defects
 }

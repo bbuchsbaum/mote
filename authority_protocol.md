@@ -101,25 +101,32 @@ mote admit           # or: mote --json admit  (mote.admit.v1)
 ```
 
 `admit` first recovers any pending publication, refuses to run while a landing
-needs recovery, and validates the complete admitted prefix. It then validates
-every unadmitted op as `fsck` does: filename, JSON, content hash, op shape, and
-envelope id and timestamp. Any defect fails closed and nothing is admitted. An
+needs recovery, and validates the complete admitted prefix. It then checks the
+integrity of every unadmitted op as `fsck` does: filename, JSON, content hash,
+and envelope id and timestamp. Any integrity defect fails closed and nothing is
+admitted. An op kind this binary does not know (published by a newer binary) is
+admitted; replay records it as rejected history, exactly as for a local
+publication. An
 admitted op whose bytes changed (the same op id with different bytes, as when a
 merge replaces a file) fails closed as `authority op changed`. Valid ops are
 appended as one atomic admission record, in op-id order, after the existing
 prefix. The prefix is never reordered. Admitting a session-bound claim raises the
 authority version before the claim becomes visible, as publication does. Run
 `admit` after every pull, or from a `post-merge` hook, and do not suppress its
-exit status.
+exit status. While a landing needs recovery, unadmitted ops are invisible rather
+than an error, so the recorded `candidate land` request can be retried against
+the prefix it bound; run `admit` after it completes.
 
 **Ordering.** Each replica orders foreign ops after its own admitted history, so
-replicas agree on the op set but not necessarily on the order. Ops on different
-issues replay identically everywhere. Concurrent conflicting ops (two claims on
-one issue, a close racing a patch) resolve in each replica's admission order and
-can resolve differently on different replicas. `admit` reports, as
-`out_of_order`, the admitted ops whose id sorts before the previous admitted
-tail: these are exactly the ops a pre-authority replay would have placed
-earlier. Surfacing or rejecting semantic conflicts is not implemented.
+replicas agree on the op set but not necessarily on the order. Ops whose effect
+does not depend on order replay identically everywhere. Order-sensitive ops can
+resolve differently on different replicas, permanently: two claims on one issue,
+overlapping path reservations (even on different issues), handoffs, a close
+racing a patch, and reused idempotency keys. `admit` reports, as `out_of_order`,
+the newly admitted ops whose id sorts before the previous admitted tail. That is
+informational only, not a conflict signal: the same conflict is reported on one
+replica and not on the other. Surfacing or rejecting semantic conflicts is not
+implemented.
 
 **Exclusivity.** Claims, reservations, holder-checked handoff, and fenced landing
 are exclusive within one replica. A claim made on another machine is visible
@@ -128,7 +135,11 @@ pending journals are strictly per replica and are never replicated.
 
 **Fresh clones.** A clone has `ops/` but no `authority/` or `local/`. It is
 unfenced until its first strict write (`begin`, `claim`, `authority enable`),
-which records the clone's current filename-ordered ops as its own genesis.
+which records the clone's current filename-ordered ops as its own genesis. The
+same happens to a replica that loses **both** `authority/` and `local/` (for
+example `git clean -fdX` with the ignore rules above): it reopens unfenced, and
+its next genesis is in op-id order, which can change the outcome of ops it had
+admitted out of order. Back up both directories; losing only one fails closed.
 
 ### Binding migration
 
@@ -155,12 +166,15 @@ a file that versioned stores track. This binary keeps the binding in
   lost.
 
 Compatibility with earlier binaries: they ignore `local/authority.json`. They
-read a migrated store correctly, but each of their writes adds the `FORMAT.json`
-binding back (for the same genesis, so this binary accepts it and `migrate`
-removes it again). They cannot admit foreign ops and fail closed on them.
-Earlier binaries also enforced the version fence only through `FORMAT.json`, so
-once a store is migrated they are no longer fenced out by a version raise.
-Upgrade every binary that writes the store, then migrate.
+read a store bound only locally (migrated, or activated by this binary)
+correctly, but each of their writes adds the `FORMAT.json` binding back. This
+binary accepts that copy (same genesis) and `migrate` removes it again, but if
+it is committed, fresh clones fail closed until they discard it: the original
+problem. They cannot admit foreign ops and fail closed on them. Authority-v1
+binaries (which predate session-bound claims) check the version fence only in
+`FORMAT.json`, so they are not fenced out of a version-2 store whose binding is
+only local, and would replay its session-bound claims differently. Upgrade every
+binary that writes or reads the store before activating or migrating.
 
 ## Fenced landing
 

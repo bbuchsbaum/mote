@@ -538,6 +538,25 @@ fn foreign_format_binding_from_another_clone_is_discarded_explicitly() {
     assert_eq!(discarded["foreign_format_binding_discarded"], true);
     assert_eq!(discarded["enabled"], true);
     assert_eq!(std::fs::read(store.format_path()).unwrap(), pristine);
+
+    // A replica that lost authority/ keeps its own legacy binding and stays
+    // fenced: the flag removes only another replica's binding.
+    let own = legacy_binding(&store);
+    std::fs::write(
+        authority::binding_path(&store),
+        serde_json::to_vec(&own).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(authority::directory(&store)).unwrap();
+    fails(&mote(
+        root.path(),
+        &["authority", "migrate", "--discard-foreign-format"],
+    ));
+    assert!(
+        String::from_utf8_lossy(&std::fs::read(store.format_path()).unwrap())
+            .contains(own["genesis_hash"].as_str().unwrap())
+    );
+    assert!(reducer::replay_store(&store).is_err());
 }
 
 #[test]
@@ -580,4 +599,81 @@ fn doctor_warns_when_git_tracks_per_replica_authority_state() {
         warnings.iter().any(|w| w.contains("is not ignored")),
         "{warnings:?}"
     );
+}
+
+#[test]
+fn conflicting_claims_from_two_replicas_resolve_in_each_replicas_admission_order() {
+    // Pins known behaviour: replicas agree on the op set, not on the order, so
+    // order-sensitive ops such as two claims on one issue can diverge.
+    let (_td, a, b, shared) = two_replicas();
+    ok(&mote(&a, &["--actor", "alice", "claim", &shared]));
+    ok(&mote(&b, &["--actor", "bob", "claim", &shared]));
+    publish_ops_and_sync(&a);
+    publish_ops_and_sync(&b);
+    git(
+        &a,
+        &["pull", "-q", "--no-rebase", "--no-edit", "origin", "main"],
+    );
+    ok(&mote(&a, &["admit"]));
+    ok(&mote(&b, &["admit"]));
+    let holder = |dir: &Path| {
+        board(dir)["active_claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|claim| claim["id"] == shared.as_str())
+            .map(|claim| claim["claimed_by"].clone())
+    };
+    assert_eq!(holder(&a), Some("alice".into()));
+    assert_eq!(holder(&b), Some("bob".into()));
+}
+
+#[test]
+fn unadmitted_ops_wait_while_a_landing_needs_recovery() {
+    let (root, store) = fenced_store();
+    let (file, bytes) = foreign_op(&ids::new_bead_id());
+    std::fs::write(store.ops_dir().join(&file), bytes).unwrap();
+    let active = authority::directory(&store).join("landing-active.json");
+    std::fs::write(&active, b"{}").unwrap();
+
+    // The landing's admitted prefix stays readable so it can be recovered...
+    ok(&mote(root.path(), &["--actor", "observer", "ls"]));
+    assert!(!store.list_op_filenames().unwrap().contains(&file));
+    // ...and nothing may extend that prefix until it is.
+    let error = fails(&mote(root.path(), &["admit"]));
+    assert!(error.contains("candidate land"), "{error}");
+    assert!(error.contains("mote admit"), "{error}");
+
+    std::fs::remove_file(&active).unwrap();
+    assert!(
+        reducer::replay_store(&store)
+            .unwrap_err()
+            .to_string()
+            .contains("unadmitted")
+    );
+    ok(&mote(root.path(), &["admit"]));
+    assert_eq!(store.list_op_filenames().unwrap().last(), Some(&file));
+}
+
+#[test]
+fn admit_accepts_an_op_kind_this_binary_does_not_know() {
+    // A clone on a newer binary may publish a new kind. Replay records it as
+    // rejected history; refusing it here would brick every older replica.
+    let (root, store) = fenced_store();
+    let other = TempDir::new().unwrap();
+    let newer = Store::init(other.path()).unwrap();
+    let name = publish::publish_value(
+        &newer,
+        serde_json::json!({"kind": "future_kind", "actor": "remote"}),
+        Timestamp::now(),
+    )
+    .unwrap();
+    let file = format!("{}.json", name.as_str());
+    std::fs::copy(newer.ops_dir().join(&file), store.ops_dir().join(&file)).unwrap();
+
+    let report: Value =
+        serde_json::from_str(&ok(&mote(root.path(), &["--json", "admit"]))).unwrap();
+    assert_eq!(report["admitted"], serde_json::json!([file.clone()]));
+    let state = reducer::replay_store(&store).unwrap();
+    assert!(!state.was_accepted(name.as_str()));
 }

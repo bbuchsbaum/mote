@@ -61,8 +61,10 @@ pub fn binding_path(store: &Store) -> PathBuf {
 /// - 1: shared admission order, holder-checked handoff, checked landing.
 /// - 2: the log may contain session-bound claims (claim op `v: 2`). Binaries
 ///   that only understand version 1 ignore the session binding and would
-///   replay those claims differently, so they must refuse the store; they do,
-///   because every replay checks this version first.
+///   replay those claims differently, so they must refuse the store. They
+///   check the version only in FORMAT.json, so they are fenced out only while
+///   a replica's binding is also recorded there (an unmigrated store); see
+///   `binding`.
 pub const AUTHORITY_VERSION: u32 = 2;
 
 pub fn enabled(store: &Store) -> bool {
@@ -338,8 +340,15 @@ fn scan(store: &Store, raw: Vec<String>) -> MoteResult<Scan> {
 
 /// Return the frozen publication order. Unadmitted operations fail closed.
 /// A pending publication is invisible until its admission record is durable.
+///
+/// While a landing needs recovery, unadmitted operations are invisible instead:
+/// no other writer, `admit` included, may extend the prefix that the landing
+/// decision bound, so failing here would leave the landing unrecoverable.
 pub(crate) fn ordered_names(store: &Store, raw: Vec<String>) -> MoteResult<Vec<String>> {
     let scan = scan(store, raw)?;
+    if landing_active(store) {
+        return Ok(scan.admitted);
+    }
     if let Some(name) = scan.unadmitted.first() {
         return Err(MoteError::Other(format!(
             "unadmitted operation {name} ({} unadmitted in total); this replica has not \
@@ -349,6 +358,10 @@ pub(crate) fn ordered_names(store: &Store, raw: Vec<String>) -> MoteResult<Vec<S
         )));
     }
     Ok(scan.admitted)
+}
+
+fn landing_active(store: &Store) -> bool {
+    directory(store).join("landing-active.json").exists()
 }
 
 /// Result of [`Writer::admit`].
@@ -493,10 +506,13 @@ impl<'a> Writer<'a> {
         let Some(legacy) = &format.authority else {
             return Ok(false);
         };
-        let local = read_local_binding(self.store)?;
-        let foreign = match &local {
-            Some(local) => local.genesis_hash != legacy.genesis_hash,
-            None => genesis_digest(self.store)?.as_deref() != Some(legacy.genesis_hash.as_str()),
+        // Judge against the genesis on disk; without one, a binding that
+        // matches this replica's local binding is its own (authority/ was
+        // lost) and stays, so the replica keeps failing closed.
+        let foreign = match genesis_digest(self.store)? {
+            Some(digest) => digest != legacy.genesis_hash,
+            None => read_local_binding(self.store)?
+                .is_none_or(|local| local.genesis_hash != legacy.genesis_hash),
         };
         if foreign {
             format.authority = None;
@@ -544,7 +560,13 @@ impl<'a> Writer<'a> {
     /// batch is appended in op-id order as one atomic admission record after
     /// the existing prefix, which is never reordered.
     pub fn admit(&self) -> MoteResult<AdmitReport> {
-        self.ensure_no_landing()?;
+        if landing_active(self.store) {
+            return Err(MoteError::Rejected(
+                "landing recovery required; retry the recorded candidate land request, \
+                 then run `mote admit`"
+                    .into(),
+            ));
+        }
         if !enabled(self.store) {
             return Ok(AdmitReport {
                 schema: "mote.admit.v1",
@@ -560,7 +582,13 @@ impl<'a> Writer<'a> {
         let mut session_claim = false;
         for name in &scan.unadmitted {
             let bytes = fs::read(self.store.ops_dir().join(name))?;
-            let defects = crate::fsck::check_op(name, &bytes);
+            // An op this binary cannot parse (a newer kind) is still admitted:
+            // replay records it as rejected history, as it would for a local
+            // publication. Integrity defects fail closed.
+            let defects: Vec<_> = crate::fsck::check_op(name, &bytes)
+                .into_iter()
+                .filter(|defect| !matches!(defect, crate::fsck::OpDefect::Shape(_)))
+                .collect();
             if !defects.is_empty() {
                 let defects = defects
                     .iter()
