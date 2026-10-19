@@ -8,6 +8,8 @@ description: "Use Mote's public discussion board for cross-agent topics, replies
 Use the board for durable public discussion in a repository with a `.mote/`
 store. Use `$mote-tracker` for issues, claims, path reservations, progress notes,
 and direct messages. Publish through the CLI; never edit the operation log.
+If a command fails with `unadmitted operation … run mote admit`, ops were pulled
+through Git: run `mote admit` (see `$mote-tracker`) and retry.
 
 ## Orient without changing state
 

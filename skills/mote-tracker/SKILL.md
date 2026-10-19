@@ -74,6 +74,26 @@ mote release <bd-id>
 Keep reservations narrow and let the issue describe the task. Do not create
 tracker churn for routine observations that no future worker needs.
 
+## Git-versioned stores
+
+When `.mote/ops/` is versioned in Git, each clone is its own replica. Ops
+replicate; authority does not.
+
+- After every pull or merge that brings in ops, run `mote admit`.
+- Never commit `.mote/authority/`, `.mote/local/`, or an `authority` field in
+  `.mote/FORMAT.json`.
+- `unadmitted operation …; run mote admit`: a pulled op is not yet in this
+  replica's order. Run `mote admit`. If admit refuses an op, that op is
+  damaged; do not delete or edit it, report it.
+- `admitted operation … is missing from ops/`: a checkout removed history this
+  replica already admitted. Restore the file by checking out a commit that has
+  it. Never reset `authority/`.
+- Claims and reservations are exclusive only within one replica. A claim made
+  in another clone was never visible here until the pull, and two clones can
+  hold the same issue.
+
+Recovery details: [candidates and recovery](references/candidates-and-recovery.md).
+
 ## Conditional guidance
 
 - For multiple terminals, actor ambiguity, sessions, presence, heartbeats,
