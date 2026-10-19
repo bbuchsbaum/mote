@@ -414,9 +414,53 @@ Prefer these for a human or supervising agent watching progress. They are not a
 substitute for `mote show`, `mote who-has`, or `mote history` when you need a
 single precise answer in a script.
 
+## Replicated Stores And Authority
+
+Ops in `.mote/ops/` may be versioned in Git; `.mote/authority/`, `.mote/local/`
+and `.mote/tmp/` never are. A fenced replica must admit pulled ops before reads
+succeed:
+
+```sh
+mote admit                 # validate unadmitted ops; append them in op-id order
+mote --json admit          # mote.admit.v1: enabled, admitted[], out_of_order[], record, admitted_total
+```
+
+`admit` is idempotent and atomic: any integrity defect admits nothing (exit 2).
+An unknown op kind from a newer binary is admitted, and replay rejects it.
+`out_of_order` lists admitted ops whose id sorts before the previous tail. It
+is informational: clones can order concurrent ops differently.
+
+Authority commands always print `mote.authority-status.v1` JSON (`enabled`,
+`authority_version`, `genesis_digest`, `binding`: `local`/`format`/null,
+`foreign_format_binding`):
+
+```sh
+mote authority status      # read-only validation
+mote authority enable      # activate under the writer lock; adds activated: true when new
+mote authority migrate     # move a legacy FORMAT.json binding to local/; adds format_binding_removed
+mote authority migrate --discard-foreign-format   # also drop another clone's FORMAT.json binding
+```
+
+Run `migrate` only after every binary writing the store is upgraded, because
+older binaries re-add the field. Use `--discard-foreign-format` only when the
+field came through Git, not when this replica lost `authority/`.
+
+Post-merge hook (do not swallow failures):
+
+```sh
+#!/bin/sh
+# .git/hooks/post-merge
+exec mote admit
+```
+
+`mote doctor` warns when Git tracks `authority/` or `local/`, when a fenced
+replica does not ignore `authority/`, or when a tracked `FORMAT.json` carries a
+binding.
+
 ## Exit Codes
 
 - `0`: success
+- `1`: other failures, including `unadmitted operation …`; run `mote admit`
 - `2`: reducer rejected the op; inspect current state before retrying
 - `3`: invalid command, validation error, or unresolved actor
 - `4`: store/layout/storage problem; run `mote doctor` and `mote fsck`
