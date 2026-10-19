@@ -31,8 +31,8 @@ developer plus a few local agents doing tiny task updates:
   FORMAT.json    # schema version, store id, default TTLs
   tmp/           # Maildir-style staging
   ops/           # immutable published ops, source of truth
-  authority/     # strict-mode admission order and durable recovery journals
-  local/         # actor identity and shared publication lock
+  authority/     # per-replica admission order and durable recovery journals
+  local/         # per-replica: actor identity, publication lock, authority binding
 ```
 
 ### Repository policy
@@ -41,11 +41,38 @@ For normal single-workstation use, keep `.mote/` out of git and treat it like
 local coordination state. Add `.mote/` to the host repository's `.gitignore`
 unless you have explicitly decided to version the op log.
 
-If the task history matters, back up `FORMAT.json`, `.mote/ops/`, and
-`.mote/authority/` together. Strict operations activate an admission journal that
-is also source of truth; op files alone are insufficient to restore that store.
-Do not hand-edit op files or journals. Use `mote fsck` or `mote doctor` when you
-suspect storage damage. See [shared-store authority](authority_protocol.md).
+If the task history matters, back up `FORMAT.json`, `.mote/ops/`,
+`.mote/authority/`, and `.mote/local/authority.json` together. Strict operations
+activate an admission journal that is also source of truth for that replica; op
+files alone are insufficient to restore it. Do not hand-edit op files or
+journals. Use `mote fsck` or `mote doctor` when you suspect storage damage. See
+[shared-store authority](authority_protocol.md).
+
+If you do version the op log, version **only** `FORMAT.json` and `ops/`. They
+form a grow-only set: op files are immutable and uniquely named, so a Git merge
+of `ops/` is a set union. Authority is per replica (each clone, machine, or VM
+holding its own `.mote/`), so keep it out of Git:
+
+```gitignore
+.mote/local/
+.mote/tmp/
+.mote/authority/
+```
+
+Ops pulled from another clone are not admitted in a fenced replica, and reads
+fail closed, naming the remedy, until you admit them:
+
+```sh
+git pull
+mote admit          # validate pulled ops; append them after the local order
+```
+
+Run it after every pull, or from a `post-merge` hook that runs `mote admit`. A
+failed admission means a pulled op is damaged or conflicts with admitted bytes,
+so do not suppress its exit status. `mote doctor` warns when Git tracks
+per-replica state. Claims, reservations, handoffs, and
+fenced landings are exclusive only within one replica: a claim made on another
+machine is visible after a pull, but never excluded anyone here.
 
 Automation can inspect the authority contract without changing the store:
 
@@ -57,6 +84,8 @@ mote authority enable
 
 Both commands print `mote.authority-status.v1` JSON. `status` is read-only;
 `enable` adds `activated: true` only when it created the authority journal.
+`mote authority migrate` moves a binding written by earlier binaries out of the
+tracked `FORMAT.json` into `local/authority.json`, keeping the genesis digest.
 
 Every publisher holds the shared store's OS lock. Its Maildir write steps are:
 
@@ -945,8 +974,11 @@ Requires Rust 1.85+ (edition 2024).
   authority fence. It does not change the index/worktree or push. Other candidate
   and audit commands make explicit read-only Git observations. Use separate Git
   worktrees for separate `HEAD`/index state. Reservations remain advisory.
-- No distributed sync protocol. Versioning `.mote/` in git is a manual policy
-  decision, not the default operational mode.
+- No distributed sync protocol. Versioning `.mote/ops/` in git is a manual
+  policy decision, not the default operational mode. Replicas exchange ops but
+  not authority: each replica admits foreign ops after its own history (`mote
+  admit`), so concurrent conflicting ops (two claims on one issue) can resolve
+  differently on different replicas.
 - No snapshots; replay-from-scratch is the v0.2 read path.
 
 ## Project layout
