@@ -175,6 +175,11 @@ pub enum Command {
         cmd: AuthorityCmd,
     },
 
+    /// Admit operations this replica has not admitted yet, such as ops pulled
+    /// through Git from another clone. Validates each one and appends them in
+    /// op-id order after the existing admission order.
+    Admit,
+
     /// Manage actor identity and inspect actors observed in this store
     Actor {
         #[command(subcommand)]
@@ -1110,6 +1115,14 @@ pub enum AuthorityCmd {
     Status,
     /// Acquire the shared writer lock and activate authority if needed
     Enable,
+    /// Move this replica's authority binding out of FORMAT.json into
+    /// `local/authority.json`, keeping the genesis digest
+    Migrate {
+        /// Also remove a FORMAT.json binding that names another replica's
+        /// genesis (for example one committed elsewhere and pulled through Git)
+        #[arg(long)]
+        discard_foreign_format: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1581,6 +1594,7 @@ impl Command {
             self,
             Command::Init { .. }
                 | Command::Authority { .. }
+                | Command::Admit
                 | Command::Actor { .. }
                 | Command::Show { .. }
                 | Command::Parents { .. }
@@ -1708,9 +1722,15 @@ fn warn_stale_requests_for_stateful_invocation(cli: &Cli) -> MoteResult<()> {
 pub fn run(cli: Cli) -> MoteResult<i32> {
     guard_concurrent_local_identity(&cli)?;
     warn_stale_requests_for_stateful_invocation(&cli)?;
-    match cli.command {
+    // Activation is per replica; detect it here so every activating command
+    // (begin, claim, handoff, land, a session-bound claim) reports it.
+    let unfenced_store = open_store(cli.store.as_deref())
+        .ok()
+        .filter(|store| !crate::authority::enabled(store));
+    let code = match cli.command {
         Command::Init { separate } => cmd_init(cli.quiet, separate),
         Command::Authority { cmd } => cmd_authority(cli.store.as_deref(), cmd),
+        Command::Admit => cmd_admit(cli.store.as_deref(), cli.json),
         Command::Actor { cmd } => {
             cmd_actor(cli.actor.as_deref(), cli.store.as_deref(), cli.json, cmd)
         }
@@ -2034,7 +2054,11 @@ pub fn run(cli: Cli) -> MoteResult<i32> {
             cmd_import(cli.actor.as_deref(), cli.store.as_deref(), cli.json, input)
         }
         Command::Skills { cmd } => cmd_skills(cli.json, cli.quiet, cmd),
+    };
+    if let Some(store) = unfenced_store {
+        note_git_versioned_activation(&store);
     }
+    code
 }
 
 #[derive(Debug, Serialize)]
@@ -4217,12 +4241,68 @@ fn cmd_authority(store_flag: Option<&Path>, cmd: AuthorityCmd) -> MoteResult<i32
             drop(writer);
             (crate::authority::status(&store)?, !was_enabled)
         }
+        AuthorityCmd::Migrate {
+            discard_foreign_format,
+        } => {
+            let (writer, discarded) = if discard_foreign_format {
+                crate::authority::Writer::acquire_discarding_foreign_format(&store)?
+            } else {
+                (crate::authority::Writer::acquire(&store)?, false)
+            };
+            let migrated = writer.migrate()?;
+            drop(writer);
+            let mut value = serde_json::to_value(crate::authority::status(&store)?)?;
+            value["format_binding_removed"] = serde_json::Value::Bool(migrated);
+            value["foreign_format_binding_discarded"] = serde_json::Value::Bool(discarded);
+            println!("{}", serde_json::to_string(&value)?);
+            return Ok(0);
+        }
     };
     let mut value = serde_json::to_value(status)?;
     if activated {
         value["activated"] = serde_json::Value::Bool(true);
     }
     println!("{}", serde_json::to_string(&value)?);
+    Ok(0)
+}
+
+/// When a command activated authority in a replica of a Git-versioned op log,
+/// say so: ops pulled from other clones must then be admitted explicitly.
+fn note_git_versioned_activation(store: &Store) {
+    if crate::authority::enabled(store) && crate::audit::ops_tracked_by_git(store) {
+        eprintln!(
+            "note: activated authority fencing for this replica of a Git-versioned op log; \
+             after pulling ops from other clones run `mote admit` (for example from a \
+             post-merge hook); keep .mote/authority/ and .mote/local/ out of Git"
+        );
+    }
+}
+
+fn cmd_admit(store_flag: Option<&Path>, json_mode: bool) -> MoteResult<i32> {
+    let store = open_store(store_flag)?;
+    let writer = crate::authority::Writer::acquire_for_admission(&store)?;
+    let report = writer.admit()?;
+    drop(writer);
+    if json_mode {
+        println!("{}", serde_json::to_string(&report)?);
+    } else if !report.enabled {
+        println!("authority not enabled; every op is already visible, nothing to admit");
+    } else if report.admitted.is_empty() {
+        println!("nothing to admit ({} ops admitted)", report.admitted_total);
+    } else {
+        println!(
+            "admitted {} op(s) ({} ops admitted)",
+            report.admitted.len(),
+            report.admitted_total
+        );
+        if !report.out_of_order.is_empty() {
+            println!(
+                "note: {} admitted op(s) sort before this replica's previous tail; they replay \
+                 after it here, so another replica may order them differently",
+                report.out_of_order.len()
+            );
+        }
+    }
     Ok(0)
 }
 
@@ -12342,6 +12422,7 @@ fn cmd_doctor(
     if let Some(warning) = git_backing.warning() {
         warnings.push(warning);
     }
+    warnings.extend(crate::audit::replica_state_warnings(&store));
     let worktree = worktree_redirect_report(&store);
     if let Some(report) = &worktree {
         if report.copy_only_ops > 0 {

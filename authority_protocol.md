@@ -16,7 +16,9 @@ mote authority status
 ```
 
 It prints `mote.authority-status.v1` JSON with `store_id`, `enabled`,
-`authority_version` (`0` or `1`), `genesis_digest`, and the capabilities
+`authority_version` (`0`, `1`, or `2`), `genesis_digest`, `binding` (`local`,
+`format` for a binding not yet migrated, or null), `foreign_format_binding`, and
+the capabilities
 `stable_claim_order`, `holder_checked_handoff`, and
 `checked_landing_results`. Enabled status validates the immutable admission
 prefix but does not acquire a writer lock, recover journals, or mutate the
@@ -34,6 +36,10 @@ upgraded writer first.
 
 ## Publication and replay
 
+Activation is per replica. Running `begin` in a store whose `ops/` is tracked
+by Git prints a note to that effect, because ops pulled from other clones must
+then be admitted explicitly (see below).
+
 Every in-tree publisher, including library and server writers, takes an exclusive
 OS lock on `.mote/local/publication.lock`. Do not delete or replace that file
 while any Mote process is running. The OS releases the lock when its process
@@ -42,8 +48,8 @@ exits. Normal read-only replay does not take the write lock.
 The first strict operation preserves the existing filename-ordered replay prefix
 in `.mote/authority/00000000000000000000.json`. Subsequent immutable, contiguous
 20-digit admission records each bind an operation filename and its full BLAKE3
-content digest. `FORMAT.json` records the authority version and genesis digest.
-Replay follows admission order. A later publication with an earlier timestamp
+content digest. `local/authority.json` records the authority version and genesis
+digest for this replica. Replay follows admission order. A later publication with an earlier timestamp
 cannot reorder this prefix or undo a committed landing authorization.
 
 Publication uses a durable `authority/publication.json` containing the exact
@@ -59,15 +65,116 @@ A pending operation is not visible to readers until admitted. The
 journal decision belongs before subsequent writers even if recovery happens
 later. Retries must retain the original request key and arguments.
 
-Back up or version **FORMAT.json, ops/, and authority/ together**. The numbered
-records, pending journals, and completed landing receipts are source of truth.
-Copying only the op files is no longer sufficient. Missing admission records,
-changed admitted bytes, and unadmitted files copied into `ops/` fail closed.
-`fsck` checks these bindings too. Event op cursors follow admission order in
+Back up **FORMAT.json, ops/, authority/, and local/authority.json together**.
+The numbered records, pending journals, and completed landing receipts are
+source of truth for the replica. Copying only the op files is no longer
+sufficient to restore it. Missing admission records, missing or changed admitted
+op files, and unadmitted files copied into `ops/` fail closed. `fsck` checks
+these bindings too. Event op cursors follow admission order in
 fenced stores. Resuming from a timed synthetic cursor conservatively replays raw
 operation IDs, which consumers can deduplicate; it does not skip late admissions. Do not hand-edit journals, remove a pending
 landing, merge independently writable authority directories, or run older Mote
 binaries against a fenced store. All worktrees must select the same `MOTE_STORE`.
+
+## Replicated op logs and per-replica authority
+
+A store whose `ops/` is versioned in Git has one replica per clone (machine,
+cloud VM, CI checkout). The model is:
+
+- **Replicated:** `FORMAT.json` and `ops/`. Op files are immutable and uniquely
+  named, so merging two clones' `ops/` is a set union.
+- **Per replica:** `authority/` (admission records, publication and landing
+  journals, landing receipts) and `local/` (including the binding in
+  `local/authority.json`). Never commit them, and never merge two replicas'
+  copies: admission records are sequential, and two writers produce different
+  record N for the same slot. Ignore `.mote/authority/`, `.mote/local/`, and
+  `.mote/tmp/`. `mote doctor` warns when Git tracks any of them, when it does
+  not ignore `authority/` in a fenced replica of a versioned op log, and when a
+  tracked `FORMAT.json` still carries a legacy binding.
+
+An op that arrives by `git pull` has no admission record in this replica. Reads
+fail closed with `unadmitted operation …; run mote admit`. Admit it under the
+writer lock:
+
+```sh
+mote admit           # or: mote --json admit  (mote.admit.v1)
+```
+
+`admit` first recovers any pending publication, refuses to run while a landing
+needs recovery, and validates the complete admitted prefix. It then checks the
+integrity of every unadmitted op as `fsck` does: filename, JSON, content hash,
+and envelope id and timestamp. Any integrity defect fails closed and nothing is
+admitted. An op kind this binary does not know (published by a newer binary) is
+admitted; replay records it as rejected history, exactly as for a local
+publication. An
+admitted op whose bytes changed (the same op id with different bytes, as when a
+merge replaces a file) fails closed as `authority op changed`. Valid ops are
+appended as one atomic admission record, in op-id order, after the existing
+prefix. The prefix is never reordered. Admitting a session-bound claim raises the
+authority version before the claim becomes visible, as publication does. Run
+`admit` after every pull, or from a `post-merge` hook, and do not suppress its
+exit status. While a landing needs recovery, unadmitted ops are invisible rather
+than an error, so the recorded `candidate land` request can be retried against
+the prefix it bound; run `admit` after it completes.
+
+**Ordering.** Each replica orders foreign ops after its own admitted history, so
+replicas agree on the op set but not necessarily on the order. Ops whose effect
+does not depend on order replay identically everywhere. Order-sensitive ops can
+resolve differently on different replicas, permanently: two claims on one issue,
+overlapping path reservations (even on different issues), handoffs, a close
+racing a patch, and reused idempotency keys. `admit` reports, as `out_of_order`,
+the newly admitted ops whose id sorts before the previous admitted tail. That is
+informational only, not a conflict signal: the same conflict is reported on one
+replica and not on the other. Surfacing or rejecting semantic conflicts is not
+implemented.
+
+**Exclusivity.** Claims, reservations, holder-checked handoff, and fenced landing
+are exclusive within one replica. A claim made on another machine is visible
+after a pull and admit, but it never excluded anyone here. Landing receipts and
+pending journals are strictly per replica and are never replicated.
+
+**Fresh clones.** A clone has `ops/` but no `authority/` or `local/`. It is
+unfenced until its first strict write (`begin`, `claim`, `authority enable`),
+which records the clone's current filename-ordered ops as its own genesis. The
+same happens to a replica that loses **both** `authority/` and `local/` (for
+example `git clean -fdX` with the ignore rules above): it reopens unfenced, and
+its next genesis is in op-id order, which can change the outcome of ops it had
+admitted out of order. Back up both directories; losing only one fails closed.
+
+### Binding migration
+
+Earlier binaries recorded the binding in the `authority` field of `FORMAT.json`,
+a file that versioned stores track. This binary keeps the binding in
+`local/authority.json`:
+
+- New activations write only `local/authority.json`; `FORMAT.json` is unchanged.
+- In an existing store bound only in `FORMAT.json`, the first writer copies that
+  binding (same version and genesis digest) into `local/authority.json`. Reads
+  and `authority status` keep working before and after; `binding` reports which
+  copy governs. `FORMAT.json` is left untouched.
+- `mote authority migrate` then removes the `FORMAT.json` field after the local
+  binding is durable, rewriting `FORMAT.json` in the layout `init` creates. It
+  keeps the higher version if an earlier binary raised only the `FORMAT.json`
+  copy. It is idempotent.
+- A `FORMAT.json` binding for another genesis came from another replica (for
+  example a fresh clone of a repository where someone committed the field). A
+  replica with its own local binding ignores it for reads; earlier binaries
+  fail closed on it. A replica without a local binding fails closed and names
+  the remedy, `mote authority migrate --discard-foreign-format`, which removes
+  only a binding that does not name this replica's genesis. Use it only when
+  you know the field was replicated, not when this replica's `authority/` was
+  lost.
+
+Compatibility with earlier binaries: they ignore `local/authority.json`. They
+read a store bound only locally (migrated, or activated by this binary)
+correctly, but each of their writes adds the `FORMAT.json` binding back. This
+binary accepts that copy (same genesis) and `migrate` removes it again, but if
+it is committed, fresh clones fail closed until they discard it: the original
+problem. They cannot admit foreign ops and fail closed on them. Authority-v1
+binaries (which predate session-bound claims) check the version fence only in
+`FORMAT.json`, so they are not fenced out of a version-2 store whose binding is
+only local, and would replay its session-bound claims differently. Upgrade every
+binary that writes or reads the store before activating or migrating.
 
 ## Fenced landing
 
@@ -178,4 +285,7 @@ and restart, byte-identical retries, and a moved ref after Git mutation.
 `tests/handoff_authority.rs` exercises replacement claims, nonholder operations,
 expiry, competing transfers/adoptions, atomic release, and publication restart.
 `tests/authority.rs` covers frozen replay order, missing/tampered authority data,
-and direct publication bypass detection. Fault hooks exist only in debug builds.
+and direct publication bypass detection. `tests/replicated_authority.rs`
+exchanges fenced ops between two Git clones and admits them, and covers
+fail-closed admission, pending-publication recovery, binding migration, foreign
+bindings, and the `doctor` Git checks. Fault hooks exist only in debug builds.

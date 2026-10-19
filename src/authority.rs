@@ -2,6 +2,11 @@
 //! freeze replay order; wall-clock timestamps no longer reorder accepted history.
 //! All in-tree publishers take the same OS lock. Independent store replicas are
 //! not a consensus group and must not be used as independent landing authorities.
+//!
+//! Authority is per replica. `ops/` may be replicated (for example through
+//! Git); `authority/` and the activation binding in `local/authority.json`
+//! never are. Operations that arrive from another replica stay unadmitted, and
+//! fail closed on read, until `mote admit` appends them after the local prefix.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -11,6 +16,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::{MoteError, MoteResult};
+use crate::repo::AuthorityFormat;
 use crate::{ids::OpName, publish, repo::Store};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,17 +50,123 @@ pub fn directory(store: &Store) -> PathBuf {
     store.root().join("authority")
 }
 
+/// The per-replica activation binding. It lives beside the publication lock in
+/// `local/`, which is never replicated, instead of in the tracked FORMAT.json.
+pub fn binding_path(store: &Store) -> PathBuf {
+    store.local_dir().join("authority.json")
+}
+
 /// Highest authority format version this binary understands.
 ///
 /// - 1: shared admission order, holder-checked handoff, checked landing.
 /// - 2: the log may contain session-bound claims (claim op `v: 2`). Binaries
 ///   that only understand version 1 ignore the session binding and would
-///   replay those claims differently, so they must refuse the store; they do,
-///   because every replay checks this version first.
+///   replay those claims differently, so they must refuse the store. They
+///   check the version only in FORMAT.json, so they are fenced out only while
+///   a replica's binding is also recorded there (an unmigrated store); see
+///   `binding`.
 pub const AUTHORITY_VERSION: u32 = 2;
 
 pub fn enabled(store: &Store) -> bool {
     directory(store).join("00000000000000000000.json").is_file()
+}
+
+/// Where this replica's authority binding was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingLocation {
+    /// `local/authority.json`, written by this binary.
+    Local,
+    /// The legacy `authority` field of FORMAT.json, written by earlier binaries.
+    Format,
+}
+
+/// The effective per-replica binding of an authority genesis.
+#[derive(Debug, Clone)]
+pub struct Binding {
+    pub version: u32,
+    pub genesis_hash: String,
+    pub location: BindingLocation,
+    /// FORMAT.json names a different genesis than this replica's local binding:
+    /// per-replica state that reached this replica through a shared file.
+    pub foreign_format: bool,
+}
+
+fn read_local_binding(store: &Store) -> MoteResult<Option<AuthorityFormat>> {
+    match fs::read(binding_path(store)) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Resolve this replica's binding without validating or changing the store.
+///
+/// The local binding governs. A legacy FORMAT.json binding for the same
+/// genesis is the pre-migration copy of it; an older binary may have raised
+/// only that copy's version, so the higher version wins. A FORMAT.json binding
+/// for another genesis is foreign and never governs a locally bound replica.
+pub fn binding(store: &Store) -> MoteResult<Option<Binding>> {
+    let legacy = store.read_format()?.authority;
+    Ok(match (read_local_binding(store)?, legacy) {
+        (Some(local), Some(format)) if format.genesis_hash == local.genesis_hash => Some(Binding {
+            version: local.version.max(format.version),
+            genesis_hash: local.genesis_hash,
+            location: BindingLocation::Local,
+            foreign_format: false,
+        }),
+        (Some(local), format) => Some(Binding {
+            version: local.version,
+            genesis_hash: local.genesis_hash,
+            location: BindingLocation::Local,
+            foreign_format: format.is_some(),
+        }),
+        (None, Some(format)) => Some(Binding {
+            version: format.version,
+            genesis_hash: format.genesis_hash,
+            location: BindingLocation::Format,
+            foreign_format: false,
+        }),
+        (None, None) => None,
+    })
+}
+
+pub(crate) fn is_bound(store: &Store) -> MoteResult<bool> {
+    Ok(binding(store)?.is_some())
+}
+
+const FOREIGN_FORMAT_REMEDY: &str = "restore the complete store, or, if FORMAT.json's \
+     authority binding was replicated from another clone, run \
+     `mote authority migrate --discard-foreign-format`";
+
+fn genesis_digest(store: &Store) -> MoteResult<Option<String>> {
+    match fs::read(directory(store).join("00000000000000000000.json")) {
+        Ok(bytes) => Ok(Some(blake3::hash(&bytes).to_hex().to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Check the binding's version and that it names this replica's genesis.
+fn verify_binding(store: &Store, binding: &Binding) -> MoteResult<()> {
+    if !(1..=AUTHORITY_VERSION).contains(&binding.version) {
+        return Err(MoteError::Other(
+            "unsupported authority format version".into(),
+        ));
+    }
+    let digest = genesis_digest(store)?;
+    if digest.as_deref() == Some(binding.genesis_hash.as_str()) {
+        return Ok(());
+    }
+    let problem = if digest.is_none() {
+        "authority binding names a missing genesis journal"
+    } else {
+        "authority genesis mismatch"
+    };
+    Err(MoteError::Other(match binding.location {
+        BindingLocation::Format => format!("{problem}; {FOREIGN_FORMAT_REMEDY}"),
+        BindingLocation::Local => format!("{problem}; restore the complete store"),
+    }))
 }
 
 /// Read-only description of the shared admission authority.  Callers use this
@@ -67,39 +179,32 @@ pub struct Status {
     pub enabled: bool,
     pub authority_version: u32,
     pub genesis_digest: Option<String>,
+    /// Where this replica's binding lives; `format` means not yet migrated.
+    pub binding: Option<BindingLocation>,
+    /// FORMAT.json carries another replica's binding; see `authority migrate`.
+    pub foreign_format_binding: bool,
     pub capabilities: [&'static str; 3],
 }
 
 pub fn status(store: &Store) -> MoteResult<Status> {
     let format = store.read_format()?;
     let enabled = enabled(store);
+    let binding = binding(store)?;
+    if let Some(binding) = &binding {
+        verify_binding(store, binding)?;
+    }
     let genesis_digest = if enabled {
-        let authority = format.authority.as_ref().ok_or_else(|| {
-            MoteError::Other("authority genesis exists without a FORMAT binding".into())
+        let binding = binding.as_ref().ok_or_else(|| {
+            MoteError::Other(
+                "authority genesis exists without a replica binding; run `mote authority enable`"
+                    .into(),
+            )
         })?;
-        if !(1..=AUTHORITY_VERSION).contains(&authority.version) {
-            return Err(MoteError::Other(
-                "unsupported authority format version".into(),
-            ));
-        }
-        // list_op_filenames verifies both the immutable FORMAT binding and
-        // every admitted operation without recovering or changing the store.
+        // list_op_filenames verifies both the binding and every admitted
+        // operation without recovering or changing the store.
         store.list_op_filenames()?;
-        let digest = blake3::hash(&fs::read(
-            directory(store).join("00000000000000000000.json"),
-        )?)
-        .to_hex()
-        .to_string();
-        if digest != authority.genesis_hash {
-            return Err(MoteError::Other("authority genesis mismatch".into()));
-        }
-        Some(digest)
+        Some(binding.genesis_hash.clone())
     } else {
-        if format.authority.is_some() {
-            return Err(MoteError::Other(
-                "authority format names a missing genesis journal".into(),
-            ));
-        }
         None
     };
     Ok(Status {
@@ -107,11 +212,13 @@ pub fn status(store: &Store) -> MoteResult<Status> {
         store_id: format.store_id,
         enabled,
         authority_version: if enabled {
-            format.authority.as_ref().map_or(1, |a| a.version)
+            binding.as_ref().map_or(1, |b| b.version)
         } else {
             0
         },
         genesis_digest,
+        binding: binding.as_ref().map(|b| b.location),
+        foreign_format_binding: binding.as_ref().is_some_and(|b| b.foreign_format),
         capabilities: [
             "stable_claim_order",
             "holder_checked_handoff",
@@ -122,14 +229,24 @@ pub fn status(store: &Store) -> MoteResult<Status> {
 
 /// Atomically replace a journal and make both its bytes and directory durable.
 pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> MoteResult<()> {
+    write_bytes(path, &serde_json::to_vec(value)?)
+}
+
+fn write_bytes(path: &Path, bytes: &[u8]) -> MoteResult<()> {
     let parent = path
         .parent()
         .ok_or_else(|| MoteError::Invalid("journal has no parent".into()))?;
     fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(".{}.tmp", ulid::Ulid::new()));
-    publish::write_tmp_durable(&temporary, &serde_json::to_vec(value)?)?;
+    publish::write_tmp_durable(&temporary, bytes)?;
     fs::rename(&temporary, path)?;
     publish::fsync_dir(parent)
+}
+
+/// Rewrite FORMAT.json in the layout `init` creates, so that removing the
+/// legacy binding restores the file a repository may have committed.
+fn write_format(store: &Store, format: &crate::repo::Format) -> MoteResult<()> {
+    write_bytes(&store.format_path(), &serde_json::to_vec_pretty(format)?)
 }
 
 fn records(store: &Store) -> MoteResult<Vec<PathBuf>> {
@@ -152,25 +269,22 @@ fn records(store: &Store) -> MoteResult<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Return the frozen publication order. Unjournaled imports fail closed.
-/// A pending publication is invisible until its admission record is durable.
-pub(crate) fn ordered_names(store: &Store, raw: Vec<String>) -> MoteResult<Vec<String>> {
-    let format = store.read_format()?;
-    if let Some(authority) = &format.authority {
-        if !(1..=AUTHORITY_VERSION).contains(&authority.version) {
-            return Err(MoteError::Other(
-                "unsupported authority format version".into(),
-            ));
-        }
-        let genesis = fs::read(directory(store).join("00000000000000000000.json"))?;
-        if blake3::hash(&genesis).to_hex().as_str() != authority.genesis_hash {
-            return Err(MoteError::Other(
-                "authority genesis mismatch; restore the complete store".into(),
-            ));
-        }
+/// The admitted prefix, validated, plus the op files this replica has not
+/// admitted. A pending publication is in neither list.
+struct Scan {
+    admitted: Vec<String>,
+    unadmitted: Vec<String>,
+}
+
+fn scan(store: &Store, raw: Vec<String>) -> MoteResult<Scan> {
+    if let Some(binding) = binding(store)? {
+        verify_binding(store, &binding)?;
     }
     if !enabled(store) {
-        return Ok(raw);
+        return Ok(Scan {
+            admitted: raw,
+            unadmitted: Vec::new(),
+        });
     }
     let pending_path = directory(store).join("publication.json");
     // Read pending before the record snapshot: a concurrent writer can advance
@@ -189,30 +303,110 @@ pub(crate) fn ordered_names(store: &Store, raw: Vec<String>) -> MoteResult<Vec<S
             if !seen.insert(name.clone()) {
                 return Err(MoteError::Other("duplicate authority admission".into()));
             }
-            let bytes = fs::read(store.ops_dir().join(&name))?;
+            let bytes = match fs::read(store.ops_dir().join(&name)) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(MoteError::Other(format!(
+                        "admitted operation {name} is missing from ops/; restore it \
+                         (for example by checking out a commit that contains it); \
+                         a fenced replica cannot forget admitted history"
+                    )));
+                }
+                Err(e) => return Err(e.into()),
+            };
             if blake3::hash(&bytes).to_hex().as_str() != digest {
-                return Err(MoteError::Other(format!("authority op changed: {name}")));
+                return Err(MoteError::Other(format!(
+                    "authority op changed: {name}; ops/ holds different bytes under an \
+                     admitted operation id; restore the admitted bytes"
+                )));
             }
             names.push(name);
         }
     }
-    for name in raw {
-        if !seen.contains(&name)
-            && pending
-                .as_ref()
-                .is_none_or(|p| format!("{}.json", p.name) != name)
-        {
-            return Err(MoteError::Other(format!(
-                "unadmitted operation {name}; fenced stores require the shared Mote publisher"
-            )));
-        }
+    let unadmitted = raw
+        .into_iter()
+        .filter(|name| {
+            !seen.contains(name)
+                && pending
+                    .as_ref()
+                    .is_none_or(|p| format!("{}.json", p.name) != *name)
+        })
+        .collect();
+    Ok(Scan {
+        admitted: names,
+        unadmitted,
+    })
+}
+
+/// Return the frozen publication order. Unadmitted operations fail closed.
+/// A pending publication is invisible until its admission record is durable.
+///
+/// While a landing needs recovery, unadmitted operations are invisible instead:
+/// no other writer, `admit` included, may extend the prefix that the landing
+/// decision bound, so failing here would leave the landing unrecoverable.
+pub(crate) fn ordered_names(store: &Store, raw: Vec<String>) -> MoteResult<Vec<String>> {
+    let scan = scan(store, raw)?;
+    if landing_active(store) {
+        return Ok(scan.admitted);
     }
-    Ok(names)
+    if let Some(name) = scan.unadmitted.first() {
+        return Err(MoteError::Other(format!(
+            "unadmitted operation {name} ({} unadmitted in total); this replica has not \
+             admitted it, for example because it arrived through Git; run `mote admit` \
+             to validate and admit it",
+            scan.unadmitted.len()
+        )));
+    }
+    Ok(scan.admitted)
+}
+
+fn landing_active(store: &Store) -> bool {
+    directory(store).join("landing-active.json").exists()
+}
+
+/// Result of [`Writer::admit`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AdmitReport {
+    pub schema: &'static str,
+    pub enabled: bool,
+    /// Newly admitted op filenames, in admission (op-id) order.
+    pub admitted: Vec<String>,
+    /// Newly admitted ops whose id sorts before the last previously admitted
+    /// op: concurrent history that replays after this replica's prefix.
+    pub out_of_order: Vec<String>,
+    /// Admission record written, if any.
+    pub record: Option<String>,
+    pub admitted_total: usize,
 }
 
 impl<'a> Writer<'a> {
     pub fn acquire(store: &'a Store) -> MoteResult<Self> {
+        Ok(Self::acquire_with(store, false, false)?.0)
+    }
+
+    /// Like [`Writer::acquire`], but tolerate unadmitted operations: the
+    /// admitted prefix is still validated before anything is written.
+    pub fn acquire_for_admission(store: &'a Store) -> MoteResult<Self> {
+        Ok(Self::acquire_with(store, true, false)?.0)
+    }
+
+    /// Like [`Writer::acquire`], but first drop a FORMAT.json binding that
+    /// does not name this replica's genesis, returning whether one was
+    /// dropped. The caller asserts that the binding was replicated from
+    /// another clone; this replica's own binding is never dropped.
+    pub fn acquire_discarding_foreign_format(store: &'a Store) -> MoteResult<(Self, bool)> {
+        Self::acquire_with(store, false, true)
+    }
+
+    fn acquire_with(
+        store: &'a Store,
+        admitting: bool,
+        discard_foreign: bool,
+    ) -> MoteResult<(Self, bool)> {
+        // Neither per-replica directory is replicated: a fresh Git clone of a
+        // versioned store has `ops/` but no `local/` or `tmp/`.
         fs::create_dir_all(store.local_dir())?;
+        fs::create_dir_all(store.tmp_dir())?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -221,22 +415,27 @@ impl<'a> Writer<'a> {
             .open(store.local_dir().join("publication.lock"))?;
         file.lock_exclusive()?;
         let writer = Self { store, _lock: file };
+        let discarded = discard_foreign && writer.discard_foreign_format()?;
         if enabled(store) {
-            writer.mark_format()?;
+            writer.bind_local()?;
         }
-        if store.read_format()?.authority.is_some() {
+        if is_bound(store)? {
             // Validate the protocol and admitted prefix before recovery writes,
-            // including when FORMAT names a missing or unsupported journal.
-            store.list_op_filenames()?;
+            // including when the binding names a missing or unsupported journal.
+            if admitting {
+                scan(store, crate::repo::raw_op_filenames(store)?)?;
+            } else {
+                store.list_op_filenames()?;
+            }
         }
         writer.recover_publication()?;
-        Ok(writer)
+        Ok((writer, discarded))
     }
 
     /// Activate a single authority, retaining the exact existing replay prefix.
     pub fn enable(&self) -> MoteResult<()> {
         if enabled(self.store) {
-            return self.mark_format();
+            return self.bind_local();
         }
         let files = self
             .store
@@ -253,36 +452,99 @@ impl<'a> Writer<'a> {
             &Admission { files },
         )?;
         publish::fsync_dir(self.store.root())?;
-        self.mark_format()
+        self.bind_local()
     }
 
-    fn mark_format(&self) -> MoteResult<()> {
-        let mut format = self.store.read_format()?;
-        if format.authority.is_none() {
-            format.authority = Some(crate::repo::AuthorityFormat {
-                version: 1,
-                genesis_hash: blake3::hash(&fs::read(
-                    directory(self.store).join("00000000000000000000.json"),
-                )?)
-                .to_hex()
-                .to_string(),
-            });
-            write_json(&self.store.format_path(), &format)?;
+    /// Record this replica's binding in `local/`. A legacy FORMAT.json binding
+    /// for the same genesis is copied with its version, so migration never
+    /// changes the genesis digest; a mismatched one is never copied, and
+    /// validation reports it.
+    fn bind_local(&self) -> MoteResult<()> {
+        if read_local_binding(self.store)?.is_some() {
+            return Ok(());
         }
-        Ok(())
+        let Some(genesis_hash) = genesis_digest(self.store)? else {
+            return Ok(());
+        };
+        let version = match self.store.read_format()?.authority {
+            Some(format) if format.genesis_hash == genesis_hash => format.version,
+            Some(_) => return Ok(()),
+            None => 1,
+        };
+        write_json(
+            &binding_path(self.store),
+            &AuthorityFormat {
+                version,
+                genesis_hash,
+            },
+        )
     }
 
     fn raise_format_version(&self, version: u32) -> MoteResult<()> {
+        let mut local = read_local_binding(self.store)?.ok_or_else(|| {
+            MoteError::Other("authority enabled without a replica binding".into())
+        })?;
+        if local.version < version {
+            local.version = version;
+            write_json(&binding_path(self.store), &local)?;
+        }
+        // Until a store is migrated, earlier binaries read only FORMAT.json;
+        // keep fencing them out of a log they would replay differently.
         let mut format = self.store.read_format()?;
-        let authority = format
-            .authority
-            .as_mut()
-            .ok_or_else(|| MoteError::Other("authority enabled without a FORMAT binding".into()))?;
-        if authority.version < version {
-            authority.version = version;
-            write_json(&self.store.format_path(), &format)?;
+        if let Some(legacy) = format.authority.as_mut() {
+            if legacy.genesis_hash == local.genesis_hash && legacy.version < version {
+                legacy.version = version;
+                write_format(self.store, &format)?;
+            }
         }
         Ok(())
+    }
+
+    /// Remove a FORMAT.json binding that does not name this replica's genesis.
+    fn discard_foreign_format(&self) -> MoteResult<bool> {
+        let mut format = self.store.read_format()?;
+        let Some(legacy) = &format.authority else {
+            return Ok(false);
+        };
+        // Judge against the genesis on disk; without one, a binding that
+        // matches this replica's local binding is its own (authority/ was
+        // lost) and stays, so the replica keeps failing closed.
+        let foreign = match genesis_digest(self.store)? {
+            Some(digest) => digest != legacy.genesis_hash,
+            None => read_local_binding(self.store)?
+                .is_none_or(|local| local.genesis_hash != legacy.genesis_hash),
+        };
+        if foreign {
+            format.authority = None;
+            write_format(self.store, &format)?;
+        }
+        Ok(foreign)
+    }
+
+    /// Finish moving this replica's binding out of FORMAT.json: once the local
+    /// binding is durable, remove the legacy copy for the same genesis.
+    /// Returns whether FORMAT.json changed.
+    pub fn migrate(&self) -> MoteResult<bool> {
+        if enabled(self.store) {
+            self.bind_local()?;
+        }
+        let Some(binding) = binding(self.store)? else {
+            return Ok(false);
+        };
+        if binding.foreign_format {
+            return Err(MoteError::Rejected(format!(
+                "FORMAT.json binds another replica's authority genesis; {FOREIGN_FORMAT_REMEDY}"
+            )));
+        }
+        let mut format = self.store.read_format()?;
+        if binding.location != BindingLocation::Local || format.authority.is_none() {
+            return Ok(false);
+        }
+        // Keep any version an earlier binary raised only in FORMAT.json.
+        self.raise_format_version(binding.version)?;
+        format.authority = None;
+        write_format(self.store, &format)?;
+        Ok(true)
     }
 
     pub(crate) fn ensure_no_landing(&self) -> MoteResult<()> {
@@ -290,6 +552,83 @@ impl<'a> Writer<'a> {
             return Err(MoteError::Rejected("landing recovery required; retry the recorded candidate land request before publishing other mutations".into()));
         }
         Ok(())
+    }
+
+    /// Admit operations present in `ops/` but not yet admitted by this
+    /// replica, such as ops pulled from another clone. Each is validated as
+    /// `fsck` would; any defect fails closed before anything is written. The
+    /// batch is appended in op-id order as one atomic admission record after
+    /// the existing prefix, which is never reordered.
+    pub fn admit(&self) -> MoteResult<AdmitReport> {
+        if landing_active(self.store) {
+            return Err(MoteError::Rejected(
+                "landing recovery required; retry the recorded candidate land request, \
+                 then run `mote admit`"
+                    .into(),
+            ));
+        }
+        if !enabled(self.store) {
+            return Ok(AdmitReport {
+                schema: "mote.admit.v1",
+                enabled: false,
+                admitted: Vec::new(),
+                out_of_order: Vec::new(),
+                record: None,
+                admitted_total: 0,
+            });
+        }
+        let scan = scan(self.store, crate::repo::raw_op_filenames(self.store)?)?;
+        let mut files = Vec::new();
+        let mut session_claim = false;
+        for name in &scan.unadmitted {
+            let bytes = fs::read(self.store.ops_dir().join(name))?;
+            // An op this binary cannot parse (a newer kind) is still admitted:
+            // replay records it as rejected history, as it would for a local
+            // publication. Integrity defects fail closed.
+            let defects: Vec<_> = crate::fsck::check_op(name, &bytes)
+                .into_iter()
+                .filter(|defect| !matches!(defect, crate::fsck::OpDefect::Shape(_)))
+                .collect();
+            if !defects.is_empty() {
+                let defects = defects
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(MoteError::Rejected(format!(
+                    "refusing to admit {name}: {defects}; nothing was admitted"
+                )));
+            }
+            session_claim |= is_session_claim(&bytes);
+            files.push((name.clone(), blake3::hash(&bytes).to_hex().to_string()));
+        }
+        let last = scan.admitted.last().cloned();
+        let out_of_order = scan
+            .unadmitted
+            .iter()
+            .filter(|name| last.as_ref().is_some_and(|last| *name < last))
+            .cloned()
+            .collect();
+        let record = if files.is_empty() {
+            None
+        } else {
+            if session_claim {
+                // Fence version-1 readers before the claim becomes visible.
+                self.raise_format_version(2)?;
+            }
+            let path =
+                directory(self.store).join(format!("{:020}.json", records(self.store)?.len()));
+            write_json(&path, &Admission { files })?;
+            Some(path.display().to_string())
+        };
+        Ok(AdmitReport {
+            schema: "mote.admit.v1",
+            enabled: true,
+            admitted_total: scan.admitted.len() + scan.unadmitted.len(),
+            admitted: scan.unadmitted,
+            out_of_order,
+            record,
+        })
     }
 
     fn recover_publication(&self) -> MoteResult<()> {
@@ -300,7 +639,6 @@ impl<'a> Writer<'a> {
         }
         Ok(())
     }
-
     fn finish_publication(&self, prepared: &PreparedOp) -> MoteResult<()> {
         let validated_name = OpName::from_string(prepared.name.clone())?;
         let filename = format!("{}.json", prepared.name);

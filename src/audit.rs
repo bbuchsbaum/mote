@@ -218,6 +218,80 @@ impl AuditReport {
     }
 }
 
+/// Store-relative paths under `pathspecs` that the containing Git index
+/// tracks. Empty when the store is not in a Git worktree or Git is unavailable.
+fn tracked_store_paths(store: &Store, pathspecs: &[&str]) -> Vec<String> {
+    let mut args = vec!["ls-files", "-z", "--"];
+    args.extend_from_slice(pathspecs);
+    match run_git(store.root(), &args) {
+        Ok(output) if output.status.success() => output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the store's op log is versioned in Git, so other clones replicate it.
+pub fn ops_tracked_by_git(store: &Store) -> bool {
+    !tracked_store_paths(store, &["ops"]).is_empty()
+}
+
+/// Warnings for per-replica authority state that Git tracks, or would pick up
+/// from a versioned store. Authority admission is sequential and local to one
+/// replica; committing it, or merging two replicas' copies, breaks other clones.
+pub fn replica_state_warnings(store: &Store) -> Vec<String> {
+    let tracked = tracked_store_paths(store, &["authority", "local", "FORMAT.json"]);
+    let mut warnings = Vec::new();
+    let tracked_under = |dir: &str| {
+        tracked
+            .iter()
+            .filter(|path| path.starts_with(&format!("{dir}/")))
+            .count()
+    };
+    for dir in ["authority", "local"] {
+        let count = tracked_under(dir);
+        if count > 0 {
+            let shown = directory_display(store, dir);
+            warnings.push(format!(
+                "Git tracks {count} file(s) under {shown}; this is per-replica state that \
+                 must not be shared between clones; run `git rm -r --cached {shown}` and add \
+                 it to .gitignore"
+            ));
+        }
+    }
+    let format_tracked = tracked.iter().any(|path| path == "FORMAT.json");
+    if format_tracked && store.read_format().is_ok_and(|f| f.authority.is_some()) {
+        warnings.push(
+            "FORMAT.json is versioned in Git and carries a legacy per-replica authority \
+             binding; committing it fails closed in other clones; once every Mote binary \
+             writing this store is upgraded, run `mote authority migrate`"
+                .into(),
+        );
+    }
+    if crate::authority::enabled(store) && ops_tracked_by_git(store) {
+        let ignored = run_git(
+            store.root(),
+            &["check-ignore", "-q", "authority/00000000000000000000.json"],
+        )
+        .is_ok_and(|output| output.status.success());
+        if tracked_under("authority") == 0 && !ignored {
+            warnings.push(format!(
+                "the op log is versioned in Git but {} is not ignored; add it to .gitignore \
+                 so per-replica admission records are never committed",
+                directory_display(store, "authority")
+            ));
+        }
+    }
+    warnings
+}
+
+fn directory_display(store: &Store, dir: &str) -> String {
+    format!("{}/", store.root().join(dir).display())
+}
+
 fn run_git(dir: &Path, args: &[&str]) -> Result<Output, String> {
     Command::new("git")
         .args(["-C"])

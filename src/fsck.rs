@@ -38,7 +38,7 @@ impl FsckReport {
 
 pub fn run(store: &Store, clean_tmp: bool) -> MoteResult<FsckReport> {
     let mut report = FsckReport::default();
-    if store.read_format()?.authority.is_some() || crate::authority::enabled(store) {
+    if crate::authority::is_bound(store)? || crate::authority::enabled(store) {
         // The admission order and bound op bytes are source of truth too.
         store.list_op_filenames()?;
     }
@@ -53,83 +53,17 @@ pub fn run(store: &Store, clean_tmp: bool) -> MoteResult<FsckReport> {
             continue;
         }
         report.ops_checked += 1;
-
-        let parts = match ids::parse(&name) {
-            Ok(p) => p,
-            Err(_) => {
-                report.bad_filename.push(name);
-                continue;
-            }
-        };
-
         let bytes = fs::read(entry.path())?;
-        let mut value: Value = match serde_json::from_slice(&bytes) {
-            Ok(v) => v,
-            Err(_) => {
-                report.bad_json.push(name);
-                continue;
-            }
-        };
-
-        let ok = match value.as_object_mut() {
-            Some(obj) => {
-                obj.insert("op".to_string(), Value::String(String::new()));
-                true
-            }
-            None => false,
-        };
-        if !ok {
-            report.bad_json.push(name);
-            continue;
-        }
-
-        let bytes_for_hash = canonical::encode(&value);
-        let recomputed = ids::hash6(&bytes_for_hash);
-        if recomputed != parts.hash {
-            report
-                .bad_hash
-                .push((name.clone(), parts.hash.clone(), recomputed));
-        }
-
-        // Op-shape check: bytes parse as JSON, but do they match a known kind?
-        // Plus envelope invariants (op == filename stem, ts matches filename ts).
-        match serde_json::from_slice::<Op>(&bytes) {
-            Ok(op) => {
-                let op_id_from_filename = name.trim_end_matches(".json");
-                if op.op_id() != op_id_from_filename {
-                    report.bad_op_shape.push((
-                        name.clone(),
-                        format!(
-                            "envelope op `{}` does not match filename stem `{}`",
-                            op.op_id(),
-                            op_id_from_filename
-                        ),
-                    ));
+        for defect in check_op(&name, &bytes) {
+            match defect {
+                OpDefect::Filename => report.bad_filename.push(name.clone()),
+                OpDefect::Json => report.bad_json.push(name.clone()),
+                OpDefect::Hash { expected, got } => {
+                    report.bad_hash.push((name.clone(), expected, got))
                 }
-                match op.ts().parse::<jiff::Timestamp>() {
-                    Ok(parsed) => {
-                        let expected_basic = ids::format_op_timestamp(parsed);
-                        if expected_basic != parts.ts {
-                            report.bad_op_shape.push((
-                                name.clone(),
-                                format!(
-                                    "envelope ts `{}` does not match filename ts `{}`",
-                                    op.ts(),
-                                    parts.ts
-                                ),
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        report.bad_op_shape.push((
-                            name.clone(),
-                            format!("envelope ts `{}` is unparseable: {e}", op.ts()),
-                        ));
-                    }
+                OpDefect::Shape(error) | OpDefect::Envelope(error) => {
+                    report.bad_op_shape.push((name.clone(), error))
                 }
-            }
-            Err(e) => {
-                report.bad_op_shape.push((name, format!("{e}")));
             }
         }
     }
@@ -158,4 +92,98 @@ pub fn run(store: &Store, clean_tmp: bool) -> MoteResult<FsckReport> {
     }
 
     Ok(report)
+}
+
+/// One way an op file fails validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpDefect {
+    Filename,
+    Json,
+    /// (expected hash from filename, recomputed hash from content)
+    Hash {
+        expected: String,
+        got: String,
+    },
+    /// The bytes do not parse as an op kind this binary knows.
+    Shape(String),
+    /// The envelope's `op` or `ts` disagrees with the filename.
+    Envelope(String),
+}
+
+impl std::fmt::Display for OpDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpDefect::Filename => write!(f, "bad filename"),
+            OpDefect::Json => write!(f, "bad json"),
+            OpDefect::Hash { expected, got } => {
+                write!(f, "hash mismatch: expected {expected}, got {got}")
+            }
+            OpDefect::Shape(error) => write!(f, "bad op shape: {error}"),
+            OpDefect::Envelope(error) => write!(f, "bad envelope: {error}"),
+        }
+    }
+}
+
+/// Validate one op file: filename, JSON, content hash, op shape, and the
+/// envelope invariants (op == filename stem, ts matches filename ts). A bad
+/// filename or bad JSON stops further checks.
+pub(crate) fn check_op(name: &str, bytes: &[u8]) -> Vec<OpDefect> {
+    let parts = match ids::parse(name) {
+        Ok(p) => p,
+        Err(_) => return vec![OpDefect::Filename],
+    };
+    let raw: Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return vec![OpDefect::Json],
+    };
+    let mut value = raw.clone();
+    match value.as_object_mut() {
+        Some(obj) => {
+            obj.insert("op".to_string(), Value::String(String::new()));
+        }
+        None => return vec![OpDefect::Json],
+    }
+
+    let mut defects = Vec::new();
+    let bytes_for_hash = canonical::encode(&value);
+    let recomputed = ids::hash6(&bytes_for_hash);
+    if recomputed != parts.hash {
+        defects.push(OpDefect::Hash {
+            expected: parts.hash.clone(),
+            got: recomputed,
+        });
+    }
+
+    // Envelope invariants, read from the raw JSON so they hold for op kinds
+    // this binary does not know: op == filename stem, ts matches filename ts.
+    let op_id_from_filename = name.trim_end_matches(".json");
+    let envelope_op = raw.get("op").and_then(Value::as_str).unwrap_or_default();
+    if envelope_op != op_id_from_filename {
+        defects.push(OpDefect::Envelope(format!(
+            "envelope op `{envelope_op}` does not match filename stem `{op_id_from_filename}`"
+        )));
+    }
+    let envelope_ts = raw.get("ts").and_then(Value::as_str).unwrap_or_default();
+    match envelope_ts.parse::<jiff::Timestamp>() {
+        Ok(parsed) => {
+            let expected_basic = ids::format_op_timestamp(parsed);
+            if expected_basic != parts.ts {
+                defects.push(OpDefect::Envelope(format!(
+                    "envelope ts `{envelope_ts}` does not match filename ts `{}`",
+                    parts.ts
+                )));
+            }
+        }
+        Err(e) => {
+            defects.push(OpDefect::Envelope(format!(
+                "envelope ts `{envelope_ts}` is unparseable: {e}"
+            )));
+        }
+    }
+
+    // Op-shape check: bytes parse as JSON, but do they match a known kind?
+    if let Err(e) = serde_json::from_slice::<Op>(bytes) {
+        defects.push(OpDefect::Shape(format!("{e}")));
+    }
+    defects
 }
