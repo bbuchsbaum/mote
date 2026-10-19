@@ -154,6 +154,31 @@ fn installed_tracker_skill_documents_review_status_workflow() {
 }
 
 #[test]
+fn installed_tracker_skill_documents_replicated_store_admission() {
+    let td = TempDir::new().unwrap();
+    let out = Command::new(mote_bin())
+        .args(["skills", "install", "--agent", "codex", "--repo"])
+        .arg(td.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "install failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let base = td.path().join(".codex/skills/mote-tracker");
+    let skill = fs::read_to_string(base.join("SKILL.md")).unwrap();
+    assert!(
+        skill.contains("mote admit") && skill.contains(".mote/authority/"),
+        "installed tracker skill omits replicated-store admission"
+    );
+    let guide = fs::read_to_string(base.join("references/command-guide.md")).unwrap();
+    assert!(guide.contains("--discard-foreign-format") && guide.contains("post-merge"));
+    let recovery = fs::read_to_string(base.join("references/candidates-and-recovery.md")).unwrap();
+    assert!(recovery.contains("landing recovery required"));
+}
+
+#[test]
 fn skills_install_filters_by_agent_flag() {
     let td = TempDir::new().unwrap();
     let out = Command::new(mote_bin())
