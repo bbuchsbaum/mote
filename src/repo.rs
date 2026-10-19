@@ -38,7 +38,9 @@ pub struct Format {
     pub store_id: String,
     pub created_at: String,
     pub default_ttl_s: DefaultTtls,
-    /// Fenced stores must retain their admission journal when copied or restored.
+    /// Legacy per-replica authority binding written by earlier binaries. New
+    /// binaries bind authority in `local/authority.json` instead, because this
+    /// file is commonly versioned; see `authority::binding`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<AuthorityFormat>,
 }
@@ -271,15 +273,20 @@ impl Store {
     /// List admitted op filenames in replay order (legacy filename order or
     /// the durable shared-store admission order once authority is enabled).
     pub fn list_op_filenames(&self) -> MoteResult<Vec<String>> {
-        let mut names: Vec<String> = fs::read_dir(self.ops_dir())?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".json"))
-            .collect();
-        names.sort();
-        crate::authority::ordered_names(self, names)
+        crate::authority::ordered_names(self, raw_op_filenames(self)?)
     }
+}
+
+/// Every `*.json` file in `ops/`, sorted by name (op id), admitted or not.
+pub(crate) fn raw_op_filenames(store: &Store) -> MoteResult<Vec<String>> {
+    let mut names: Vec<String> = fs::read_dir(store.ops_dir())?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    names.sort();
+    Ok(names)
 }
 
 /// Linked-worktree layout for `dir`: `(worktree_root, main_worktree_root,

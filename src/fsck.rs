@@ -38,7 +38,7 @@ impl FsckReport {
 
 pub fn run(store: &Store, clean_tmp: bool) -> MoteResult<FsckReport> {
     let mut report = FsckReport::default();
-    if store.read_format()?.authority.is_some() || crate::authority::enabled(store) {
+    if crate::authority::is_bound(store)? || crate::authority::enabled(store) {
         // The admission order and bound op bytes are source of truth too.
         store.list_op_filenames()?;
     }

@@ -842,7 +842,9 @@ fn ending_a_session_ends_its_claims_and_strands_doing_work() {
 }
 
 fn authority_version(store: &Store) -> Option<u32> {
-    store.read_format().unwrap().authority.map(|a| a.version)
+    mote::authority::binding(store)
+        .unwrap()
+        .map(|binding| binding.version)
 }
 
 #[test]
