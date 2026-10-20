@@ -304,6 +304,38 @@ pub fn selected_remote(store: &Store, cache_root: &Path) -> MoteResult<String> {
     }
     Ok(route.remote)
 }
+
+/// Inspect a saved observation without resolving Git configuration or
+/// contacting an endpoint. Its identity must still match this project.
+pub fn cached_view(store: &Store, cache_root: &Path) -> MoteResult<super::cache::CachedView> {
+    if setup_path(store.root()).exists() {
+        return invalid("Git setup is incomplete; run authority resume");
+    }
+    let root = cache_root.canonicalize()?;
+    let local = store.local_dir().canonicalize()?;
+    if root == local || !root.starts_with(local) {
+        return invalid("project cache is outside store local/");
+    }
+    let descriptor = load_descriptor(store.root())?
+        .ok_or_else(|| MoteError::Invalid("store has no Git descriptor".into()))?;
+    let route: MachineRoute = read_canonical(&root.join("route.json"))?
+        .ok_or_else(|| MoteError::Invalid("machine is not connected".into()))?;
+    let format = store.read_format()?;
+    let cache = Cache::open(&root)?;
+    let _lock = cache.lock()?;
+    if route.version != 1
+        || route.binding != descriptor.binding(route.binding.endpoint_digest.clone())
+        || route.capabilities != descriptor.capabilities
+        || cache.binding()?.as_ref() != Some(&route.binding)
+        || format.schema_version != 2
+        || format.store_id != descriptor.store_id
+    {
+        return invalid("cached observation differs from selected project identity");
+    }
+    cache
+        .cached_view()?
+        .ok_or_else(|| MoteError::Invalid("no cached authority view is available".into()))
+}
 pub fn open_client(
     store: &Store,
     transport: GitTransport,

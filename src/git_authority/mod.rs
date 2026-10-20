@@ -5,10 +5,13 @@
 //! require a separately qualified migration. Connected stores fence local writes.
 
 pub mod cache;
+pub mod cli;
 pub mod client;
 pub mod connection;
 pub mod coordination;
 pub mod history;
+pub mod legacy;
+pub mod legacy_profile;
 pub mod planner;
 pub mod protocol;
 pub mod transport;

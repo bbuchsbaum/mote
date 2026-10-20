@@ -366,6 +366,28 @@ impl CoordinationState {
     pub fn task_view(&self) -> MoteResult<Value> {
         Ok(json!(replay_tasks(self)?))
     }
+
+    /// The lifecycle profile's durable, clock-independent ready set.
+    pub fn ready_task_ids(&self) -> MoteResult<Vec<String>> {
+        let tasks = replay_tasks(self)?;
+        let mut ready: Vec<_> = tasks
+            .iter()
+            .filter(|(id, task)| {
+                matches!(task.status.as_str(), "open" | "doing")
+                    && task
+                        .deps
+                        .iter()
+                        .all(|parent| tasks.get(parent).is_none_or(|p| p.status == "closed"))
+                    && !self.claims.contains_key(*id)
+                    && !self
+                        .reservations
+                        .values()
+                        .any(|r| r.status == "open" && r.task == **id)
+            })
+            .collect();
+        ready.sort_by_key(|(id, task)| (task.priority, (*id).clone()));
+        Ok(ready.into_iter().map(|(id, _)| id.clone()).collect())
+    }
 }
 
 fn replay_tasks(state: &CoordinationState) -> MoteResult<BTreeMap<String, Task>> {

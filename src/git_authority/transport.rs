@@ -87,6 +87,7 @@ pub struct GitTransport {
 
 impl GitTransport {
     pub fn open(repo: &Path, remote: &str, branch: &str, scratch: &Path) -> MoteResult<Self> {
+        require_project_git_environment()?;
         validate_remote(remote)?;
         validate_branch(branch)?;
         let repo = repo
@@ -877,6 +878,24 @@ fn random_suffix() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Repository selection comes from the explicit project path. Authentication
+/// and SSH configuration remain Git's own responsibility.
+pub(crate) fn require_project_git_environment() -> MoteResult<()> {
+    for name in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_NAMESPACE",
+    ] {
+        if std::env::var_os(name).is_some() {
+            return Err(MoteError::Invalid(format!(
+                "unset {name} before using Git authority; inherited repository selectors are unsupported"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_remote(remote: &str) -> MoteResult<()> {

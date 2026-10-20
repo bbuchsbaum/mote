@@ -23,6 +23,11 @@ remote manifest before observations, new request intents, or submissions. Connec
 store must match the descriptor and existing endpoint binding. A different
 remote alias is permissible only when it resolves to that same endpoint;
 changing endpoint is an administrative migration, not a fresh connection.
+Git commands must run from the selected store's project, including its linked
+worktrees. An explicit store override from an unrelated Git repository refuses
+before resolving its origin or publishing anything.
+Inherited `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE`, and `GIT_NAMESPACE`
+selectors refuse before repository probes, including for library transports.
 
 Git object/index scratch is private and isolated outside the source checkout.
 A command owns its scratch directory and removes it on ordinary completion.
@@ -121,9 +126,17 @@ ownership policy. An explicit cached read never contacts the remote and always
 reports `fresh:false`. Missing/unavailable authority is an error for fresh reads
 and mutations; it never silently turns a cached view into a fresh decision.
 Read projections use durable ownership without local TTL vacancy assumptions.
+Cached inspection checks the saved project/machine identity without resolving
+current Git remote configuration; removing an alias does not erase the saved
+observation. Receipt lookup reports the same validated observation used for its
+lookup, including when no receipt was found. Task history with rejected entries
+includes ownership requests referenced indirectly by claim/reservation intent.
 
 Remote lifecycle uses MOTE_ACTOR and MOTE_SESSION, with explicit enrollment.
 Session-start shell output activates those values only after a confirmed
 accepted receipt. A rejected or unconfirmed start must not emit shell activation.
+Without `--json`, an accepted start writes only quoted shell exports to stdout
+so `eval "$(mote session start --as actor)"` remains valid. Failure diagnostics
+go to stderr; structured JSON output is available with `--json`.
 Unsupported TTL/force/resume/announcement options refuse rather than changing
 meaning silently. Legacy local command behavior stays unchanged.
