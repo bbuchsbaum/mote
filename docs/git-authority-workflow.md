@@ -75,6 +75,9 @@ mote session end
 
 Replace `bd-ID` with the ID returned by `new`. Begin/next, done and handoff are
 whole canonical transactions. Ownership uses explicit release and exact tokens.
+On an announcement-capable authority, adding `--announce TOPIC` to `begin`
+commits the claim, reservation, status, note and public post together. Earlier
+profiles refuse the option; connecting never upgrades their contract.
 A sleeping or crashed machine does not lose ownership through a TTL. A session
 end cleans only its own claims and reservations, including when another session
 uses the same actor. Recovery is an explicit audited action by an active session:

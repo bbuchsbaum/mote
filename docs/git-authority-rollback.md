@@ -10,8 +10,9 @@ pathname. Other machines remain attached to a permanently retired authority.
 
 The immutable `authority-retirement-v1` capability is a distinct profile; the
 previous five-capability migrated profile retains its meaning and refuses this
-action. Both the six-capability recoverable profile and the new seven-capability
-communication profile support the same retirement rule. Retirement requires matching verified legacy export identity and prior
+action. The six-capability recoverable, seven-capability communication and
+eight-capability announcement profiles support the same retirement rule.
+Retirement requires matching verified legacy export identity and prior
 canonical sequence zero. Every existing receipt, including rejected requests
 and session enrollment, disqualifies retirement. A single CAS append records a
 permanent effect. All subsequent ordinary actions, including session enrollment
@@ -67,4 +68,5 @@ accepted retirement followed by client death, interrupted copying,
 authorization and atomic-publication boundaries, competing destination creation,
 and a real local write after publication surviving retry. A post-use return to
 local mode requires a separate migration from current canonical history; this
-pre-use command must refuse it.
+pre-use command must refuse it. That post-use continuation format is deferred
+from the first local-machine release by the user's scope decision.

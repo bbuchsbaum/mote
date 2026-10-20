@@ -81,7 +81,7 @@ fn bootstrap_and_explicit_second_machine_connection_share_one_communication_auth
     let descriptor = f.bootstrap();
     assert_eq!(
         descriptor.capabilities,
-        Manifest::communications(descriptor.store_id.clone()).capabilities
+        Manifest::announcements(descriptor.store_id.clone()).capabilities
     );
     assert!(!connection::setup_path(f.a.root()).exists());
     assert!(f.a.require_local_authority().is_err());

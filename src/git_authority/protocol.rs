@@ -59,6 +59,24 @@ pub const MIGRATED_COMMUNICATION_CAPABILITIES: [&str; 7] = [
     "explicit-release-v1",
     "legacy-packed-v1",
 ];
+pub const ANNOUNCEMENT_CAPABILITIES: [&str; 6] = [
+    "canonical-transactions-v1",
+    "coordination-announcements-v1",
+    "coordination-communications-v1",
+    "coordination-core-v1",
+    "coordination-lifecycle-v1",
+    "explicit-release-v1",
+];
+pub const MIGRATED_ANNOUNCEMENT_CAPABILITIES: [&str; 8] = [
+    "authority-retirement-v1",
+    "canonical-transactions-v1",
+    "coordination-announcements-v1",
+    "coordination-communications-v1",
+    "coordination-core-v1",
+    "coordination-lifecycle-v1",
+    "explicit-release-v1",
+    "legacy-packed-v1",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +119,8 @@ impl Manifest {
             || self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES
             || self.capabilities == COMMUNICATION_CAPABILITIES
             || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES
+            || self.capabilities == ANNOUNCEMENT_CAPABILITIES
+            || self.capabilities == MIGRATED_ANNOUNCEMENT_CAPABILITIES
     }
 
     pub fn lifecycle(store_id: String) -> Self {
@@ -147,6 +167,24 @@ impl Manifest {
         m
     }
 
+    pub fn announcements(store_id: String) -> Self {
+        let mut manifest = Self::communications(store_id);
+        manifest.capabilities = ANNOUNCEMENT_CAPABILITIES
+            .iter()
+            .map(|c| (*c).into())
+            .collect();
+        manifest
+    }
+
+    pub fn migrated_announcements(store_id: String, legacy_digest: String) -> Self {
+        let mut manifest = Self::migrated_communications(store_id, legacy_digest);
+        manifest.capabilities = MIGRATED_ANNOUNCEMENT_CAPABILITIES
+            .iter()
+            .map(|c| (*c).into())
+            .collect();
+        manifest
+    }
+
     pub fn allows(&self, command: &Command) -> MoteResult<()> {
         self.validate()?;
         match (self.is_coordination(), command) {
@@ -154,24 +192,42 @@ impl Manifest {
             (
                 true,
                 Command::Coordination {
+                    action: super::coordination::Action::AnnouncedBegin(_),
+                },
+            ) if self.capabilities == ANNOUNCEMENT_CAPABILITIES
+                || self.capabilities == MIGRATED_ANNOUNCEMENT_CAPABILITIES =>
+            {
+                Ok(())
+            }
+            (
+                true,
+                Command::Coordination {
                     action: super::coordination::Action::AuthorityRetire { .. },
                 },
             ) if self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES
-                || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES =>
+                || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES
+                || self.capabilities == MIGRATED_ANNOUNCEMENT_CAPABILITIES =>
             {
                 Ok(())
             }
             (true, Command::Coordination { action })
-                if !matches!(action, super::coordination::Action::AuthorityRetire { .. })
-                    && (!matches!(action, super::coordination::Action::Communication { .. })
-                        || self.capabilities == COMMUNICATION_CAPABILITIES
-                        || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES)
+                if !matches!(
+                    action,
+                    super::coordination::Action::AuthorityRetire { .. }
+                        | super::coordination::Action::AnnouncedBegin(_)
+                ) && (!matches!(action, super::coordination::Action::Communication { .. })
+                    || self.capabilities == COMMUNICATION_CAPABILITIES
+                    || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES
+                    || self.capabilities == ANNOUNCEMENT_CAPABILITIES
+                    || self.capabilities == MIGRATED_ANNOUNCEMENT_CAPABILITIES)
                     && (!action.is_lifecycle()
                         || self.capabilities == LIFECYCLE_CAPABILITIES
                         || self.capabilities == MIGRATED_ROOT_CAPABILITIES
                         || self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES
                         || self.capabilities == COMMUNICATION_CAPABILITIES
-                        || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES) =>
+                        || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES
+                        || self.capabilities == ANNOUNCEMENT_CAPABILITIES
+                        || self.capabilities == MIGRATED_ANNOUNCEMENT_CAPABILITIES) =>
             {
                 Ok(())
             }
@@ -202,12 +258,15 @@ impl Manifest {
             && self.capabilities != RECOVERABLE_MIGRATED_CAPABILITIES
             && self.capabilities != COMMUNICATION_CAPABILITIES
             && self.capabilities != MIGRATED_COMMUNICATION_CAPABILITIES
+            && self.capabilities != ANNOUNCEMENT_CAPABILITIES
+            && self.capabilities != MIGRATED_ANNOUNCEMENT_CAPABILITIES
         {
             return invalid("unsupported or noncanonical Git authority capabilities");
         }
         if self.capabilities == MIGRATED_ROOT_CAPABILITIES
             || self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES
             || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES
+            || self.capabilities == MIGRATED_ANNOUNCEMENT_CAPABILITIES
         {
             if !self.legacy_digest.as_deref().is_some_and(valid_digest) {
                 return invalid("migrated root requires a lowercase legacy archive digest");

@@ -22,3 +22,9 @@ Remote command names and successful local command names are not evidence that a
 new capability can be added to an existing authority. A manifest must use one
 of the exact immutable supported profiles. Migrated roots additionally require
 a verified retained archive for replay; a manifest alone does not prove it.
+
+`begin --announce TOPIC` is atomic only on the new announcement-capable
+profiles selected by bootstrap/migration. Earlier profiles refuse that option
+and retain their original meanings. See the
+[announcement contract](git-authority-announcements.md) for its request and
+complete receipt, including rollback on a late post rejection.

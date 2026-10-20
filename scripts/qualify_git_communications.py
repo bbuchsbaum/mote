@@ -107,6 +107,26 @@ def positive(root, binary):
     new_task = subject(promoted)
     assert len(promoted["receipt"]["outcome"]["result"]["effect_ids"]) == 4
     assert len(f.run("a", "show", new_task)["data"]["notes"]) == 1
+    announced = f.run("b", "begin", new_task, "--note", "atomic announced start", "--announce", "design",
+                      "--paths", "src/announcement.rs", actor="bob", session=bob)
+    assert announced["status"] == "accepted"
+    begin_result = announced["receipt"]["outcome"]["result"]
+    announcement = begin_result["announcement"]["id"]
+    assert len(begin_result["effect_ids"]) == 5
+    begin_sequence = announced["receipt"]["sequence"]
+    begin_tx = json.loads(f.git(root, "--git-dir", str(f.remote), "show",
+                               f"refs/heads/mote-state:transactions/{begin_sequence:020}.json"))
+    assert begin_tx["request"]["command"]["action"]["kind"] == "begin.announce"
+    assert [effect["index"] for effect in begin_tx["effects"]] == list(range(5))
+    assert begin_tx["effects"][-1]["op"]["op"].startswith(maximum + "~gaop-")
+    announced_view = f.run("a", "authority", "refresh")["data"]
+    assert announced_view["claims"][new_task]["session"] == bob
+    assert announced_view["tasks"][new_task]["status"] == "doing"
+    assert announced_view["communications"]["board_posts"][announcement]["body"] == (
+        f"claiming {new_task} for {begin_result['reservation']['id']} on src/announcement.rs")
+    accepted_head = f.head()
+    assert f.run("b", "authority", "retry", announced["request_id"], actor="bob")["receipt"] == announced["receipt"]
+    assert f.head() == accepted_head
     decision = f.run("a", "discuss", "decide", "--topic", "design", "--agreed", spaced_post,
                      "--cite", "post:" + spaced_post, "--body", "preserve this imported citation", session=alice)
     decision_id = subject(decision)
@@ -140,7 +160,9 @@ def positive(root, binary):
             "imported_reply_id": reply_id, "promotion_task": new_task, "original_ops_unchanged": True,
             "old_keys_preserved": True, "receipt_retry_does_not_append": True, "spaced_reference_round_trip": True,
             "legacy_remote_event_cursor_resume": True, "canonical_event_positions": positions,
-            "backward_timestamps_and_lexical_ids_preserve_event_order": True, "diagnostics_publish_nothing": True}
+            "backward_timestamps_and_lexical_ids_preserve_event_order": True, "diagnostics_publish_nothing": True,
+            "atomic_begin_announcement": {"task": new_task, "post": announcement, "sequence": begin_sequence,
+                                           "effect_indices": list(range(5)), "exact_retry_without_append": True}}
 
 
 def eligibility(root, binary, case):

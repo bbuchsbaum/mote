@@ -2,7 +2,7 @@
 
 `mote --json authority capabilities` works without a store or network access.
 It reports the executing file's path and BLAKE3 digest, package version, explicit
-release ownership, and the exact seven immutable profiles compiled into it.
+release ownership, and the exact nine immutable profiles compiled into it.
 This evidence identifies the actual executable. Source SHA, dirty state and
 target metadata are explicitly unavailable pending F10; the command never
 infers them from the Git checkout where it happens to run.

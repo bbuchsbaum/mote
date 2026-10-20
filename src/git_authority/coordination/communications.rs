@@ -500,6 +500,16 @@ pub(super) fn plan(
     sequence: u64,
     action: &Action,
 ) -> MoteResult<CoordinationPlan> {
+    plan_at(state, request, sequence, action, 0)
+}
+
+pub(super) fn plan_at(
+    state: &CoordinationState,
+    request: &Request,
+    sequence: u64,
+    action: &Action,
+    offset: usize,
+) -> MoteResult<CoordinationPlan> {
     let domain = state.communication_state()?;
     let reject =
         |code: &str, subject: &str| rejected(state, json!({"code":code,"subject":subject}));
@@ -546,6 +556,7 @@ pub(super) fn plan(
         &subject(action),
         ops(action, &domain)?,
         domain,
+        offset,
     )
 }
 fn rejected(state: &CoordinationState, result: Value) -> CoordinationPlan {
@@ -565,13 +576,17 @@ fn apply_specs(
     subject: &str,
     specs: Vec<Value>,
     mut domain: crate::state::State,
+    offset: usize,
 ) -> MoteResult<CoordinationPlan> {
-    if specs.len() > 1_000_000 {
+    if offset
+        .checked_add(specs.len())
+        .is_none_or(|end| end > 1_000_000)
+    {
         return bad("communication effect index overflow");
     }
     let mut effects = Vec::new();
     for (index, mut op) in specs.into_iter().enumerate() {
-        let index = index as u32;
+        let index = (offset + index) as u32;
         let effect_id = format!("eff-{}-{index:06}", request.request_id);
         let is_task = matches!(
             op["kind"].as_str(),
@@ -1107,6 +1122,41 @@ mod tests {
     }
 
     #[test]
+    fn compound_effect_offsets_are_checked_before_applying_any_adapter() {
+        let mut h = Harness::new();
+        let action = Action::Post {
+            id: "post-offset".into(),
+            topic: "design".into(),
+            body: "offset".into(),
+            reply_to: None,
+            post_kind: "post".into(),
+            answers: vec![],
+            notify: vec![],
+            idempotency_key: None,
+        };
+        let request = h.request(
+            "alice",
+            Core::Communication {
+                action: action.clone(),
+            },
+        );
+        let state = &h.state.coordination;
+        for offset in [1_000_000, usize::MAX] {
+            assert!(plan_at(state, &request, h.state.sequence + 1, &action, offset).is_err());
+        }
+        let ordinary = plan(state, &request, h.state.sequence + 1, &action).unwrap();
+        let zero = plan_at(state, &request, h.state.sequence + 1, &action, 0).unwrap();
+        assert_eq!(ordinary, zero);
+        let last = plan_at(state, &request, h.state.sequence + 1, &action, 999_999).unwrap();
+        assert_eq!(last.effects[0].index(), 999_999);
+        assert_eq!(
+            last.effects[0].effect_id(),
+            format!("eff-{}-999999", request.request_id)
+        );
+        assert!(last.effects[0].adapter_id().contains("-999999-"));
+        assert_eq!(state.communication_state().unwrap().board_posts.len(), 0);
+    }
+    #[test]
     fn read_conflicts_and_missing_reply_targets_are_canonical_rejections() {
         let mut h = Harness::new();
         h.post("post-source");
@@ -1219,6 +1269,7 @@ mod tests {
             "bd-promoted",
             specs,
             domain,
+            0,
         )
         .unwrap();
         assert_eq!(plan.outcome.result["code"], "communication_effect_rejected");

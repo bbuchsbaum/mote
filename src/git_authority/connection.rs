@@ -306,7 +306,9 @@ pub(crate) fn checked_rollback_source(
         || original.store_id != source.descriptor.store_id
         || (source.descriptor.capabilities != super::protocol::RECOVERABLE_MIGRATED_CAPABILITIES
             && source.descriptor.capabilities
-                != super::protocol::MIGRATED_COMMUNICATION_CAPABILITIES)
+                != super::protocol::MIGRATED_COMMUNICATION_CAPABILITIES
+            && source.descriptor.capabilities
+                != super::protocol::MIGRATED_ANNOUNCEMENT_CAPABILITIES)
         || source.proposed_format != proposed_format(&source.original_format, &source.descriptor)?
         || (format != source.original_format && format != source.proposed_format)
         || source.endpoint_digest != transport.endpoint_digest()
@@ -758,7 +760,7 @@ fn run_setup_inner(
                 if transport.head()?.is_some() {
                     return invalid("authority branch already exists; use authority connect");
                 }
-                let manifest = Manifest::communications(format.store_id.clone());
+                let manifest = Manifest::announcements(format.store_id.clone());
                 let root = transport.capture_root(&manifest)?;
                 let descriptor = Descriptor {
                     version: 1,
@@ -797,7 +799,7 @@ fn run_setup_inner(
                 super::coordination::CoordinationState::from_legacy(verified)?;
                 let pack = super::legacy::pack(&archive)?;
                 let backup = super::backup::create(store, &options.backup)?;
-                let manifest = Manifest::migrated_communications(
+                let manifest = Manifest::migrated_announcements(
                     format.store_id.clone(),
                     archive.digest.clone(),
                 );

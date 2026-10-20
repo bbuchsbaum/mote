@@ -151,6 +151,14 @@ fn supported_profiles() -> Vec<SupportedProfile> {
             "migrated-communication",
             protocol::MIGRATED_COMMUNICATION_CAPABILITIES.as_slice(),
         ),
+        (
+            "announcement",
+            protocol::ANNOUNCEMENT_CAPABILITIES.as_slice(),
+        ),
+        (
+            "migrated-announcement",
+            protocol::MIGRATED_ANNOUNCEMENT_CAPABILITIES.as_slice(),
+        ),
     ]
     .into_iter()
     .map(|(name, capabilities)| SupportedProfile {

@@ -98,7 +98,9 @@ impl Journal {
             || (self.source.descriptor.capabilities
                 != super::protocol::RECOVERABLE_MIGRATED_CAPABILITIES
                 && self.source.descriptor.capabilities
-                    != super::protocol::MIGRATED_COMMUNICATION_CAPABILITIES)
+                    != super::protocol::MIGRATED_COMMUNICATION_CAPABILITIES
+                && self.source.descriptor.capabilities
+                    != super::protocol::MIGRATED_ANNOUNCEMENT_CAPABILITIES)
             || self.working != working_path(&self.destination, &self.nonce)?
             || (self.phase != Phase::Retiring && self.proof.is_none())
             || (matches!(

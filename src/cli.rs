@@ -498,7 +498,7 @@ pub enum Command {
         paths: Vec<String>,
     },
 
-    /// Compound: optional reserve_open + claim + status=doing + optional progress note. Compensates on partial failure.
+    /// Claim/start with optional paths and note. Git authority commits supported effects atomically; local mode compensates on failure.
     Begin {
         id: String,
         /// Paths to reserve; omit to claim and start the bead without a reservation
@@ -509,7 +509,7 @@ pub enum Command {
         note: Option<String>,
         #[arg(long, value_parser = parse_duration_seconds)]
         ttl: Option<u32>,
-        /// Also post a one-line claim to this discussion topic
+        /// Also post a one-line claim; atomic on an announcement-capable Git authority
         #[arg(long)]
         announce: Option<String>,
     },

@@ -394,14 +394,26 @@ pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
             ttl,
             announce,
         } => {
-            if ttl.is_some() || announce.is_some() {
+            if ttl.is_some() {
                 return Err(MoteError::Invalid(
-                    "remote begin does not support --ttl or --announce".into(),
+                    "remote begin does not support --ttl".into(),
                 ));
             }
             let session = required_session()?;
             let (client, _scratch) = open_client(&store)?;
             let snapshot = client.refresh()?;
+            if announce.is_some()
+                && !snapshot
+                    .manifest
+                    .capabilities
+                    .iter()
+                    .any(|c| c == "coordination-announcements-v1")
+            {
+                return Err(MoteError::Invalid(
+                    "this immutable authority profile does not support atomic begin announcements"
+                        .into(),
+                ));
+            }
             let task = snapshot
                 .state
                 .coordination
@@ -423,18 +435,26 @@ pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
             paths.dedup();
             let reservation = (!paths.is_empty()).then(ids::new_reservation_id);
             let note = crate::cli::resolve_optional_text(note.clone())?;
-            let req = request(
-                &store,
-                cli,
-                Action::Begin(super::coordination::lifecycle::Begin {
-                    id: id.clone(),
-                    expect_status,
-                    reservation,
-                    paths,
-                    note,
-                }),
-                session,
-            )?;
+            let begin = super::coordination::lifecycle::Begin {
+                id: id.clone(),
+                expect_status,
+                reservation,
+                paths,
+                note,
+            };
+            let action = match announce {
+                Some(topic) => {
+                    Action::AnnouncedBegin(super::coordination::announcements::AnnouncedBegin {
+                        begin,
+                        announcement: super::coordination::announcements::Announcement {
+                            id: ids::new_post_id(),
+                            topic: crate::cli::normalize_discussion_topic(topic)?,
+                        },
+                    })
+                }
+                None => Action::Begin(begin),
+            };
+            let req = request(&store, cli, action, session)?;
             finish_submission(cli.json, client.submit(req, 4)?)?
         }
         Command::Done { id, note, force } => {

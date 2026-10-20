@@ -22,7 +22,9 @@ transition. A previously bound branch disappearing is an error, not permission
 to initialize it again.
 
 The root commit has no parents. Its tree contains exactly `manifest.json` and,
-for a migrated store, `legacy.json`. The manifest is immutable:
+for a migrated store, `legacy.pack`. The manifest is immutable. This example
+uses the synthetic engine profile; current bootstrap selects the separate
+[announcement-capable profile](git-authority-announcements.md):
 
 ```json
 {
@@ -39,16 +41,20 @@ Store IDs use Mote's `st-` prefix and a nonempty ASCII alphanumeric/hyphen
 suffix. Generation is a positive integer. Capability arrays are sorted,
 duplicate-free, and exact: unknown required capabilities fail closed. Root OID
 is recorded in the local binding, not inside its own manifest. If present,
-`legacy_digest` is the full lowercase BLAKE3 digest of canonical `legacy.json`.
-The initial engine implements the `synthetic-cas-v1` command profile. The next
-development slice adds the separately reviewed [coordination core profile](git-authority-coordination.md).
+`legacy_digest` is the full lowercase domain-separated BLAKE3 digest of the
+verified legacy export in the packed archive; the pack retains the original
+inputs and replay evidence. See the [migration contract](git-authority-migration.md).
+The initial engine implements the `synthetic-cas-v1` command profile. The
+separately reviewed [coordination core profile](git-authority-coordination.md)
+adds ordinary task ownership.
 Its exact capability array is `["canonical-transactions-v1", "coordination-core-v1", "explicit-release-v1"]`.
-The immutable manifest selects exactly one of these arrays; a synthetic root
+The immutable manifest selects exactly one supported array; a synthetic root
 never gains coordination semantics, and inactive-profile requests are refused
-before planning and during replay. Both profiles require roots with
-`legacy_digest: null` and no legacy file. The engine refuses migrated roots
-until GA-22 supplies a separately reviewed import schema and semantic profile.
-The migration requirements below remain mandatory for that later capability.
+before planning and during replay. These two early profiles require roots with
+`legacy_digest: null` and no legacy file. Later lifecycle, communications,
+packed-migration, retirement and announcement profiles retain their own exact
+capability sets. Migrated roots require the separately reviewed packed import
+schema and exact retained replay profile; they never reinterpret an old root.
 
 Each subsequent commit has exactly one parent and adds exactly one file:
 `transactions/00000000000000000001.json`, then consecutive 20-digit decimal
@@ -288,9 +294,11 @@ role paths, as well as CLI commands and overrides. Losing connectivity never
 changes mode. Read-only cached views report head, observation time and freshness.
 
 Bootstrap uses explicit authorization and competes to create one root. A loser
-does not overwrite another bootstrap. Rollback before any remote commands can
-restore the stopped local backup. After remote writes, conversion back to local
-mode is a new migration from current canonical history. Source branch updates
+does not overwrite another bootstrap. Before any canonical receipt, explicit
+permanent retirement may restore the stopped backup into a new private local
+store under the [rollback contract](git-authority-rollback.md). Post-use
+conversion is deferred from the first local-machine release: it requires a
+versioned continuation format preserving current canonical history. Source branch updates
 and deployment are separate effects, outside this transaction guarantee.
 
 ## Contract fixtures and acceptance

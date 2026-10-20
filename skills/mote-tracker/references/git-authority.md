@@ -20,6 +20,10 @@ mote done bd-ID --note 'verified result'
 mote session end
 ```
 
+On a profile declaring `coordination-announcements-v1`, `begin --announce TOPIC`
+also commits one public claim announcement atomically with ownership and its
+optional note. Earlier profiles refuse it; `connect` never upgrades a root.
+
 Bootstrap is a separate deliberate `authority init-git` action. A nonempty
 local history requires stopped-source migration, not `admit` or a merge of
 replicas. Preserve old operations and complete backup custody. Setup interrupted

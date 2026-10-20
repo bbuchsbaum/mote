@@ -7,6 +7,11 @@ coordination-lifecycle-v1, explicit-release-v1. Its migrated counterpart adds
 authority-retirement-v1 first and legacy-packed-v1 last. Bootstrap and migration
 select these new profiles only after integration and qualification.
 
+Current bootstrap/migration select the separate
+[announcement-capable profiles](git-authority-announcements.md), which include
+this unchanged communications capability. The earlier five/seven-capability
+profiles retain their exact meanings and refuse the new compound action.
+
 The coordination action is a strict `communication` variant containing a strict
 `action` object tagged by `kind`. Unknown fields, including nested reference and
 question fields, are invalid. Nullable fields must be present; lists are required.

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod announcements;
 pub mod communications;
 pub mod lifecycle;
 
@@ -68,6 +69,8 @@ pub enum Action {
     ReservationRelease { reservation: String, token: String },
     #[serde(rename = "begin")]
     Begin(lifecycle::Begin),
+    #[serde(rename = "begin.announce")]
+    AnnouncedBegin(announcements::AnnouncedBegin),
     #[serde(rename = "next")]
     Next(lifecycle::Next),
     #[serde(rename = "done")]
@@ -248,6 +251,7 @@ pub struct CoordinationPlan {
 pub fn validate_action(a: &Action) -> MoteResult<()> {
     match a {
         Action::Communication { action } => communications::validate(action)?,
+        Action::AnnouncedBegin(action) => announcements::validate(action)?,
         Action::Begin(_)
         | Action::Next(_)
         | Action::Done(_)
@@ -681,6 +685,9 @@ pub fn plan(
             next_state,
         });
     }
+    if let Action::AnnouncedBegin(action) = action {
+        return announcements::plan(state, request, sequence, action);
+    }
     if action.is_lifecycle() {
         return lifecycle::plan(state, request, sequence);
     }
@@ -701,7 +708,8 @@ pub fn plan(
         return Ok(reject("session_unavailable", &request.session));
     }
     let (effect, subject) = match action {
-        Action::Begin(_)
+        Action::AnnouncedBegin(_)
+        | Action::Begin(_)
         | Action::Next(_)
         | Action::Done(_)
         | Action::Handoff(_)
