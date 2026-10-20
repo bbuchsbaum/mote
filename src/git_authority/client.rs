@@ -16,6 +16,7 @@ use crate::{MoteError, MoteResult};
 pub struct Client {
     transport: GitTransport,
     cache: Cache,
+    expected_capabilities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,11 +68,58 @@ impl Client {
     /// Explicitly connect a cache to an existing authority. This does not
     /// initialize a branch, migrate a task store, or enable CLI task commands.
     pub fn connect(transport: GitTransport, cache_root: &Path) -> MoteResult<Self> {
-        let cache = Cache::open(cache_root)?;
-        let client = Self { transport, cache };
-        {
+        Self::connect_inner(transport, cache_root, None, None).map(|(client, _)| client)
+    }
+
+    pub(crate) fn connect_snapshot(
+        transport: GitTransport,
+        cache_root: &Path,
+    ) -> MoteResult<(Self, Snapshot)> {
+        Self::connect_inner(transport, cache_root, None, None)
+    }
+
+    /// Setup validates the selected identity before binding or advancing its
+    /// cache. A resumed setup can also retain a minimum confirmed observation.
+    pub(crate) fn connect_expected(
+        transport: GitTransport,
+        cache_root: &Path,
+        expected: &Binding,
+        capabilities: &[String],
+        minimum_head: Option<&str>,
+    ) -> MoteResult<(Self, Snapshot)> {
+        Self::connect_inner(
+            transport,
+            cache_root,
+            Some((expected, capabilities)),
+            minimum_head,
+        )
+    }
+
+    fn connect_inner(
+        transport: GitTransport,
+        cache_root: &Path,
+        expected: Option<(&Binding, &[String])>,
+        minimum_head: Option<&str>,
+    ) -> MoteResult<(Self, Snapshot)> {
+        let cache = Cache::open(&transport.checked_cache_path(cache_root)?)?;
+        let client = Self {
+            transport,
+            cache,
+            expected_capabilities: expected.map(|(_, caps)| caps.to_vec()),
+        };
+        let snapshot = {
             let _lock = client.cache.lock()?;
-            if let Some(binding) = client.cache.binding()? {
+            let existing = client.cache.binding()?;
+            if let Some((expected, _)) = expected {
+                expected.check_endpoint(
+                    &client.transport.endpoint_digest(),
+                    client.transport.branch_ref(),
+                )?;
+                if existing.as_ref().is_some_and(|binding| binding != expected) {
+                    return invalid("cache binding differs from selected authority");
+                }
+            }
+            if let Some(binding) = &existing {
                 binding.check_endpoint(
                     &client.transport.endpoint_digest(),
                     client.transport.branch_ref(),
@@ -83,9 +131,15 @@ impl Client {
                 )
             })?;
             let chain = client.chain(&head)?;
-            let binding = client.cache.binding()?;
             let previous = client.cache.previous_head()?;
-            let snapshot = validate_chain(&chain, binding.as_ref(), previous.as_deref())?;
+            let binding = expected.map(|(binding, _)| binding).or(existing.as_ref());
+            let snapshot = validate_chain(&chain, binding, previous.as_deref())?;
+            if minimum_head.is_some_and(|head| !chain.iter().any(|commit| commit.oid == head)) {
+                return invalid("authority lost the setup's confirmed observation");
+            }
+            if expected.is_some_and(|(_, caps)| caps != snapshot.manifest.capabilities) {
+                return invalid("authority profile differs from selected capabilities");
+            }
             let binding = Binding {
                 version: 1,
                 endpoint_digest: client.transport.endpoint_digest(),
@@ -96,8 +150,34 @@ impl Client {
             };
             client.cache.bind(&binding)?;
             client.cache.observe(&snapshot)?;
+            snapshot
+        };
+        Ok((client, snapshot))
+    }
+
+    /// Open an explicitly connected machine without an extra remote read.
+    /// Subsequent reads/submissions still perform the normal full refresh.
+    pub(crate) fn open_bound(
+        transport: GitTransport,
+        cache_root: &Path,
+        expected: &Binding,
+        capabilities: &[String],
+    ) -> MoteResult<Self> {
+        expected.check_endpoint(&transport.endpoint_digest(), transport.branch_ref())?;
+        let cache = Cache::open(&transport.checked_cache_path(cache_root)?)?;
+        {
+            let _lock = cache.lock()?;
+            if cache.binding()?.as_ref() != Some(expected) {
+                return invalid(
+                    "this machine is not connected to the selected authority; run authority connect",
+                );
+            }
         }
-        Ok(client)
+        Ok(Self {
+            transport,
+            cache,
+            expected_capabilities: Some(capabilities.to_vec()),
+        })
     }
 
     pub fn refresh(&self) -> MoteResult<Snapshot> {
@@ -143,6 +223,7 @@ impl Client {
             return invalid("submission attempts must be between 1 and 64");
         }
         let _lock = self.cache.lock()?;
+        let mut pending_intent = false;
         let mut journal = match self.journal(&request.request_id)? {
             Some(existing) => {
                 if existing.request.digest()? != request.digest()? {
@@ -156,7 +237,13 @@ impl Client {
                     request: request.clone(),
                     attempted_commits: vec![],
                 };
-                persist(&entry)?;
+                if self.expected_capabilities.is_some() {
+                    // A checked project profile must be validated before a
+                    // new intent is retained under that profile.
+                    pending_intent = true;
+                } else {
+                    persist(&entry)?;
+                }
                 entry
             }
         };
@@ -176,6 +263,10 @@ impl Client {
             }
             if let Err(error) = snapshot.manifest.allows(&request.command) {
                 return uncertain_or_error(&journal, error, "profile");
+            }
+            if pending_intent {
+                persist(&journal)?;
+                pending_intent = false;
             }
             let transaction =
                 match Transaction::prepare(&snapshot.state, &snapshot.head, request.clone()) {
@@ -280,6 +371,13 @@ impl Client {
         let chain = self.chain(&head)?;
         let previous = self.cache.previous_head()?;
         let snapshot = validate_chain(&chain, Some(&binding), previous.as_deref())?;
+        if self
+            .expected_capabilities
+            .as_ref()
+            .is_some_and(|caps| *caps != snapshot.manifest.capabilities)
+        {
+            return invalid("authority profile differs from selected capabilities");
+        }
         self.cache.observe(&snapshot)?;
         Ok(snapshot)
     }

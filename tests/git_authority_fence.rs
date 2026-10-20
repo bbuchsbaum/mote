@@ -63,6 +63,36 @@ fn incompatible_format_fails_before_creating_local_publication_state() {
 }
 
 #[test]
+fn durable_setup_intent_fences_local_writes_before_the_project_marker_exists() {
+    let td = tempdir().unwrap();
+    let store = Store::init(td.path()).unwrap();
+    let format = fs::read(store.format_path()).unwrap();
+    // Even an incomplete or damaged intent is a fence, never permission to
+    // accept local work behind an interrupted activation.
+    fs::write(
+        store.local_dir().join("git-setup.json"),
+        b"incomplete intent",
+    )
+    .unwrap();
+    assert!(!store.root().join("remote.json").exists());
+    assert!(mote::authority::Writer::acquire(&store).is_err());
+    assert!(mote::authority::Writer::acquire_for_admission(&store).is_err());
+    assert!(mote::authority::Writer::acquire_discarding_foreign_format(&store).is_err());
+    assert!(mote::reducer::replay_store(&store).is_err());
+    assert!(
+        mote::publish::publish_value(
+            &store,
+            json!({"kind":"create","actor":"a","entity":"bd-test","set":{"title":"bad"}}),
+            jiff::Timestamp::now()
+        )
+        .is_err()
+    );
+    assert!(!store.local_dir().join("publication.lock").exists());
+    assert_eq!(fs::read(store.format_path()).unwrap(), format);
+    assert_eq!(fs::read_dir(store.ops_dir()).unwrap().count(), 0);
+}
+
+#[test]
 fn cache_binding_cannot_be_replaced_and_local_state_is_private() {
     let td = tempdir().unwrap();
     let cache = Cache::open(td.path()).unwrap();

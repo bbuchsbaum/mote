@@ -245,9 +245,12 @@ impl Store {
     /// A remote-mode marker is deliberately incompatible with local writers.
     /// All local publication and replay entry points consult this boundary.
     pub fn require_local_authority(&self) -> MoteResult<()> {
-        if self.read_format()?.schema_version != 1 || self.root.join("remote.json").exists() {
+        if self.read_format()?.schema_version != 1
+            || self.root.join("remote.json").exists()
+            || self.local_dir().join("git-setup.json").exists()
+        {
             return Err(MoteError::Invalid(
-                "Git-authority or unsupported store: local publication/replay is refused; use the remote client".into(),
+                "Git-authority, pending Git setup, or unsupported store: local publication/replay is refused; finish setup or use the remote client".into(),
             ));
         }
         Ok(())

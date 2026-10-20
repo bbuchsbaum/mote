@@ -297,7 +297,7 @@ fn race_case(
         assert!(outcomes.iter().any(|outcome| outcome == expected.1));
     }
     let snapshot = f
-        .client(&f.root.join("race-observer"), "race-observer")
+        .client(&f.root.join("race-observer-cache"), "race-observer-scratch")
         .refresh()
         .unwrap();
     assert_eq!(snapshot.receipts.len(), receipts);

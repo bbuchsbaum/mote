@@ -754,6 +754,19 @@ pub(crate) fn checkpoint(name: &str) -> MoteResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_git_setup_is_rechecked_inside_the_publication_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::repo::Store::init(root.path()).unwrap();
+        store.require_local_authority().unwrap();
+        std::fs::write(store.local_dir().join("git-setup.json"), b"prepared").unwrap();
+        // Enter after the outer mode check, as a writer that waited for a
+        // concurrent setup lock would. The under-lock check must still refuse.
+        let result = super::Writer::acquire_after_mode_check(&store, false, false);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(store.ops_dir()).unwrap().count(), 0);
+    }
+
     use super::*;
     use crate::op::{ScalarSet, make_create, make_note};
     use jiff::Timestamp;

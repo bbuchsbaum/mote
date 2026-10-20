@@ -20,6 +20,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::{
+    connection::RootArtifact,
+    protocol::{Manifest, encode},
+};
 use crate::{MoteError, MoteResult};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -157,6 +161,37 @@ impl GitTransport {
 
     pub fn branch_ref(&self) -> &str {
         &self.reference
+    }
+
+    pub fn remote_name(&self) -> &str {
+        &self.remote
+    }
+
+    /// Durable identity and journals must survive disposal of transport scratch.
+    pub(crate) fn checked_cache_path(&self, path: &Path) -> MoteResult<PathBuf> {
+        let mut ancestor = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let mut tail = Vec::new();
+        while !ancestor.exists() {
+            let name = ancestor
+                .file_name()
+                .ok_or_else(|| MoteError::Invalid("cache path has no existing ancestor".into()))?;
+            tail.push(name.to_owned());
+            ancestor.pop();
+        }
+        let mut resolved = ancestor.canonicalize()?;
+        for name in tail.into_iter().rev() {
+            resolved.push(name);
+        }
+        if resolved.starts_with(&self.scratch) || self.scratch.starts_with(&resolved) {
+            return Err(MoteError::Invalid(
+                "durable authority cache must be disjoint from disposable Git scratch".into(),
+            ));
+        }
+        Ok(resolved)
     }
 
     /// Fetch the selected authority branch into scratch objects only.
@@ -345,6 +380,102 @@ impl GitTransport {
             .trim();
         self.validate_oid(oid)?;
         Ok(oid.to_owned())
+    }
+
+    pub fn capture_root(&self, manifest: &Manifest) -> MoteResult<RootArtifact> {
+        manifest.validate()?;
+        let manifest_bytes = encode(manifest)?;
+        let commit_oid = self.create_commit(
+            None,
+            &BTreeMap::from([("manifest.json".into(), manifest_bytes.clone())]),
+        )?;
+        let commit_bytes = self.git_bytes(
+            "read root commit",
+            ["cat-file", "commit", &commit_oid],
+            None,
+        )?;
+        let tree_oid = self
+            .git_text(
+                "read root tree",
+                ["rev-parse", &format!("{commit_oid}^{{tree}}")],
+            )?
+            .trim()
+            .to_owned();
+        self.validate_oid(&tree_oid)?;
+        let tree_bytes = self.git_bytes("read root tree", ["cat-file", "tree", &tree_oid], None)?;
+        let manifest_oid = self
+            .git_text(
+                "read root blob",
+                ["rev-parse", &format!("{commit_oid}:manifest.json")],
+            )?
+            .trim()
+            .to_owned();
+        self.validate_oid(&manifest_oid)?;
+        let artifact = RootArtifact {
+            object_format: if self.oid_len == 40 { "sha1" } else { "sha256" }.into(),
+            manifest_oid,
+            manifest_bytes,
+            tree_oid,
+            tree_bytes,
+            commit_oid,
+            commit_bytes,
+        };
+        self.import_root(&artifact)?;
+        Ok(artifact)
+    }
+
+    pub fn import_root(&self, artifact: &RootArtifact) -> MoteResult<()> {
+        artifact.validate()?;
+        if (artifact.object_format == "sha1") != (self.oid_len == 40) {
+            return Err(MoteError::Invalid(
+                "root artifact object format differs from transport".into(),
+            ));
+        }
+        for (kind, oid, bytes) in [
+            ("blob", &artifact.manifest_oid, &artifact.manifest_bytes),
+            ("tree", &artifact.tree_oid, &artifact.tree_bytes),
+            ("commit", &artifact.commit_oid, &artifact.commit_bytes),
+        ] {
+            let got = self.git_bytes(
+                "import retained root object",
+                ["hash-object", "-w", "-t", kind, "--stdin"],
+                Some(bytes),
+            )?;
+            let got = std::str::from_utf8(&got)
+                .map_err(|_| MoteError::Invalid("invalid imported object id".into()))?
+                .trim();
+            if got != oid {
+                return Err(MoteError::Invalid(
+                    "retained root object hash differs".into(),
+                ));
+            }
+        }
+        let commit = self.commit(&artifact.commit_oid)?;
+        if !commit.parents.is_empty()
+            || commit.files.len() != 1
+            || commit.files.get("manifest.json").is_none_or(|b| {
+                b.mode != "100644"
+                    || b.oid != artifact.manifest_oid
+                    || b.bytes != artifact.manifest_bytes
+            })
+        {
+            return Err(MoteError::Invalid(
+                "retained root artifact does not describe an authority root".into(),
+            ));
+        }
+        let tree = self
+            .git_text(
+                "verify retained root tree",
+                ["rev-parse", &format!("{}^{{tree}}", artifact.commit_oid)],
+            )?
+            .trim()
+            .to_owned();
+        if tree != artifact.tree_oid {
+            return Err(MoteError::Invalid(
+                "retained root tree differs from commit".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Narrow append builder for an already-validated authority parent.
@@ -798,6 +929,35 @@ fn validate_tree_path(path: &str) -> MoteResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_paths_cannot_overlap_scratch_even_through_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        git(root.path(), &["init", "-q", repo.to_str().unwrap()]);
+        git(&repo, &["remote", "add", "origin", "unused"]);
+        let scratch = root.path().join("scratch");
+        let transport = GitTransport::open(&repo, "origin", "authority", &scratch).unwrap();
+        for cache in [
+            &scratch,
+            &scratch.join("durable"),
+            &root.path().to_path_buf(),
+        ] {
+            assert!(transport.checked_cache_path(cache).is_err());
+        }
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&scratch, &alias).unwrap();
+            assert!(transport.checked_cache_path(&alias.join("nested")).is_err());
+        }
+        let durable = root.path().join("durable");
+        assert_eq!(
+            transport.checked_cache_path(&durable).unwrap(),
+            root.path().canonicalize().unwrap().join("durable")
+        );
+        assert!(!durable.exists(), "validation must not create cache state");
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         assert!(
