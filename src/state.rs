@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Serialize, Serializer};
+use serde::{Serialize, Serializer, ser::SerializeMap};
 
 use crate::candidate::{
     AuthorizationStatus, CandidateContainmentBasis, CandidateEvidencePayload, CandidatePhase,
@@ -21,7 +21,7 @@ use crate::role::{
     RoleAssignmentClock, RoleAssignmentDisposition, RoleCoverage, RoleDemandSource, RoleExclusion,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Bead {
     pub id: String,
     pub title: String,
@@ -45,7 +45,7 @@ pub struct Bead {
     pub deleted_at_ts: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClaimState {
     pub claimed_by: String,
     pub claim_clock: String,
@@ -63,7 +63,7 @@ impl ClaimState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReleasedClaim {
     pub released_by: String,
     pub released_ts: String,
@@ -107,7 +107,7 @@ impl Bead {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Note {
     pub op_id: String,
     pub note_kind: String,
@@ -116,11 +116,12 @@ pub struct Note {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct State {
     /// Still-live carrier reservations left by an accepted claim handoff.
     pub handoff_orphans: BTreeSet<String>,
     /// Actor-scoped handoff request digests and original outcomes (including conflicts).
+    #[serde(serialize_with = "serialize_btree_map_pairs")]
     pub handoff_idempotency: BTreeMap<(String, String), (String, String)>,
     pub beads: BTreeMap<String, Bead>,
     /// Per-entity history in filename order. Includes both accepted and rejected
@@ -144,14 +145,17 @@ pub struct State {
     /// Per-actor discussion-board read cursor, as the latest seen board_post op id.
     pub board_read_cursors: BTreeMap<String, String>,
     /// Per-(actor, topic) discussion-board read cursor.
+    #[serde(serialize_with = "serialize_btree_map_pairs")]
     pub board_topic_read_cursors: BTreeMap<(String, String), String>,
     /// Current explicit topic-watch register per actor and topic.
+    #[serde(serialize_with = "serialize_btree_map_pairs")]
     pub board_topic_watches: BTreeMap<(String, String), BoardTopicWatchRecord>,
     /// All reservations, indexed by `reservation_id`. Both live and closed.
     pub reservations: BTreeMap<String, ReservationState>,
     /// All session leases, indexed by `session_id`. Both live and ended.
     pub sessions: BTreeMap<String, SessionRecord>,
     /// Actor-scoped retry registry for heartbeat and status operations.
+    #[serde(serialize_with = "serialize_btree_map_pairs")]
     pub session_idempotency: BTreeMap<(String, String), SessionIdempotencyRecord>,
     /// Immutable role definitions, indexed by role id.
     pub roles: BTreeMap<String, RoleRecord>,
@@ -160,16 +164,20 @@ pub struct State {
     /// All bounded role assignments, including terminal assignments.
     pub role_assignments: BTreeMap<String, RoleAssignmentRecord>,
     /// Actor-scoped retry registry for role mutations.
+    #[serde(serialize_with = "serialize_btree_map_pairs")]
     pub role_idempotency: BTreeMap<(String, String), RoleIdempotencyRecord>,
     /// Candidate protocol state, derived exclusively from candidate ops.
+    #[serde(serialize_with = "serialize_state_candidates")]
     pub candidates: BTreeMap<String, CandidateRecord>,
     /// Latest explicit ancestry rows contributed by each subject candidate for
     /// each known candidate. The directed key makes the two independently
     /// produced observations of one unordered pair available without allowing
     /// an omitted row to erase an immutable fact.
+    #[serde(serialize_with = "serialize_btree_map_pairs")]
     pub candidate_pair_evidence: BTreeMap<(String, String), CandidatePairEvidenceRecord>,
     /// Sender-scoped retry registry. Same key plus same digest is a no-op;
     /// reusing a key for a different action is rejected.
+    #[serde(serialize_with = "serialize_btree_map_pairs")]
     pub candidate_idempotency: BTreeMap<(String, String), CandidateIdempotencyRecord>,
 }
 
@@ -223,6 +231,67 @@ where
     evidence.values().collect::<Vec<_>>().serialize(serializer)
 }
 
+struct MapPairs<'a, K, V>(&'a BTreeMap<K, V>);
+
+impl<K, V> Serialize for MapPairs<'_, K, V>
+where
+    K: Ord + Serialize,
+    V: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+}
+
+fn serialize_btree_map_pairs<S, K, V>(
+    map: &BTreeMap<K, V>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    K: Ord + Serialize,
+    V: Serialize,
+{
+    MapPairs(map).serialize(serializer)
+}
+
+struct StateCandidate<'a>(&'a CandidateRecord);
+
+impl Serialize for StateCandidate<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut candidate = serde_json::to_value(self.0).map_err(serde::ser::Error::custom)?;
+        candidate
+            .as_object_mut()
+            .expect("CandidateRecord serializes as an object")
+            .insert(
+                "evidence".into(),
+                serde_json::to_value(MapPairs(&self.0.evidence))
+                    .map_err(serde::ser::Error::custom)?,
+            );
+        candidate.serialize(serializer)
+    }
+}
+
+fn serialize_state_candidates<S>(
+    candidates: &BTreeMap<String, CandidateRecord>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut map = serializer.serialize_map(Some(candidates.len()))?;
+    for (candidate_id, candidate) in candidates {
+        map.serialize_entry(candidate_id, &StateCandidate(candidate))?;
+    }
+    map.end()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CandidateReviewRecord {
     pub reviewer: String,
@@ -274,7 +343,7 @@ pub struct CandidateEvidenceRecord {
     pub ts: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CandidatePairEvidenceRecord {
     pub subject_candidate_id: String,
     pub subject_proposal_op_id: String,
@@ -375,7 +444,7 @@ pub struct CandidateSupersededReviewRecord {
     pub review_op_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CandidateIdempotencyRecord {
     pub candidate_id: String,
     pub digest: String,
@@ -426,14 +495,14 @@ pub struct RoleAssignmentRecord {
     pub released_ts: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RoleIdempotencyRecord {
     pub role_id: String,
     pub digest: String,
     pub op_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ReservationState {
     pub reservation_id: String,
     pub actor: String,
@@ -545,7 +614,7 @@ impl RequestState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MsgRecord {
     pub msg_id: String,
     pub from: String,
@@ -619,7 +688,7 @@ impl RouteState {
 }
 
 /// Derived routing state attached to a post or a topic.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RouteRecord {
     pub state: RouteState,
     /// Beads this discussion target has been linked to, in id order.
@@ -636,7 +705,7 @@ impl RouteRecord {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BoardPostRecord {
     pub post_id: String,
     pub from: String,
@@ -758,7 +827,7 @@ pub struct DecisionQuestionCounts {
     pub unresolved: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BoardTopicRecord {
     pub topic: String,
     pub title: String,
@@ -779,7 +848,7 @@ pub struct BoardTopicRecord {
 
 /// A TTL-bounded session lease. Multiple concurrent sessions may share one
 /// actor name; the lease is what makes them individually visible.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionRecord {
     pub session_id: String,
     pub actor: String,
@@ -825,7 +894,7 @@ pub struct SessionIntentRecord {
     pub set_op_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionIdempotencyRecord {
     pub op_id: String,
     pub kind: String,
@@ -839,7 +908,7 @@ impl SessionRecord {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HistoryEntry {
     pub op_id: String,
     pub kind: String,
