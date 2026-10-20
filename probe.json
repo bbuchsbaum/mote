@@ -1,0 +1,10 @@
+{
+  "branch": "mote-probe-20261020",
+  "receipts": {
+    "probe-20261020-local": {
+      "action": "synthetic-append",
+      "participant": "local"
+    }
+  },
+  "schema": "mote-git-probe-v1"
+}
