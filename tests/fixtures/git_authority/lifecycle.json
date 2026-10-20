@@ -1,0 +1,706 @@
+{
+  "contract_sha256": "ec9ac4a0eb7c715cb4883d4b8f966de8b549911c816a12033a1f4f8c14bf491b",
+  "derivation": "Independent authority_plan_review contract witnesses; no lifecycle implementation consulted",
+  "scenarios": [
+    {
+      "name": "pathless-begin",
+      "seed": [
+        {
+          "version": 1,
+          "request_id": "enroll-a",
+          "actor": "alice",
+          "session": "sess-a",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "session.start",
+              "label": "Alice"
+            }
+          }
+        },
+        {
+          "version": 1,
+          "request_id": "enroll-b",
+          "actor": "bob",
+          "session": "sess-b",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "session.start",
+              "label": "Bob"
+            }
+          }
+        },
+        {
+          "version": 1,
+          "request_id": "create",
+          "actor": "alice",
+          "session": "sess-a",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "task.create",
+              "id": "bd-one",
+              "title": "Task",
+              "body": "",
+              "priority": 2,
+              "assignee": null
+            }
+          }
+        }
+      ],
+      "vectors": [
+        {
+          "name": "begin-pathless",
+          "sequence": 4,
+          "request": {
+            "version": 1,
+            "request_id": "begin-pathless",
+            "actor": "alice",
+            "session": "sess-a",
+            "timestamp": "2026-10-20T00:00:00Z",
+            "command": {
+              "kind": "coordination",
+              "action": {
+                "kind": "begin",
+                "id": "bd-one",
+                "expect_status": "gaop-00000000000000000003-000000-eff-create-000000",
+                "reservation": null,
+                "paths": [],
+                "note": null
+              }
+            }
+          },
+          "effects": [
+            {
+              "kind": "ownership",
+              "effect_id": "eff-begin-pathless-000000",
+              "sequence": 4,
+              "index": 0,
+              "transition": {
+                "kind": "claim_acquired",
+                "task": "bd-one",
+                "actor": "alice",
+                "session": "sess-a",
+                "token": "eff-begin-pathless-000000"
+              }
+            },
+            {
+              "kind": "task_op",
+              "effect_id": "eff-begin-pathless-000001",
+              "sequence": 4,
+              "index": 1,
+              "op": {
+                "v": 1,
+                "kind": "patch",
+                "op": "gaop-00000000000000000004-000001-eff-begin-pathless-000001",
+                "actor": "alice",
+                "ts": "2026-10-20T00:00:00Z",
+                "entity": "bd-one",
+                "set": {
+                  "status": "doing"
+                },
+                "expect": {
+                  "status": "gaop-00000000000000000003-000000-eff-create-000000"
+                }
+              }
+            }
+          ],
+          "outcome": {
+            "status": "accepted",
+            "result": {
+              "code": "ok",
+              "subject": "bd-one",
+              "effect_ids": [
+                "eff-begin-pathless-000000",
+                "eff-begin-pathless-000001"
+              ],
+              "task": "bd-one",
+              "claim_token": "eff-begin-pathless-000000",
+              "reservation": null
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "handoff-and-end",
+      "seed": [
+        {
+          "version": 1,
+          "request_id": "enroll-a",
+          "actor": "alice",
+          "session": "sess-a",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "session.start",
+              "label": "Alice"
+            }
+          }
+        },
+        {
+          "version": 1,
+          "request_id": "enroll-b",
+          "actor": "bob",
+          "session": "sess-b",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "session.start",
+              "label": "Bob"
+            }
+          }
+        },
+        {
+          "version": 1,
+          "request_id": "create",
+          "actor": "alice",
+          "session": "sess-a",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "task.create",
+              "id": "bd-one",
+              "title": "Task",
+              "body": "",
+              "priority": 2,
+              "assignee": null
+            }
+          }
+        }
+      ],
+      "vectors": [
+        {
+          "name": "begin-work",
+          "sequence": 4,
+          "request": {
+            "version": 1,
+            "request_id": "begin-work",
+            "actor": "alice",
+            "session": "sess-a",
+            "timestamp": "2026-10-20T00:00:00Z",
+            "command": {
+              "kind": "coordination",
+              "action": {
+                "kind": "begin",
+                "id": "bd-one",
+                "expect_status": "gaop-00000000000000000003-000000-eff-create-000000",
+                "reservation": "rv-one",
+                "paths": [
+                  "src/a.rs"
+                ],
+                "note": "starting"
+              }
+            }
+          },
+          "effects": [
+            {
+              "kind": "ownership",
+              "effect_id": "eff-begin-work-000000",
+              "sequence": 4,
+              "index": 0,
+              "transition": {
+                "kind": "reservation_acquired",
+                "reservation": "rv-one",
+                "task": "bd-one",
+                "actor": "alice",
+                "session": "sess-a",
+                "token": "eff-begin-work-000000",
+                "paths": [
+                  "src/a.rs"
+                ]
+              }
+            },
+            {
+              "kind": "ownership",
+              "effect_id": "eff-begin-work-000001",
+              "sequence": 4,
+              "index": 1,
+              "transition": {
+                "kind": "claim_acquired",
+                "task": "bd-one",
+                "actor": "alice",
+                "session": "sess-a",
+                "token": "eff-begin-work-000001"
+              }
+            },
+            {
+              "kind": "task_op",
+              "effect_id": "eff-begin-work-000002",
+              "sequence": 4,
+              "index": 2,
+              "op": {
+                "v": 1,
+                "kind": "patch",
+                "op": "gaop-00000000000000000004-000002-eff-begin-work-000002",
+                "actor": "alice",
+                "ts": "2026-10-20T00:00:00Z",
+                "entity": "bd-one",
+                "set": {
+                  "status": "doing"
+                },
+                "expect": {
+                  "status": "gaop-00000000000000000003-000000-eff-create-000000"
+                }
+              }
+            },
+            {
+              "kind": "task_op",
+              "effect_id": "eff-begin-work-000003",
+              "sequence": 4,
+              "index": 3,
+              "op": {
+                "v": 1,
+                "kind": "note",
+                "op": "gaop-00000000000000000004-000003-eff-begin-work-000003",
+                "actor": "alice",
+                "ts": "2026-10-20T00:00:00Z",
+                "entity": "bd-one",
+                "note_kind": "progress",
+                "text": "starting"
+              }
+            }
+          ],
+          "outcome": {
+            "status": "accepted",
+            "result": {
+              "code": "ok",
+              "subject": "bd-one",
+              "effect_ids": [
+                "eff-begin-work-000000",
+                "eff-begin-work-000001",
+                "eff-begin-work-000002",
+                "eff-begin-work-000003"
+              ],
+              "task": "bd-one",
+              "claim_token": "eff-begin-work-000001",
+              "reservation": {
+                "id": "rv-one",
+                "token": "eff-begin-work-000000",
+                "paths": [
+                  "src/a.rs"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "name": "handoff-work",
+          "sequence": 5,
+          "request": {
+            "version": 1,
+            "request_id": "handoff-work",
+            "actor": "alice",
+            "session": "sess-a",
+            "timestamp": "2026-10-20T00:00:00Z",
+            "command": {
+              "kind": "coordination",
+              "action": {
+                "kind": "handoff",
+                "id": "bd-one",
+                "expect_status": "gaop-00000000000000000004-000002-eff-begin-work-000002",
+                "expect_claim": "eff-begin-work-000001",
+                "reservations": {
+                  "rv-one": "eff-begin-work-000000"
+                },
+                "to_session": "sess-b",
+                "disposition": "transfer",
+                "note": "please continue"
+              }
+            }
+          },
+          "effects": [
+            {
+              "kind": "task_op",
+              "effect_id": "eff-handoff-work-000000",
+              "sequence": 5,
+              "index": 0,
+              "op": {
+                "v": 1,
+                "kind": "note",
+                "op": "gaop-00000000000000000005-000000-eff-handoff-work-000000",
+                "actor": "alice",
+                "ts": "2026-10-20T00:00:00Z",
+                "entity": "bd-one",
+                "note_kind": "handoff",
+                "text": "please continue"
+              }
+            },
+            {
+              "kind": "ownership",
+              "effect_id": "eff-handoff-work-000001",
+              "sequence": 5,
+              "index": 1,
+              "transition": {
+                "kind": "claim_transferred",
+                "task": "bd-one",
+                "from_actor": "alice",
+                "from_session": "sess-a",
+                "old_token": "eff-begin-work-000001",
+                "to_actor": "bob",
+                "to_session": "sess-b",
+                "token": "eff-handoff-work-000001"
+              }
+            },
+            {
+              "kind": "ownership",
+              "effect_id": "eff-handoff-work-000002",
+              "sequence": 5,
+              "index": 2,
+              "transition": {
+                "kind": "reservation_transferred",
+                "reservation": "rv-one",
+                "task": "bd-one",
+                "paths": [
+                  "src/a.rs"
+                ],
+                "from_actor": "alice",
+                "from_session": "sess-a",
+                "old_token": "eff-begin-work-000000",
+                "to_actor": "bob",
+                "to_session": "sess-b",
+                "token": "eff-handoff-work-000002"
+              }
+            }
+          ],
+          "outcome": {
+            "status": "accepted",
+            "result": {
+              "code": "ok",
+              "subject": "bd-one",
+              "effect_ids": [
+                "eff-handoff-work-000000",
+                "eff-handoff-work-000001",
+                "eff-handoff-work-000002"
+              ],
+              "task": "bd-one",
+              "disposition": "transfer",
+              "recipient_session": "sess-b",
+              "claim_token": "eff-handoff-work-000001",
+              "reservations": [
+                {
+                  "id": "rv-one",
+                  "paths": [
+                    "src/a.rs"
+                  ],
+                  "previous_token": "eff-begin-work-000000",
+                  "token": "eff-handoff-work-000002"
+                }
+              ],
+              "unaffected_other_session_reservations": []
+            }
+          }
+        },
+        {
+          "name": "end-b",
+          "sequence": 6,
+          "request": {
+            "version": 1,
+            "request_id": "end-b",
+            "actor": "bob",
+            "session": "sess-b",
+            "timestamp": "2026-10-20T00:00:00Z",
+            "command": {
+              "kind": "coordination",
+              "action": {
+                "kind": "session.end",
+                "expect_session": "eff-enroll-b-000000",
+                "reason": "finished session"
+              }
+            }
+          },
+          "effects": [
+            {
+              "kind": "ownership",
+              "effect_id": "eff-end-b-000000",
+              "sequence": 6,
+              "index": 0,
+              "transition": {
+                "kind": "claim_released",
+                "task": "bd-one",
+                "actor": "bob",
+                "session": "sess-b",
+                "token": "eff-handoff-work-000001"
+              }
+            },
+            {
+              "kind": "ownership",
+              "effect_id": "eff-end-b-000001",
+              "sequence": 6,
+              "index": 1,
+              "transition": {
+                "kind": "reservation_released",
+                "reservation": "rv-one",
+                "task": "bd-one",
+                "actor": "bob",
+                "session": "sess-b",
+                "token": "eff-handoff-work-000002"
+              }
+            },
+            {
+              "kind": "ownership",
+              "effect_id": "eff-end-b-000002",
+              "sequence": 6,
+              "index": 2,
+              "transition": {
+                "kind": "session_ended",
+                "session": "sess-b",
+                "actor": "bob",
+                "token": "eff-enroll-b-000000",
+                "reason": "finished session"
+              }
+            }
+          ],
+          "outcome": {
+            "status": "accepted",
+            "result": {
+              "code": "ok",
+              "subject": "sess-b",
+              "effect_ids": [
+                "eff-end-b-000000",
+                "eff-end-b-000001",
+                "eff-end-b-000002"
+              ],
+              "session": "sess-b",
+              "released_claims": [
+                {
+                  "task": "bd-one",
+                  "token": "eff-handoff-work-000001"
+                }
+              ],
+              "released_reservations": [
+                {
+                  "id": "rv-one",
+                  "task": "bd-one",
+                  "token": "eff-handoff-work-000002",
+                  "paths": [
+                    "src/a.rs"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "transfer-recovery",
+      "seed": [
+        {
+          "version": 1,
+          "request_id": "enroll-a",
+          "actor": "alice",
+          "session": "sess-a",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "session.start",
+              "label": "Alice"
+            }
+          }
+        },
+        {
+          "version": 1,
+          "request_id": "enroll-b",
+          "actor": "bob",
+          "session": "sess-b",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "session.start",
+              "label": "Bob"
+            }
+          }
+        },
+        {
+          "version": 1,
+          "request_id": "create",
+          "actor": "alice",
+          "session": "sess-a",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "task.create",
+              "id": "bd-one",
+              "title": "Task",
+              "body": "",
+              "priority": 2,
+              "assignee": null
+            }
+          }
+        },
+        {
+          "version": 1,
+          "request_id": "claim-a",
+          "actor": "alice",
+          "session": "sess-a",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "claim.acquire",
+              "id": "bd-one"
+            }
+          }
+        },
+        {
+          "version": 1,
+          "request_id": "reserve-a",
+          "actor": "alice",
+          "session": "sess-a",
+          "timestamp": "2026-10-20T00:00:00Z",
+          "command": {
+            "kind": "coordination",
+            "action": {
+              "kind": "reservation.acquire",
+              "id": "bd-one",
+              "reservation": "rv-one",
+              "paths": [
+                "src/a.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "vectors": [
+        {
+          "name": "recover-a",
+          "sequence": 6,
+          "request": {
+            "version": 1,
+            "request_id": "recover-a",
+            "actor": "bob",
+            "session": "sess-b",
+            "timestamp": "2026-10-20T00:00:00Z",
+            "command": {
+              "kind": "coordination",
+              "action": {
+                "kind": "session.recover",
+                "source_session": "sess-a",
+                "expect_session": "eff-enroll-a-000000",
+                "claims": {
+                  "bd-one": "eff-claim-a-000000"
+                },
+                "reservations": {
+                  "rv-one": "eff-reserve-a-000000"
+                },
+                "disposition": "transfer",
+                "recipient_session": "sess-b",
+                "reason": "holder crashed"
+              }
+            }
+          },
+          "effects": [
+            {
+              "kind": "ownership",
+              "effect_id": "eff-recover-a-000000",
+              "sequence": 6,
+              "index": 0,
+              "transition": {
+                "kind": "claim_recovered",
+                "task": "bd-one",
+                "old_token": "eff-claim-a-000000",
+                "new_token": "eff-recover-a-000000",
+                "requester_actor": "bob",
+                "requester_session": "sess-b",
+                "source_actor": "alice",
+                "source_session": "sess-a",
+                "disposition": "transfer",
+                "new_actor": "bob",
+                "new_session": "sess-b",
+                "reason": "holder crashed"
+              }
+            },
+            {
+              "kind": "ownership",
+              "effect_id": "eff-recover-a-000001",
+              "sequence": 6,
+              "index": 1,
+              "transition": {
+                "kind": "reservation_recovered",
+                "reservation": "rv-one",
+                "task": "bd-one",
+                "paths": [
+                  "src/a.rs"
+                ],
+                "old_token": "eff-reserve-a-000000",
+                "new_token": "eff-recover-a-000001",
+                "requester_actor": "bob",
+                "requester_session": "sess-b",
+                "source_actor": "alice",
+                "source_session": "sess-a",
+                "disposition": "transfer",
+                "new_actor": "bob",
+                "new_session": "sess-b",
+                "reason": "holder crashed"
+              }
+            },
+            {
+              "kind": "ownership",
+              "effect_id": "eff-recover-a-000002",
+              "sequence": 6,
+              "index": 2,
+              "transition": {
+                "kind": "session_revoked",
+                "session": "sess-a",
+                "actor": "alice",
+                "token": "eff-enroll-a-000000",
+                "requester_actor": "bob",
+                "requester_session": "sess-b",
+                "disposition": "transfer",
+                "new_actor": "bob",
+                "new_session": "sess-b",
+                "new_token": "eff-enroll-b-000000",
+                "reason": "holder crashed"
+              }
+            }
+          ],
+          "outcome": {
+            "status": "accepted",
+            "result": {
+              "code": "ok",
+              "subject": "sess-a",
+              "effect_ids": [
+                "eff-recover-a-000000",
+                "eff-recover-a-000001",
+                "eff-recover-a-000002"
+              ],
+              "source_session": "sess-a",
+              "disposition": "transfer",
+              "recipient_session": "sess-b",
+              "claims": [
+                {
+                  "task": "bd-one",
+                  "previous_token": "eff-claim-a-000000",
+                  "token": "eff-recover-a-000000"
+                }
+              ],
+              "reservations": [
+                {
+                  "id": "rv-one",
+                  "task": "bd-one",
+                  "paths": [
+                    "src/a.rs"
+                  ],
+                  "previous_token": "eff-reserve-a-000000",
+                  "token": "eff-recover-a-000001"
+                }
+              ],
+              "unaffected_other_session_reservations": []
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

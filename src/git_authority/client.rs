@@ -1,6 +1,6 @@
 //! Experimental local client for the reviewed Git transaction profiles.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -182,18 +182,19 @@ impl Client {
                     Ok(transaction) => transaction,
                     Err(error) => return uncertain_or_error(&journal, error, "plan"),
                 };
-            let mut files = snapshot.files;
-            files.insert(
-                transaction_path(transaction.sequence),
-                encode(&transaction)?,
-            );
-            let commit = match self.transport.create_commit(Some(&snapshot.head), &files) {
-                Ok(commit) => commit,
-                Err(error) if journal.attempted_commits.is_empty() => return Err(error),
-                Err(error) => {
-                    return Ok(unconfirmed(&journal, diagnostic(&error, "prepare", None)));
-                }
-            };
+            let path = transaction_path(transaction.sequence);
+            let transaction_bytes = encode(&transaction)?;
+            let commit =
+                match self
+                    .transport
+                    .append_commit(&snapshot.head, &path, &transaction_bytes)
+                {
+                    Ok(commit) => commit,
+                    Err(error) if journal.attempted_commits.is_empty() => return Err(error),
+                    Err(error) => {
+                        return Ok(unconfirmed(&journal, diagnostic(&error, "prepare", None)));
+                    }
+                };
             // Recording before the push is intentionally conservative: a
             // crash at any later point leaves a recoverable uncertain attempt.
             let mut attempted = journal.clone();
@@ -285,13 +286,14 @@ impl Client {
 
     fn chain(&self, head: &str) -> MoteResult<Vec<super::transport::GitCommit>> {
         let mut chain = Vec::new();
+        let mut blobs = BTreeMap::new();
         let mut oid = head.to_owned();
         let mut seen = BTreeSet::new();
         loop {
             if !seen.insert(oid.clone()) {
                 return invalid("authority commit cycle");
             }
-            let commit = self.transport.commit(&oid)?;
+            let commit = self.transport.commit_memo(&oid, &mut blobs)?;
             let parent = match commit.parents.as_slice() {
                 [] => None,
                 [parent] => Some(parent.clone()),

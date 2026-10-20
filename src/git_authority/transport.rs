@@ -12,6 +12,10 @@ use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -70,9 +74,11 @@ pub struct GitTransport {
     proxy_auth_method: Option<String>,
     scratch: PathBuf,
     objects: PathBuf,
+    source_objects: OsString,
     index: PathBuf,
     timeout: Duration,
     oid_len: usize,
+    blob_reads: Arc<AtomicUsize>,
 }
 
 impl GitTransport {
@@ -94,6 +100,7 @@ impl GitTransport {
         let objects = scratch.join("objects");
         fs::create_dir_all(&objects)?;
         let index = scratch.join("index");
+        let source_objects = resolve_source_objects(&repo)?;
 
         let mut transport = Self {
             repo,
@@ -106,9 +113,11 @@ impl GitTransport {
             proxy_auth_method: None,
             scratch,
             objects,
+            source_objects,
             index,
             timeout: DEFAULT_TIMEOUT,
             oid_len: 0,
+            blob_reads: Arc::new(AtomicUsize::new(0)),
         };
         let object_format =
             transport.git_text("object format", ["rev-parse", "--show-object-format"])?;
@@ -192,6 +201,16 @@ impl GitTransport {
     }
 
     pub fn commit(&self, oid: &str) -> MoteResult<GitCommit> {
+        self.commit_memo(oid, &mut BTreeMap::new())
+    }
+
+    /// Per-load blob memo. Callers own its lifetime so validation always walks
+    /// every commit and tree while identical immutable blobs are read once.
+    pub(crate) fn commit_memo(
+        &self,
+        oid: &str,
+        blobs: &mut BTreeMap<String, GitBlob>,
+    ) -> MoteResult<GitCommit> {
         self.validate_oid(oid)?;
         let kind = self.git_text("read commit", ["cat-file", "-t", oid])?;
         if kind.trim() != "commit" {
@@ -238,14 +257,25 @@ impl GitTransport {
             let path = std::str::from_utf8(&entry[tab + 1..])
                 .map_err(|_| MoteError::Invalid("authority tree path is not UTF-8".into()))?;
             validate_tree_path(path)?;
-            let bytes = self.git_bytes("read blob", ["cat-file", "blob", blob_oid], None)?;
+            let blob = if let Some(blob) = blobs.get(blob_oid) {
+                blob.clone()
+            } else {
+                let bytes = self.git_bytes("read blob", ["cat-file", "blob", blob_oid], None)?;
+                self.blob_reads.fetch_add(1, Ordering::Relaxed);
+                let blob = GitBlob {
+                    mode: mode.to_owned(),
+                    oid: blob_oid.to_owned(),
+                    bytes,
+                };
+                blobs.insert(blob_oid.to_owned(), blob.clone());
+                blob
+            };
             if files
                 .insert(
                     path.to_owned(),
                     GitBlob {
                         mode: mode.to_owned(),
-                        oid: blob_oid.to_owned(),
-                        bytes,
+                        ..blob
                     },
                 )
                 .is_some()
@@ -312,6 +342,66 @@ impl GitTransport {
         )?;
         let oid = std::str::from_utf8(&oid)
             .map_err(|_| MoteError::Other("Git returned invalid commit id".into()))?
+            .trim();
+        self.validate_oid(oid)?;
+        Ok(oid.to_owned())
+    }
+
+    /// Narrow append builder for an already-validated authority parent.
+    pub(crate) fn append_commit(
+        &self,
+        parent: &str,
+        path: &str,
+        bytes: &[u8],
+    ) -> MoteResult<String> {
+        self.validate_oid(parent)?;
+        validate_tree_path(path)?;
+        if self
+            .git_text("read parent", ["cat-file", "-t", parent])?
+            .trim()
+            != "commit"
+        {
+            return Err(MoteError::Invalid("Git parent is not a commit".into()));
+        }
+        if !self
+            .git_bytes(
+                "check append path",
+                ["ls-tree", "-z", parent, "--", path],
+                None,
+            )?
+            .is_empty()
+        {
+            return Err(MoteError::Invalid(
+                "authority append path already exists".into(),
+            ));
+        }
+        let _ = fs::remove_file(&self.index);
+        self.git_text("load parent tree", ["read-tree", parent])?;
+        let oid = self.git_bytes("write blob", ["hash-object", "-w", "--stdin"], Some(bytes))?;
+        let oid = std::str::from_utf8(&oid)
+            .map_err(|_| MoteError::Other("Git returned invalid object id".into()))?
+            .trim();
+        self.validate_oid(oid)?;
+        self.git_text(
+            "update tree",
+            ["update-index", "--add", "--cacheinfo", "100644", oid, path],
+        )?;
+        let tree = self.git_text("write tree", ["write-tree"])?;
+        self.validate_oid(tree.trim())?;
+        let oid = self.git_bytes(
+            "create commit",
+            [
+                "-c",
+                "commit.gpgsign=false",
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                parent,
+            ],
+            Some(b"Mote Git authority transaction\n"),
+        )?;
+        let oid = std::str::from_utf8(&oid)
+            .map_err(|_| MoteError::Other("Git returned invalid object id".into()))?
             .trim();
         self.validate_oid(oid)?;
         Ok(oid.to_owned())
@@ -429,7 +519,8 @@ impl GitTransport {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")
             .env("GIT_OBJECT_DIRECTORY", &self.objects)
-            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", self.source_objects()?)
+            .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", &self.source_objects)
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_INDEX_FILE", &self.index)
             .env("GIT_AUTHOR_NAME", "Mote Git Authority")
             .env("GIT_AUTHOR_EMAIL", "git-authority@mote.invalid")
@@ -488,25 +579,26 @@ impl GitTransport {
             stderr,
         })
     }
+}
 
-    fn source_objects(&self) -> MoteResult<OsString> {
-        let output = Command::new("git")
-            .current_dir(&self.repo)
-            .args(["rev-parse", "--git-path", "objects"])
-            .output()?;
-        if !output.status.success() {
-            return Err(MoteError::Invalid("Git repository is unavailable".into()));
-        }
-        let raw = String::from_utf8(output.stdout)
-            .map_err(|_| MoteError::Invalid("invalid Git object directory".into()))?;
-        let objects = self
-            .repo
-            .join(raw.trim())
-            .canonicalize()
-            .map_err(|_| MoteError::Invalid("Git object directory is unavailable".into()))?;
-        Ok(objects.into_os_string())
+fn resolve_source_objects(repo: &Path) -> MoteResult<OsString> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["--no-replace-objects", "rev-parse", "--git-path", "objects"])
+        .output()?;
+    if !output.status.success() {
+        return Err(MoteError::Invalid("Git repository is unavailable".into()));
     }
+    let raw = String::from_utf8(output.stdout)
+        .map_err(|_| MoteError::Invalid("invalid Git object directory".into()))?;
+    let objects = repo
+        .join(raw.trim())
+        .canonicalize()
+        .map_err(|_| MoteError::Invalid("Git object directory is unavailable".into()))?;
+    Ok(objects.into_os_string())
+}
 
+impl GitTransport {
     fn remote_config(&self, name: &str) -> MoteResult<Option<String>> {
         let key = format!("remote.{}.{}", self.remote, name);
         let output = Command::new("git")
@@ -701,4 +793,154 @@ fn validate_tree_path(path: &str) -> MoteResult<()> {
         return Err(MoteError::Invalid("invalid Git tree path".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn blob_memo_reads_each_oid_once_and_cold_reads_match() {
+        let root = tempfile::TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        let remote = root.path().join("remote.git");
+        git(root.path(), &["init", repo.to_str().unwrap()]);
+        git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let transport =
+            GitTransport::open(&repo, "origin", "authority", &root.path().join("scratch")).unwrap();
+        let first = transport
+            .create_commit(
+                None,
+                &BTreeMap::from([("manifest.json".into(), b"same".to_vec())]),
+            )
+            .unwrap();
+        let second = transport
+            .append_commit(&first, "transactions/0001.json", b"next")
+            .unwrap();
+        transport.blob_reads.store(0, Ordering::Relaxed);
+        let cold_first = transport.commit(&first).unwrap();
+        let cold_second = transport.commit(&second).unwrap();
+        let cold_reads = transport.blob_reads.load(Ordering::Relaxed);
+        transport.blob_reads.store(0, Ordering::Relaxed);
+        let mut memo = BTreeMap::new();
+        let memo_second = transport.commit_memo(&second, &mut memo).unwrap();
+        let memo_first = transport.commit_memo(&first, &mut memo).unwrap();
+        assert_eq!(memo_second, cold_second);
+        assert_eq!(memo_first, cold_first);
+        assert_eq!(transport.blob_reads.load(Ordering::Relaxed), 2);
+        assert_eq!(cold_reads, 3);
+    }
+
+    #[test]
+    fn narrow_append_preserves_all_parent_entries_and_refuses_reuse() {
+        let root = tempfile::TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        let remote = root.path().join("remote.git");
+        git(root.path(), &["init", repo.to_str().unwrap()]);
+        git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let transport =
+            GitTransport::open(&repo, "origin", "authority", &root.path().join("scratch")).unwrap();
+        let files = BTreeMap::from([
+            ("manifest.json".into(), b"manifest".to_vec()),
+            ("transactions/0001.json".into(), b"old".to_vec()),
+        ]);
+        let parent = transport.create_commit(None, &files).unwrap();
+        let before = transport.commit(&parent).unwrap();
+        let child = transport
+            .append_commit(&parent, "transactions/0002.json", b"new")
+            .unwrap();
+        let after = transport.commit(&child).unwrap();
+        assert_eq!(after.parents, [parent]);
+        assert_eq!(after.files.len(), before.files.len() + 1);
+        for (path, blob) in before.files {
+            assert_eq!(after.files[&path], blob);
+        }
+        assert_eq!(after.files["transactions/0002.json"].mode, "100644");
+        assert_eq!(after.files["transactions/0002.json"].bytes, b"new");
+        assert!(
+            transport
+                .append_commit(&child, "transactions/0001.json", b"replace")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn memoized_blob_content_does_not_hide_each_tree_entry_mode() {
+        use crate::git_authority::{
+            history::validate_chain,
+            protocol::{Manifest, encode, transaction_path},
+        };
+        let root = tempfile::TempDir::new().unwrap();
+        let repo = root.path().join("repo");
+        let remote = root.path().join("remote.git");
+        git(root.path(), &["init", repo.to_str().unwrap()]);
+        git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let transport =
+            GitTransport::open(&repo, "origin", "authority", &root.path().join("scratch")).unwrap();
+        let parent = transport
+            .create_commit(
+                None,
+                &BTreeMap::from([(
+                    "manifest.json".into(),
+                    encode(&Manifest::new("st-test".into())).unwrap(),
+                )]),
+            )
+            .unwrap();
+        let before = transport.commit(&parent).unwrap();
+        let path = transaction_path(1);
+        transport
+            .append_commit(&parent, &path, b"invalid transaction")
+            .unwrap();
+        transport
+            .git_text(
+                "change test mode",
+                [
+                    "update-index",
+                    "--cacheinfo",
+                    "100755",
+                    &before.files["manifest.json"].oid,
+                    "manifest.json",
+                ],
+            )
+            .unwrap();
+        let tree = transport.git_text("test tree", ["write-tree"]).unwrap();
+        let child = transport
+            .git_text("test commit", ["commit-tree", tree.trim(), "-p", &parent])
+            .unwrap();
+        let child = child.trim();
+        let mut memo = BTreeMap::new();
+        let after = transport.commit_memo(child, &mut memo).unwrap();
+        let before_memo = transport.commit_memo(&parent, &mut memo).unwrap();
+        assert_eq!(after.files["manifest.json"].mode, "100755");
+        assert_eq!(before_memo.files["manifest.json"].mode, "100644");
+        assert_eq!(before_memo, before);
+        let error = validate_chain(&[before_memo, after], None, None).unwrap_err();
+        assert!(
+            error.to_string().contains("append changed history"),
+            "{error}"
+        );
+    }
 }

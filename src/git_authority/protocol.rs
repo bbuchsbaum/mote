@@ -22,6 +22,12 @@ pub const COORDINATION_CAPABILITIES: [&str; 3] = [
     "coordination-core-v1",
     "explicit-release-v1",
 ];
+pub const LIFECYCLE_CAPABILITIES: [&str; 4] = [
+    "canonical-transactions-v1",
+    "coordination-core-v1",
+    "coordination-lifecycle-v1",
+    "explicit-release-v1",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,12 +65,24 @@ impl Manifest {
 
     pub fn is_coordination(&self) -> bool {
         self.capabilities == COORDINATION_CAPABILITIES
+            || self.capabilities == LIFECYCLE_CAPABILITIES
+    }
+
+    pub fn lifecycle(store_id: String) -> Self {
+        let mut manifest = Self::coordination(store_id);
+        manifest.capabilities = LIFECYCLE_CAPABILITIES.iter().map(|x| (*x).into()).collect();
+        manifest
     }
 
     pub fn allows(&self, command: &Command) -> MoteResult<()> {
         self.validate()?;
         match (self.is_coordination(), command) {
-            (false, Command::SyntheticCas { .. }) | (true, Command::Coordination { .. }) => Ok(()),
+            (false, Command::SyntheticCas { .. }) => Ok(()),
+            (true, Command::Coordination { action })
+                if !action.is_lifecycle() || self.capabilities == LIFECYCLE_CAPABILITIES =>
+            {
+                Ok(())
+            }
             _ => invalid("command is not supported by the immutable authority profile"),
         }
     }
@@ -85,7 +103,10 @@ impl Manifest {
         if self.generation == 0 || self.ownership != "explicit-release-v1" {
             return invalid("unsupported authority generation or ownership policy");
         }
-        if self.capabilities != CAPABILITIES && self.capabilities != COORDINATION_CAPABILITIES {
+        if self.capabilities != CAPABILITIES
+            && self.capabilities != COORDINATION_CAPABILITIES
+            && self.capabilities != LIFECYCLE_CAPABILITIES
+        {
             return invalid("unsupported or noncanonical Git authority capabilities");
         }
         if self.legacy_digest.is_some() {
@@ -187,7 +208,7 @@ pub enum Effect {
         effect_id: String,
         sequence: u64,
         index: u32,
-        transition: super::coordination::Transition,
+        transition: Box<super::coordination::Transition>,
     },
 }
 

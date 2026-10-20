@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod lifecycle;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum Action {
@@ -61,6 +63,32 @@ pub enum Action {
     },
     #[serde(rename = "reservation.release")]
     ReservationRelease { reservation: String, token: String },
+    #[serde(rename = "begin")]
+    Begin(lifecycle::Begin),
+    #[serde(rename = "next")]
+    Next(lifecycle::Next),
+    #[serde(rename = "done")]
+    Done(lifecycle::Done),
+    #[serde(rename = "handoff")]
+    Handoff(lifecycle::Handoff),
+    #[serde(rename = "session.end")]
+    SessionEnd(lifecycle::SessionEnd),
+    #[serde(rename = "session.recover")]
+    SessionRecover(lifecycle::SessionRecover),
+}
+
+impl Action {
+    pub(crate) fn is_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::Begin(_)
+                | Self::Next(_)
+                | Self::Done(_)
+                | Self::Handoff(_)
+                | Self::SessionEnd(_)
+                | Self::SessionRecover(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +134,12 @@ pub enum Transition {
         session: String,
         token: String,
     },
+    ClaimTransferred(lifecycle::ClaimTransferred),
+    ReservationTransferred(lifecycle::ReservationTransferred),
+    SessionEnded(lifecycle::SessionEnded),
+    ClaimRecovered(lifecycle::ClaimRecovered),
+    ReservationRecovered(lifecycle::ReservationRecovered),
+    SessionRevoked(lifecycle::SessionRevoked),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -179,6 +213,12 @@ pub struct CoordinationPlan {
 
 pub fn validate_action(a: &Action) -> MoteResult<()> {
     match a {
+        Action::Begin(_)
+        | Action::Next(_)
+        | Action::Done(_)
+        | Action::Handoff(_)
+        | Action::SessionEnd(_)
+        | Action::SessionRecover(_) => lifecycle::validate(a)?,
         Action::SessionStart { label } | Action::SessionPresence { text: label } => {
             text(label, 4096, "session text")?
         }
@@ -423,6 +463,9 @@ pub fn plan(
         protocol::Command::Coordination { action } => action,
         _ => return bad("inactive command profile"),
     };
+    if action.is_lifecycle() {
+        return lifecycle::plan(state, request, sequence);
+    }
     let mut next = state.clone();
     let eid = format!("eff-{}-000000", request.request_id);
     let reject = |code: &str, subject: &str| CoordinationPlan {
@@ -442,6 +485,14 @@ pub fn plan(
         return Ok(reject("session_unavailable", &request.session));
     }
     let (effect, subject) = match action {
+        Action::Begin(_)
+        | Action::Next(_)
+        | Action::Done(_)
+        | Action::Handoff(_)
+        | Action::SessionEnd(_)
+        | Action::SessionRecover(_) => {
+            unreachable!("lifecycle action dispatched before core planning")
+        }
         Action::SessionStart { label } => {
             if state.sessions.contains_key(&request.session) {
                 return Ok(reject("session_exists", &request.session));
@@ -468,7 +519,8 @@ pub fn plan(
                         token: eid.clone(),
                         label: label.clone(),
                         timestamp: request.timestamp.clone(),
-                    },
+                    }
+                    .into(),
                 },
                 request.session.clone(),
             )
@@ -487,7 +539,8 @@ pub fn plan(
                         actor: request.actor.clone(),
                         text: text.clone(),
                         timestamp: request.timestamp.clone(),
-                    },
+                    }
+                    .into(),
                 },
                 request.session.clone(),
             )
@@ -591,7 +644,8 @@ pub fn plan(
                         actor: request.actor.clone(),
                         session: request.session.clone(),
                         token: eid.clone(),
-                    },
+                    }
+                    .into(),
                 },
                 id.clone(),
             )
@@ -615,7 +669,8 @@ pub fn plan(
                         actor: request.actor.clone(),
                         session: request.session.clone(),
                         token: token.clone(),
-                    },
+                    }
+                    .into(),
                 },
                 id.clone(),
             )
@@ -664,7 +719,8 @@ pub fn plan(
                         session: request.session.clone(),
                         token: eid.clone(),
                         paths: paths.clone(),
-                    },
+                    }
+                    .into(),
                 },
                 reservation.clone(),
             )
@@ -691,7 +747,8 @@ pub fn plan(
                         actor: request.actor.clone(),
                         session: request.session.clone(),
                         token: token.clone(),
-                    },
+                    }
+                    .into(),
                 },
                 reservation.clone(),
             )
@@ -808,6 +865,10 @@ fn reaches(tasks: &BTreeMap<String, Task>, start: &str, target: &str, relations:
     false
 }
 fn task_effect(e: &str, sequence: u64, r: &Request, body: Value) -> Effect {
+    task_effect_at(e, sequence, 0, r, body)
+}
+
+fn task_effect_at(e: &str, sequence: u64, index: u32, r: &Request, body: Value) -> Effect {
     let mut op = body;
     let o = op.as_object_mut().unwrap();
     if let Some(set) = o.get_mut("set").and_then(Value::as_object_mut) {
@@ -827,14 +888,14 @@ fn task_effect(e: &str, sequence: u64, r: &Request, body: Value) -> Effect {
     o.insert("v".into(), json!(1));
     o.insert(
         "op".into(),
-        json!(format!("gaop-{sequence:020}-000000-{e}")),
+        json!(format!("gaop-{sequence:020}-{index:06}-{e}")),
     );
     o.insert("actor".into(), json!(r.actor));
     o.insert("ts".into(), json!(r.timestamp));
     Effect::TaskOp {
         effect_id: e.into(),
         sequence,
-        index: 0,
+        index,
         op,
     }
 }
