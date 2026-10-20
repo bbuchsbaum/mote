@@ -18,6 +18,9 @@ fn ordinary_build_cannot_enable_a_legacy_profile_at_runtime() {
             .to_string()
             .contains("profile unavailable")
     );
+    assert!(legacy_profile::portable().is_err());
+    assert!(legacy_profile::evidence().is_err());
+    assert!(legacy_profile::require_supported("portable-v2:runtime-injection").is_err());
     let td = tempfile::tempdir().unwrap();
     let store = Store::init(td.path()).unwrap();
     let before = std::fs::read(store.format_path()).unwrap();

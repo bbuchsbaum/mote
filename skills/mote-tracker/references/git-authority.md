@@ -65,8 +65,12 @@ advance discussion cursors or renew ownership. Event cursors identify the
 authority root and canonical position, not wall-clock order. Polling intervals
 are provisional and full-chain replay costs must be measured for each workload.
 
-Migrated history requires its exact retained closed-build executable, not merely
-the same version string. Before any canonical request, explicit rollback can
+New migrated history requires a matching `portable-v2:` closed-build replay
+profile: independently built Mac executables may differ, but the complete source
+and locked inputs must match. Every client verifies full imported and canonical
+replay. Compare `authority legacy-profile` on each machine; a version string is
+insufficient. Old exact-v1 archives and interrupted rollback executor journals
+retain their exact-binary pin. Before any canonical request, explicit rollback can
 retire an unused migrated authority and restore its verified backup into a new
 private local store. Post-use conversion is deferred. No command here qualifies
 hosted branch policy, authenticates actor names, or publishes source changes.

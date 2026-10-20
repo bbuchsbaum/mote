@@ -48,9 +48,11 @@ pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
             cmd: AuthorityCmd::LegacyProfile
         }
     ) {
+        let profile = super::legacy_profile::evidence()?;
         print_value(
             cli.json,
-            json!({"schema":"mote.legacy-profile.v1","profile_id":super::legacy_profile::current()?}),
+            json!({"schema":"mote.legacy-profile.v2","profile_id":profile.portable_id,
+                "compatibility":"same-source-locked-dependencies-v2", "build":profile}),
         );
         return Ok(Some(0));
     }

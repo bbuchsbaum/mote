@@ -1,9 +1,10 @@
 # Legacy migration development contract
 
 GA-22 development seam. No existing project is migrated by this document.
-The initial profile may refuse an archive after a harmless build-input change;
-that conservative compatibility limit is acceptable for disposable development
-roots. Adoption requires a separately qualified supported-client profile.
+The portable profile permits separate builds for the participating Macs. It
+remains conservative about source changes: even a harmless inventoried-input
+change can require a different supported profile. Physical CPU/macOS combinations
+require qualification before adoption.
 
 ## Selected source cut
 
@@ -25,14 +26,22 @@ local and is separate from the shareable archive.
 
 ## Pinned replay
 
-The development legacy profile is an embedded fingerprint of the actual build
-inputs: the entire semantic crate (including dirty/untracked build inputs),
-build script and generated semantic input, dependency lock/manifests, path
-dependencies, enabled features and relevant compilation configuration. Git HEAD
-alone is insufficient. New or unsupported build-input classes must either be
-included or make profile generation refuse. The fingerprint implementation
-must have independent fixtures proving changes to a helper and to dependency
-or build input change the fingerprint.
+New exports select a distinct `portable-v2:` replay profile. Its domain-separated
+digest covers the complete embedded input inventory: the entire semantic crate
+(including dirty/untracked inputs), bundled assets/skills, build script, closed
+recipe and dependency lock/manifests. Git HEAD or a package version alone is
+insufficient. The validated closed build receipt remains mandatory and retains
+compiler, host/target, resolved dependencies/features and configuration evidence.
+Executable bytes and build configuration are provenance, not portable identity.
+The supported recipe still pins Rust 1.85, host-target builds and no default
+features; unsupported configuration and escaped compiler inputs refuse.
+
+Independently built binaries with the same inventoried inputs select the same
+portable ID. This is a compatibility gate, not proof of arbitrary platform
+equivalence: full replay equality remains mandatory. Existing exact-v1 archive
+identifiers retain their executable-specific formula and require an exact match;
+they never fall back to v2. Interrupted rollback journals also retain the exact
+executor identity. No archive or journal is relabeled to make it portable.
 
 An importer requires an exact supported embedded profile before replay, seed
 acceptance or high-water advancement. It never tries the current reducer on an

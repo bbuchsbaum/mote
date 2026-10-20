@@ -14,8 +14,9 @@ remote. A fork must explicitly select the intended authority endpoint.
 
 ## New authority and another client
 
-Use the same retained executable on the participating local machines. First
-inspect the executable without opening a store:
+Use a compatible Mote build on each participating machine. Different macOS
+versions and Intel/Apple Silicon builds do not need identical executable bytes.
+First inspect each executable without opening a store:
 
 ```sh
 mote --json authority capabilities
@@ -143,10 +144,18 @@ Setup journals preserve the selected root across interruption:
 mote authority resume --remote origin --branch mote-state
 ```
 
-Use the same retained binary for migrated replay, resume and rollback. Its
-profile includes executable bytes and closed build inputs. A rebuild—even from
-the same Git revision—or another architecture is not automatically compatible.
-Cross-build and cross-architecture migration are not yet qualified.
+For new migrations, independently build the same supported source and locked
+dependencies on each Mac using the closed recipe above. Compare `profile_id`
+from `authority legacy-profile`: the `portable-v2:` identifiers must match.
+Compiler/target configuration and executable digests remain separate provenance;
+they do not change that compatibility identifier. Each client still verifies
+every imported decision, the complete final state and all canonical transactions.
+Changed source inputs refuse instead of silently upgrading the authority.
+
+Old exact-v1 archives still require their original retained executable. An
+interrupted rollback also keeps its exact executor pin; resume it with the same
+binary. No existing archive or journal is rewritten. Actual CPU/macOS combinations
+need the physical-machine pilot before they are described as qualified.
 
 Before any canonical receipt (including enrollment or rejection), an unused
 migrated authority can be permanently retired and its verified backup restored

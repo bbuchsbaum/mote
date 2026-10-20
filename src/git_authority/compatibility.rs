@@ -172,7 +172,7 @@ fn supported_profiles() -> Vec<SupportedProfile> {
 }
 
 fn legacy_replay() -> LegacyReplayEvidence {
-    legacy_replay_from(super::legacy_profile::current())
+    legacy_replay_from(super::legacy_profile::portable())
 }
 
 fn legacy_replay_from(result: MoteResult<String>) -> LegacyReplayEvidence {

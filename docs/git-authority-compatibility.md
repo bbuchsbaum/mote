@@ -21,9 +21,20 @@ sorted sets; adding a capability to an existing root is not an upgrade path.
 On incompatibility, use `authority capabilities` to identify a compatible
 executable. Do not recreate or downgrade the authority. A compatible manifest
 alone cannot establish legacy replay compatibility: a migrated root additionally
-requires the verified packed archive and its exact retained closed-build replay
-profile. An ordinary build can diagnose its supported profiles but refuses a
-migrated root whose replay profile it cannot verify.
+requires the verified packed archive and a supported closed-build replay profile.
+New archives use `portable-v2:` followed by a domain-separated digest of the
+complete source/build-input inventory and locked dependencies. Independently
+built executables from those same inputs may differ in target, compiler evidence
+and executable bytes. Those differences remain build provenance, reported by
+`authority legacy-profile` and the retained build receipt. The closed recipe is
+still mandatory; an ordinary build cannot claim portable replay support.
+
+Matching profile identifiers never replace replay verification: every imported
+decision, complete final state, task seed and cleanup proof must match, and every
+canonical transaction is replanned. Changed source inputs produce a different
+profile and refuse. Exact-v1 archives keep their original executable-specific
+identity and never fall back to portable verification. Existing rollback journals
+also keep their exact executor pin. No existing root is rewritten or upgraded.
 
 New Git stores fence the old local writer and reducer with their FORMAT mode
 and descriptor. Console, TUI, batch/import, candidate and role routes have no
@@ -34,6 +45,8 @@ The first release targets local machines using a shared Git remote. Cloud
 qualification follows separately. A physical simultaneous-machine pilot and
 hosted policy qualification remain required before claiming adoption readiness.
 Migration does not transfer machine-local routing or credential configuration.
+Different macOS versions alone do not require different portable profile IDs;
+actual CPU/macOS combinations still require qualification in the local pilot.
 
 Rollback is limited to an unused migrated authority: it must win the first
 canonical transaction, permanently retire the shared authority, and restore the

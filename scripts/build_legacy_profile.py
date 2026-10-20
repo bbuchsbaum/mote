@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an exact-binary legacy development profile using a closed local recipe.
+"""Build portable legacy replay compatibility with exact build provenance.
 
 This deliberately refuses unsupported Cargo configuration. It verifies extracted
 registry inputs against locked .crate archives, retains the binary and receipt,

@@ -276,7 +276,7 @@ fn canonical_file<T: serde::de::DeserializeOwned + Serialize>(
 /// Capture exactly one stopped source. `cleanup_start` is the zero-based input
 /// boundary; `None` designates an empty suffix for an already-clean source.
 pub fn capture(store: &Store, cleanup_start: Option<u64>) -> MoteResult<Archive> {
-    let profile = super::legacy_profile::current()?;
+    let profile = super::legacy_profile::portable()?;
     capture_profile(store, cleanup_start, &profile)
 }
 fn capture_profile(
@@ -297,7 +297,7 @@ fn capture_profile(
 /// Internal orchestration seam; the caller owns publication.lock and must not
 /// acquire a second lock or invoke Writer's automatic journal recovery.
 pub(crate) fn capture_locked(store: &Store, cleanup_start: Option<u64>) -> MoteResult<Archive> {
-    let profile = super::legacy_profile::current()?;
+    let profile = super::legacy_profile::portable()?;
     capture_locked_profile(store, cleanup_start, &profile)
 }
 fn capture_locked_profile(
@@ -453,8 +453,9 @@ fn build_archive(
 }
 
 pub fn verify(files: &BTreeMap<String, Vec<u8>>, expected_digest: &str) -> MoteResult<Verified> {
-    let profile = super::legacy_profile::current()?;
-    verify_profile(files, expected_digest, &profile)
+    let export: Export = canonical_file(files, "legacy/export.json")?;
+    super::legacy_profile::require_supported(&export.source.profile)?;
+    verify_profile(files, expected_digest, &export.source.profile)
 }
 fn verify_profile(
     files: &BTreeMap<String, Vec<u8>>,
@@ -468,7 +469,7 @@ fn verify_profile(
         || export.source.profile != profile
     {
         return invalid(
-            "unsupported legacy replay profile; use the retained matching migration binary",
+            "unsupported legacy replay profile; use a matching supported migration build",
         );
     }
     if digest("mote.legacy-export.v1", &export)? != expected_digest
@@ -808,6 +809,41 @@ mod tests {
         forged.insert("legacy/export.json".into(), encode(&export).unwrap());
         let forged_digest = digest("mote.legacy-export.v1", &export).unwrap();
         assert!(verify_profile(&forged, &forged_digest, "pinned-fixture").is_err());
+    }
+
+    #[test]
+    fn matching_portable_profile_still_rejects_self_consistent_different_replay_state() {
+        let a = archive(&ttl_history(), None);
+        let original = verify_profile(&a.files, &a.digest, "pinned-fixture").unwrap();
+        let mut source = original.export.source;
+        // Select a forced matching portable profile without relying on a real
+        // build receipt. The test discriminates replay equality after the gate.
+        source.profile = "portable-v2:forced-test-profile".into();
+        let a = build_archive(source, a.files, None).unwrap();
+        let verified =
+            verify_profile(&a.files, &a.digest, "portable-v2:forced-test-profile").unwrap();
+        let mut different = verified.state;
+        different.beads.get_mut("bd-task").unwrap().title = "different reducer result".into();
+        let seed = task_seed(&different);
+        let mut export = verified.export;
+        export.final_state_digest = state_digest(&export.source.profile, &different).unwrap();
+        export.task_seed_digest = digest("mote.legacy-task-seed.v1", &seed).unwrap();
+        let mut transition = verified.transition;
+        transition.final_state_digest = export.final_state_digest.clone();
+        transition.task_seed_digest = export.task_seed_digest.clone();
+        export.transition_digest = digest("mote.legacy-transition.v1", &transition).unwrap();
+        let mut files = a.files;
+        files.insert("legacy/task-seed.json".into(), encode(&seed).unwrap());
+        files.insert(
+            "legacy/transition.json".into(),
+            encode(&transition).unwrap(),
+        );
+        files.insert("legacy/export.json".into(), encode(&export).unwrap());
+        let expected = export_digest(&export).unwrap();
+        let error = verify_profile(&files, &expected, "portable-v2:forced-test-profile")
+            .err()
+            .expect("matching profile must not bypass full replay equality");
+        assert!(error.to_string().contains("replay decisions, state"));
     }
     #[test]
     fn expired_claim_is_not_cleanup_and_tombstones_remain_consumed() {
