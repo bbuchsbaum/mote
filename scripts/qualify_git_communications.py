@@ -25,6 +25,11 @@ def subject(result):
     return result["receipt"]["outcome"]["result"]["subject"]
 
 
+def events(f, name, *args):
+    raw = f.run(name, "--json", "events", *args, structured=False)
+    return [json.loads(line) for line in raw.splitlines()]
+
+
 def spawn(f, name, session, label, args):
     command, env = f.command(name, args, actor="bob", session=session)
     with (f.root / (label + ".stdout")).open("wb") as stdout, (f.root / (label + ".stderr")).open("wb") as stderr:
@@ -49,7 +54,8 @@ def positive(root, binary):
              msg_kind="request", body="legacy request", idempotency_key="old-key")
     spaced_post = " post-with-spaces "
     input_op(f, "p", "board_post", post_id=spaced_post, topic="design", body="space-preserving reference")
-    input_op(f, "文", "board_post", post_id="post-文", topic="design", body="retained Unicode post")
+    input_op(f, "文", "board_post", post_id="post-文", topic="design", body="retained Unicode post",
+             ts="2099-01-01T00:00:00Z")
     input_op(f, "文z", "board_read", actor="bob", upto_op_id="文", topic="design")
     maximum = "雪" * 20
     input_op(f, maximum, "future_unknown")
@@ -61,6 +67,10 @@ def positive(root, binary):
     assert "coordination-communications-v1" in descriptor["capabilities"]
     for name in ("b", "c"):
         f.run(name, "authority", "connect")
+    legacy_events = events(f, "a")
+    assert legacy_events and all(row["data"]["phase"] == "legacy" for row in legacy_events)
+    old_cursor = legacy_events[-1]["data"]["cursor"]
+    assert [row["data"] for row in events(f, "b")] == [row["data"] for row in legacy_events]
     alice, bob, other = f.start("a", "alice"), f.start("b", "bob"), f.start("c", "bob")
     posted = f.run("a", "discuss", "post", "--topic", "design", "new canonical post", session=alice)
     post = subject(posted)
@@ -107,10 +117,30 @@ def positive(root, binary):
     assert transaction["request"]["command"]["action"]["action"]["references"] == [expected_reference]
     view = f.run("a", "authority", "refresh")["data"]["communications"]
     assert view["board_decisions"][decision_id]["references"] == [expected_reference]
+    head = f.head()
+    all_events = events(f, "a")
+    tail = events(f, "b", "--after", old_cursor)
+    assert tail and all(row["data"]["phase"] == "remote" for row in tail)
+    assert [row["data"] for row in all_events] == [row["data"] for row in legacy_events + tail]
+    positions = [(row["data"]["position"]["sequence"], row["data"]["position"]["effect_index"]) for row in tail]
+    assert positions == sorted(set(positions))
+    # Communication IDs sort above the Unicode seed; later task adapters sort
+    # below them. Event order must still follow canonical effect positions.
+    op_ids = [row["data"]["event"]["op_id"] for row in tail]
+    assert any(left > right for left, right in zip(op_ids, op_ids[1:]))
+    assert next(row for row in legacy_events if row["data"]["event"]["data"].get("post_id") == "post-文")["data"]["event"]["ts"].startswith("2099-")
+    assert tail[0]["data"]["event"]["ts"] < "2099-"
+    for command in (("actor", "status", "bob"), ("doctor",), ("fsck",), ("audit",)):
+        observed = f.run("b", *command, actor="bob")
+        assert observed["authority"]["fresh"] is True
+    assert f.run("b", "actor", "status", "bob")["data"]["enrollment"] == "active"
+    assert f.head() == head
     assert f.ops("a") == before
     return {"root": descriptor["root"], "exact_unicode_prefix": maximum, "ack_exit_codes": codes, "ack_retry_checkout": winning_checkout,
             "imported_reply_id": reply_id, "promotion_task": new_task, "original_ops_unchanged": True,
-            "old_keys_preserved": True, "receipt_retry_does_not_append": True, "spaced_reference_round_trip": True}
+            "old_keys_preserved": True, "receipt_retry_does_not_append": True, "spaced_reference_round_trip": True,
+            "legacy_remote_event_cursor_resume": True, "canonical_event_positions": positions,
+            "backward_timestamps_and_lexical_ids_preserve_event_order": True, "diagnostics_publish_nothing": True}
 
 
 def eligibility(root, binary, case):
@@ -120,15 +150,21 @@ def eligibility(root, binary, case):
     else:
         stem = "a\x01" if case == "accepted-clock" else "a"
         post = "post-\x01" if case == "accepted-id" else "post-valid"
-        input_op(f, stem, "board_post", post_id=post, topic="design", body="preserved")
+        input_op(f, stem, "board_post", actor=" alice " if case == "untrimmed-actor" else "alice",
+                 post_id=post, topic="design", body="preserved", notify=["x" * 129] if case == "notification-actor" else [])
         input_op(f, "雪", "future_unknown")
+        if case == "notification-actor":
+            observed = next(row for row in f.run("a", "discuss", "list") if row["post_id"] == post)
+            assert observed["explicit_notify"] == ["x" * 129]
+            assert observed["notification_recipients"] == ["x" * 129]
     before, original_format = f.ops("a"), (root / "a/.mote/FORMAT.json").read_bytes()
     # Archival capture succeeds; operational refusal must be the profile gate.
     exported = f.run("a", "authority", "export-legacy", "--output", str(root / "archive"))
     refused = f.run("a", "authority", "migrate-git", "--backup", str(root / "backup"), failure=True)
     (root / "refusal.stdout").write_bytes(refused.stdout)
     (root / "refusal.stderr").write_bytes(refused.stderr)
-    assert b"invalid communication reference" in refused.stderr, refused.stderr
+    expected = b"legacy communication actor cannot be addressed" if case in ("untrimmed-actor", "notification-actor") else b"invalid communication reference"
+    assert expected in refused.stderr, refused.stderr
     assert f.head() is None and f.ops("a") == before
     assert (root / "a/.mote/FORMAT.json").read_bytes() == original_format
     assert not (root / "a/.mote/local/git-setup.json").exists()
@@ -152,7 +188,7 @@ def main():
                                        capture_output=True, env=fixture_environment()).stdout)
     report = {"binary": str(binary), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "profile": profile,
               "positive": positive(root / "positive", binary),
-              "eligibility": [eligibility(root / case, binary, case) for case in ("rejected-maximum", "accepted-id", "accepted-clock")]}
+              "eligibility": [eligibility(root / case, binary, case) for case in ("rejected-maximum", "accepted-id", "accepted-clock", "untrimmed-actor", "notification-actor")]}
     (root / "receipt.json").write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
     print(json.dumps(report, sort_keys=True))
 

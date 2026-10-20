@@ -137,6 +137,13 @@ reservation references follow the core bd-/rv- rule. Existing communication IDs
 and clocks use the opaque bound above. Topics must equal their nonempty trimmed
 form, have at most 4096 bytes and no control characters. Actors and recipients
 use the request actor rule: nonblank, at most 128 bytes, no control characters.
+The CLI trims actor identities consistently at session enrollment and later
+requests. The migrated communications profile refuses imported actor identities
+with leading or trailing whitespace before publication, because the CLI cannot
+enroll those exact identities. It never rewrites the archived actor strings.
+Retained explicit notification and resolved notification recipient lists must
+also contain enrollable actors; an accepted legacy notification to an invalid
+actor refuses the new profile before publication, without rewriting history.
 Keys are nullable or 1..128 trimmed bytes without control characters. Bodies,
 post/decision/question text and notes are UTF-8 and at most 1 MiB; message/post/
 decision/question bodies must be nonblank. Titles, topic title/description and

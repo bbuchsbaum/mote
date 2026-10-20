@@ -11,6 +11,13 @@ fence and durable recovery journals.
 > **Status:** v0.2 working draft. POSIX-only (Linux/macOS), local filesystem,
 > single workstation. See `PRD.json` for the consolidated working spec.
 
+An opt-in [Git authority backend](docs/git-authority-workflow.md) is under
+development for simultaneous local machines, using one shared metadata branch
+per repository. Its ownership uses explicit release. See the
+[supported command matrix](docs/git-authority-commands.md) and
+[compatibility limits](docs/git-authority-compatibility.md) before trying it;
+physical-machine adoption and hosted-policy qualification remain pending.
+
 ## Why
 
 Existing trackers solve a bigger problem than this product needs. For one

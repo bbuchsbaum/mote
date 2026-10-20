@@ -30,6 +30,7 @@ use crate::repo::Store;
 use crate::state::{Bead, State};
 
 pub fn run(store: &Store, actor: Option<&str>) -> MoteResult<i32> {
+    store.require_local_authority()?;
     enable_raw_mode().map_err(io_err)?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(io_err)?;
@@ -489,7 +490,7 @@ fn event_loop<B: Backend>(
     let mut last_tick = Instant::now();
 
     loop {
-        terminal.draw(|f| render(f, &mut app)).map_err(io_err)?;
+        render_current(terminal, &mut app, store)?;
 
         let mut needs_refresh = drain(&rx);
         let timeout = Duration::from_millis(200);
@@ -560,6 +561,18 @@ fn event_loop<B: Backend>(
             last_tick = Instant::now();
         }
     }
+}
+
+fn render_current<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    store: &Store,
+) -> MoteResult<()> {
+    // Refresh failures retain the last projection for diagnostics. Never draw
+    // that cached local projection once the store has moved to Git authority.
+    store.require_local_authority()?;
+    terminal.draw(|f| render(f, app)).map_err(io_err)?;
+    Ok(())
 }
 
 fn drain(rx: &Receiver<()>) -> bool {
@@ -3118,5 +3131,19 @@ mod tests {
         assert!(text.contains("NEEDS EYES"));
         assert!(text.contains("ACTIVE NOW"));
         assert!(text.contains("solitary new"));
+    }
+
+    #[test]
+    fn fenced_store_cannot_render_an_already_loaded_local_projection() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Store::init(temp.path()).unwrap();
+        let mut app = App::new(None, &store);
+        app.refresh(&store);
+        assert!(app.state.is_some(), "local projection should be loaded");
+
+        std::fs::write(store.root().join("remote.json"), b"{}\n").unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+
+        assert!(render_current(&mut terminal, &mut app, &store).is_err());
     }
 }

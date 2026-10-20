@@ -8,6 +8,7 @@ pub mod backup;
 pub mod cache;
 pub mod cli;
 pub mod client;
+pub mod compatibility;
 pub mod connection;
 pub mod coordination;
 pub mod history;

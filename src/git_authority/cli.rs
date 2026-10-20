@@ -26,9 +26,22 @@ use crate::cli::{AuthorityCmd, Cli, Command, SessionCmd, open_store};
 use crate::{MoteError, MoteResult, ids};
 
 mod communications;
+mod observations;
 
 /// Returns `None` only for an ordinary command against a non-Git store.
 pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
+    if matches!(
+        &cli.command,
+        Command::Authority {
+            cmd: AuthorityCmd::Capabilities
+        }
+    ) {
+        print_value(
+            cli.json,
+            serde_json::to_value(super::compatibility::binary_evidence()?)?,
+        );
+        return Ok(Some(0));
+    }
     if matches!(
         &cli.command,
         Command::Authority {
@@ -83,7 +96,7 @@ pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
                 ));
             }
             let actor = match as_actor {
-                Some(actor) => actor.clone(),
+                Some(actor) => store.resolve_actor(Some(actor))?,
                 None => store.resolve_actor(cli.actor.as_deref())?,
             };
             let session = ids::new_session_id();
@@ -692,6 +705,14 @@ pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
                 *all,
             )?
         }
+        Command::Doctor
+        | Command::Fsck { .. }
+        | Command::Audit { .. }
+        | Command::Events { .. }
+        | Command::Watch { .. }
+        | Command::Actor {
+            cmd: crate::cli::ActorCmd::List { .. } | crate::cli::ActorCmd::Status { .. },
+        } => observations::run(cli, &store)?,
         // Local identity configuration is safe, but projections of actor
         // activity must not fall through to stale local replay.
         Command::Actor {
@@ -717,7 +738,7 @@ pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
 
 fn authority_command(cli: &Cli, store: &crate::repo::Store, cmd: &AuthorityCmd) -> MoteResult<i32> {
     match cmd {
-        AuthorityCmd::LegacyProfile => {
+        AuthorityCmd::Capabilities | AuthorityCmd::LegacyProfile => {
             unreachable!("profile diagnostic is handled before store discovery")
         }
         AuthorityCmd::ExportLegacy {
@@ -837,7 +858,10 @@ fn authority_command(cli: &Cli, store: &crate::repo::Store, cmd: &AuthorityCmd) 
             let snapshot = client.refresh()?;
             print_value(
                 cli.json,
-                view_with_data(&snapshot, serde_json::to_value(&snapshot.manifest)?),
+                view_with_data(
+                    &snapshot,
+                    json!({"manifest":snapshot.manifest,"binary":super::compatibility::binary_evidence()?,"compatibility":super::compatibility::compare_manifest(&snapshot.manifest),"verified_legacy_replay":snapshot.manifest.legacy_digest.is_some()}),
+                ),
             );
             Ok(0)
         }

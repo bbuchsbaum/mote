@@ -1115,6 +1115,8 @@ pub enum ActorCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthorityCmd {
+    /// Report this executable's Git profiles and evidence without opening a store.
+    Capabilities,
     /// Validate and print the authority contract without modifying the store
     Status,
     /// Acquire the shared writer lock and activate authority if needed
@@ -4343,6 +4345,7 @@ fn cmd_authority(store_flag: Option<&Path>, cmd: AuthorityCmd) -> MoteResult<i32
         | AuthorityCmd::Retry { .. }
         | AuthorityCmd::Receipt { .. }
         | AuthorityCmd::RecoverSession { .. }
+        | AuthorityCmd::Capabilities
         | AuthorityCmd::LegacyProfile
         | AuthorityCmd::ExportLegacy { .. } => {
             return Err(MoteError::Invalid(

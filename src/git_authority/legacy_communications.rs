@@ -16,7 +16,11 @@ fn topic(value: &str) -> MoteResult<()> {
     })
 }
 fn actor(value: &str) -> MoteResult<()> {
-    if value.trim().is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+    if value.trim().is_empty()
+        || value != value.trim()
+        || value.len() > 128
+        || value.chars().any(char::is_control)
+    {
         return Err(MoteError::Invalid(
             "legacy communication actor cannot be addressed by the new profile".into(),
         ));
@@ -46,6 +50,13 @@ fn validate_state(entries: &[(String, Vec<u8>)], state: &State) -> MoteResult<()
         opaque(&post.post_id)?;
         opaque(&post.sent_op_id)?;
         actor(&post.from)?;
+        for recipient in post
+            .explicit_notify
+            .iter()
+            .chain(&post.notification_recipients)
+        {
+            actor(recipient)?;
+        }
         topic(&post.topic)?;
     }
     for question in state.board_questions.values() {
@@ -115,6 +126,41 @@ mod tests {
             );
             assert!(eligibility(entries).is_err());
         }
+    }
+    #[test]
+    fn accepted_notification_recipients_must_be_enrollable() {
+        for recipient in ["x".repeat(129), "a\u{1}b".into()] {
+            let entries = vec![entry(
+                "a",
+                "board_post",
+                json!({"post_id":"post-valid","topic":"design","body":"preserved","notify":[recipient]}),
+            )];
+            let state = crate::reducer::replay(entries.clone());
+            assert_eq!(
+                state.board_posts["post-valid"].explicit_notify,
+                vec![recipient.clone()]
+            );
+            assert_eq!(
+                state.board_posts["post-valid"].notification_recipients,
+                vec![recipient]
+            );
+            assert!(validate_state(&entries, &state).is_err());
+        }
+    }
+    #[test]
+    fn untrimmed_imported_actors_are_refused_without_rewriting_history() {
+        let mut input = entry(
+            "a",
+            "board_post",
+            json!({"post_id":"post-valid","topic":"design","body":"preserved"}),
+        );
+        let mut value: serde_json::Value = serde_json::from_slice(&input.1).unwrap();
+        value["actor"] = json!(" alice ");
+        input.1 = serde_json::to_vec(&value).unwrap();
+        let entries = vec![input];
+        let state = crate::reducer::replay(entries.clone());
+        assert_eq!(state.board_posts["post-valid"].from, " alice ");
+        assert!(validate_state(&entries, &state).is_err());
     }
     #[test]
     fn valid_unicode_names_ids_topics_and_cursors_remain_exact() {

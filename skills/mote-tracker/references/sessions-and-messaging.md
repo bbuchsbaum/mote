@@ -3,6 +3,11 @@
 Read this reference only when several terminals or agents share a store, or
 when the task uses Mote direct messages.
 
+For an explicitly connected Git authority, use [Git authority
+workflows](git-authority.md) instead of the TTL heartbeat and local candidate
+guidance below. Remote session enrollment does not prove process liveness;
+ownership persists until explicit release or audited recovery.
+
 ## Sessions and presence
 
 Give concurrent workstreams distinct session identities so their bylines and

@@ -55,6 +55,7 @@ pub struct ServerContext {
 
 impl ServerContext {
     pub fn new(store: Store, security: ServerSecurity) -> MoteResult<Self> {
+        store.require_local_authority()?;
         let snapshot = SnapshotCache::new(&store)?;
         Ok(Self {
             store,
@@ -188,6 +189,7 @@ impl ServerSecurity {
 }
 
 pub fn serve(store: Store, port: u16) -> MoteResult<()> {
+    store.require_local_authority()?;
     // The port is configurable, but the host deliberately is not: serving a
     // store to the network is outside the console's single-user model.
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|error| {
@@ -230,7 +232,17 @@ fn serve_listener(listener: TcpListener, context: ServerContext) -> MoteResult<(
     Ok(())
 }
 
-pub fn serve_connection(mut stream: TcpStream, context: &ServerContext) -> MoteResult<()> {
+pub fn serve_connection(stream: TcpStream, context: &ServerContext) -> MoteResult<()> {
+    // A context can outlive a local-to-Git authority transition. Check before
+    // serving any cached snapshot or accepting a new console request.
+    context.store.require_local_authority()?;
+    serve_connection_after_initial_authority_guard(stream, context)
+}
+
+fn serve_connection_after_initial_authority_guard(
+    mut stream: TcpStream,
+    context: &ServerContext,
+) -> MoteResult<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let request = match read_request(&mut stream) {
         Ok(request) => request,
@@ -239,6 +251,9 @@ pub fn serve_connection(mut stream: TcpStream, context: &ServerContext) -> MoteR
             return write_response(&mut stream, error.status, &body);
         }
     };
+    // Reading an incomplete HTTP request can block. Recheck before its parsed
+    // contents can reach an authoritative handler.
+    context.store.require_local_authority()?;
     let authentication = match authorize_request(&request, &context.security) {
         Ok(authentication) => authentication,
         Err(error) => {
@@ -252,13 +267,20 @@ pub fn serve_connection(mut stream: TcpStream, context: &ServerContext) -> MoteR
     if request.method == "GET" && !request.path.starts_with("/api/") {
         return serve_console_asset(&mut stream, &request, context, authentication);
     }
-    match handle_request(&request, context) {
-        Ok(response) => write_response(&mut stream, response.status, &response.body),
+    let response = match handle_request(&request, context) {
+        Ok(response) => response,
         Err(error) => {
             let body = serde_json::to_vec(&error.body)?;
-            write_response(&mut stream, error.status, &body)
+            HttpResponse {
+                status: error.status,
+                body,
+            }
         }
-    }
+    };
+    // Handlers may have spent time reading a cached snapshot. Do not write it
+    // if authority changed while they ran.
+    context.store.require_local_authority()?;
+    write_response(&mut stream, response.status, &response.body)
 }
 
 fn serve_console_asset(
@@ -308,49 +330,59 @@ fn serve_event_stream(
     context: &ServerContext,
 ) -> MoteResult<()> {
     let filter = EventFilter::default();
+    context.store.require_local_authority()?;
     let (subscriber_id, receiver) = context.snapshot.subscribe();
-    let backlog = match request.headers.get("last-event-id") {
-        Some(cursor) => match crate::events::accepted_events(&context.store, Some(cursor), &filter)
-        {
-            Ok(events) => events,
-            Err(MoteError::Invalid(_) | MoteError::InvalidOpName(_)) => {
-                context.snapshot.unsubscribe(subscriber_id);
-                return write_response(
-                    stream,
-                    400,
-                    br#"{"message":"invalid Last-Event-ID cursor"}"#,
-                );
-            }
-            Err(error) => {
-                context.snapshot.unsubscribe(subscriber_id);
-                eprintln!("mote console SSE backlog failed: {error}");
-                return write_response(stream, 500, br#"{"message":"store I/O failure"}"#);
-            }
-        },
-        None => Vec::new(),
-    };
-
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nX-Accel-Buffering: no\r\nConnection: keep-alive\r\n\r\n"
-    )?;
-    stream.flush()?;
-
-    let mut sent = BTreeSet::new();
     let result = (|| -> MoteResult<()> {
+        let backlog = match request.headers.get("last-event-id") {
+            Some(cursor) => {
+                match crate::events::accepted_events(&context.store, Some(cursor), &filter) {
+                    Ok(events) => events,
+                    Err(MoteError::Invalid(_) | MoteError::InvalidOpName(_)) => {
+                        context.store.require_local_authority()?;
+                        return write_response(
+                            stream,
+                            400,
+                            br#"{"message":"invalid Last-Event-ID cursor"}"#,
+                        );
+                    }
+                    Err(error) => {
+                        context.store.require_local_authority()?;
+                        eprintln!("mote console SSE backlog failed: {error}");
+                        return write_response(stream, 500, br#"{"message":"store I/O failure"}"#);
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+        // A transition during backlog construction must not leave an SSE
+        // subscription behind or emit its response headers.
+        context.store.require_local_authority()?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nX-Accel-Buffering: no\r\nConnection: keep-alive\r\n\r\n"
+        )?;
+        stream.flush()?;
+
+        let mut sent = BTreeSet::new();
         for event in backlog {
+            context.store.require_local_authority()?;
             sent.insert(event.event_id.clone());
             write_sse_event(stream, &event)?;
         }
         loop {
+            // An existing event stream must not keep delivering a stale local
+            // projection after the store has moved to Git authority.
+            context.store.require_local_authority()?;
             match receiver.recv_timeout(Duration::from_secs(15)) {
                 Ok(event) => {
+                    context.store.require_local_authority()?;
                     if sent.insert(event.event_id.clone()) {
                         write_sse_event(stream, &event)?;
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    context.store.require_local_authority()?;
                     stream.write_all(b": heartbeat\n\n")?;
                     stream.flush()?;
                 }
@@ -2738,5 +2770,57 @@ mod tests {
 
         let shared = context.clone();
         assert!(Arc::ptr_eq(&context.snapshot(), &shared.snapshot()));
+    }
+
+    #[test]
+    fn request_completed_after_a_mode_transition_cannot_serve_the_cached_snapshot() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc::channel;
+
+        let temp = TempDir::new().unwrap();
+        let store = Store::init(temp.path()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let context =
+            ServerContext::new(store.clone(), ServerSecurity::new(address.port(), "token"))
+                .unwrap();
+        let (accepted_tx, accepted_rx) = channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            // This helper is the portion entered after serve_connection's
+            // initial local-authority check.
+            serve_connection_after_initial_authority_guard(stream, &context)
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        accepted_rx.recv().unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Mote-Token: token\r\n",
+                    address.port()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        std::fs::write(store.root().join("remote.json"), b"{}\n").unwrap();
+        client.write_all(b"\r\n").unwrap();
+
+        let mut response = String::new();
+        match client.read_to_string(&mut response) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            Err(error) => panic!("unexpected client read failure: {error}"),
+        }
+        assert!(server.join().unwrap().is_err());
+        assert!(response.is_empty(), "fenced request served: {response}");
     }
 }
