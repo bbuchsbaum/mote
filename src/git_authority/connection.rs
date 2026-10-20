@@ -49,7 +49,8 @@ impl Descriptor {
             generation: self.generation,
             ownership: "explicit-release-v1".into(),
             capabilities: self.capabilities.clone(),
-            legacy_digest: None,
+            legacy_digest: (self.capabilities == super::protocol::MIGRATED_ROOT_CAPABILITIES)
+                .then(|| "0".repeat(64)),
         }
         .validate()
     }
@@ -93,6 +94,7 @@ impl Descriptor {
 pub enum SetupOperation {
     Bootstrap,
     Connect,
+    Migrate,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +113,15 @@ pub struct RootArtifact {
     pub tree_bytes: Vec<u8>,
     pub commit_oid: String,
     pub commit_bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_pack: Option<RootBlob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootBlob {
+    pub oid: String,
+    pub bytes: Vec<u8>,
 }
 impl RootArtifact {
     pub fn validate(&self) -> MoteResult<()> {
@@ -132,6 +143,16 @@ impl RootArtifact {
         manifest.validate()?;
         if encode(&manifest)? != self.manifest_bytes {
             return invalid("retained manifest is not canonical");
+        }
+        match (&manifest.legacy_digest, &self.legacy_pack) {
+            (Some(_), Some(pack))
+                if valid_oid(&pack.oid)
+                    && pack.oid.len() == len
+                    && !pack.bytes.is_empty()
+                    && pack.bytes.len() <= super::legacy::MAX_PACK_BYTES => {}
+            (Some(_), _) => return invalid("migrated root artifact lacks a valid legacy pack"),
+            (None, None) => {}
+            (None, Some(_)) => return invalid("ordinary root artifact retains an unexpected blob"),
         }
         Ok(())
     }
@@ -162,6 +183,19 @@ pub struct SetupRecord {
     #[serde(deserialize_with = "required_option")]
     pub confirmed_head: Option<String>,
     pub phase: SetupPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<MigrationSetup>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationSetup {
+    pub backup: super::backup::Custody,
+    pub export_digest: String,
+    pub cleanup_start: u64,
+}
+pub struct MigrationOptions {
+    pub backup: PathBuf,
+    pub cleanup_start: Option<u64>,
 }
 impl SetupRecord {
     pub fn validate(&self) -> MoteResult<()> {
@@ -184,11 +218,24 @@ impl SetupRecord {
         {
             return invalid("invalid or inconsistent Git setup identity");
         }
+        if (self.operation == SetupOperation::Migrate) != self.migration.is_some() {
+            return invalid("migration setup custody and operation disagree");
+        }
+        if let Some(migration) = &self.migration {
+            if !migration.backup.path.is_absolute()
+                || !digest_ok(&migration.backup.digest)
+                || !digest_ok(&migration.export_digest)
+            {
+                return invalid("invalid migration backup or export identity");
+            }
+        }
         match (&self.operation, &self.root_artifact) {
-            (SetupOperation::Bootstrap, Some(root)) => {
+            (SetupOperation::Bootstrap | SetupOperation::Migrate, Some(root)) => {
                 root.validate()?;
                 let manifest: Manifest = decode(&root.manifest_bytes)?;
-                if original.schema_version != 1
+                if self.migration.as_ref().map(|m| &m.export_digest)
+                    != manifest.legacy_digest.as_ref()
+                    || original.schema_version != 1
                     || self.descriptor.store_id != original.store_id
                     || root.commit_oid != self.descriptor.root
                     || manifest.store_id != self.descriptor.store_id
@@ -204,6 +251,33 @@ impl SetupRecord {
         Ok(())
     }
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationActivation {
+    version: u32,
+    migration: MigrationSetup,
+    original_format: Vec<u8>,
+    proposed_format: Vec<u8>,
+    source_fingerprint: String,
+    endpoint_digest: String,
+    cache_root: PathBuf,
+    descriptor: Descriptor,
+}
+impl From<&SetupRecord> for MigrationActivation {
+    fn from(record: &SetupRecord) -> Self {
+        Self {
+            version: 1,
+            migration: record.migration.clone().expect("migration activation"),
+            original_format: record.original_format.clone(),
+            proposed_format: record.proposed_format.clone(),
+            source_fingerprint: record.source_fingerprint.clone(),
+            endpoint_digest: record.endpoint_digest.clone(),
+            cache_root: record.cache_root.clone(),
+            descriptor: record.descriptor.clone(),
+        }
+    }
+}
+
 fn digest_ok(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
@@ -419,6 +493,43 @@ fn source_fingerprint(store: &Store) -> MoteResult<String> {
     evidence.sort();
     Ok(blake3::hash(&encode(&evidence)?).to_hex().to_string())
 }
+fn migration_source_fingerprint(store: &Store) -> MoteResult<String> {
+    let mut evidence = Vec::<(String, String)>::new();
+    for (prefix, directory) in [
+        ("ops", store.ops_dir()),
+        ("authority", crate::authority::directory(store)),
+    ] {
+        match fs::read_dir(directory) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let name = entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| MoteError::Invalid("nonUTF8 migration source path".into()))?;
+                    if !entry.file_type()?.is_file() {
+                        return invalid("nonregular migration source file");
+                    }
+                    evidence.push((
+                        format!("{prefix}/{name}"),
+                        blake3::hash(&fs::read(entry.path())?).to_hex().to_string(),
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if let Some(bytes) = read_bytes_optional(&crate::authority::binding_path(store))? {
+        evidence.push((
+            "local/authority.json".into(),
+            blake3::hash(&bytes).to_hex().to_string(),
+        ));
+    }
+    evidence.sort();
+    Ok(blake3::hash(&encode(&evidence)?).to_hex().to_string())
+}
+
 fn read_bytes_optional(path: &Path) -> MoteResult<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(b) => Ok(Some(b)),
@@ -465,6 +576,9 @@ pub fn connect(
 pub fn resume(store: &Store, transport: GitTransport, cache_root: &Path) -> MoteResult<Descriptor> {
     let record = load_setup(store.root())?
         .ok_or_else(|| MoteError::Invalid("no retained Git setup to resume".into()))?;
+    if let Some(migration) = &record.migration {
+        transport.checked_durable_path(&migration.backup.path)?;
+    }
     run_setup(store, transport, cache_root, record.operation, &mut |_| {
         Ok(())
     })
@@ -476,6 +590,46 @@ fn run_setup(
     operation: SetupOperation,
     hook: &mut dyn FnMut(Checkpoint) -> MoteResult<()>,
 ) -> MoteResult<Descriptor> {
+    run_setup_inner(store, transport, cache_root, operation, None, hook)
+}
+pub fn migrate(
+    store: &Store,
+    transport: GitTransport,
+    cache_root: &Path,
+    options: &MigrationOptions,
+) -> MoteResult<Descriptor> {
+    let options = MigrationOptions {
+        backup: transport.checked_durable_path(&options.backup)?,
+        cleanup_start: options.cleanup_start,
+    };
+    run_setup_inner(
+        store,
+        transport,
+        cache_root,
+        SetupOperation::Migrate,
+        Some(&options),
+        &mut |_| Ok(()),
+    )
+}
+fn run_setup_inner(
+    store: &Store,
+    transport: GitTransport,
+    cache_root: &Path,
+    operation: SetupOperation,
+    migration_options: Option<&MigrationOptions>,
+    hook: &mut dyn FnMut(Checkpoint) -> MoteResult<()>,
+) -> MoteResult<Descriptor> {
+    if operation == SetupOperation::Migrate {
+        if let Some(options) = migration_options {
+            transport.checked_durable_path(&options.backup)?;
+        }
+        if let Some(record) = load_setup(store.root())? {
+            if let Some(migration) = record.migration {
+                transport.checked_durable_path(&migration.backup.path)?;
+            }
+        }
+        super::legacy_profile::current()?;
+    }
     let canonical_store = Store::open(&fs::canonicalize(store.root())?)?;
     let store = &canonical_store;
     fs::create_dir_all(store.local_dir())?;
@@ -503,12 +657,29 @@ fn run_setup(
                 "setup arguments differ from retained identity; use the original endpoint, branch and cache",
             );
         }
+        if let Some(options) = migration_options {
+            let migration = record
+                .migration
+                .as_ref()
+                .ok_or_else(|| MoteError::Invalid("retained setup is not a migration".into()))?;
+            if fs::canonicalize(&options.backup)? != migration.backup.path
+                || options
+                    .cleanup_start
+                    .is_some_and(|n| n != migration.cleanup_start)
+            {
+                return invalid("migration options differ from retained source cut and backup");
+            }
+        }
         record
     } else {
         let original = fs::read(store.format_path())?;
         let format: Format = decode(&original)?;
         let existing = load_descriptor(store.root())?;
-        let source = source_fingerprint(store)?;
+        let source = if operation == SetupOperation::Migrate {
+            migration_source_fingerprint(store)?
+        } else {
+            source_fingerprint(store)?
+        };
         if format.schema_version == 1 && existing.is_none() {
             store.require_local_authority()?;
             crate::authority::status(store)?;
@@ -519,6 +690,7 @@ fn run_setup(
         {
             return invalid("local format and Git descriptor disagree");
         }
+        let mut migration = None;
         let (descriptor, root_artifact, confirmed_head) = match operation {
             SetupOperation::Bootstrap => {
                 if existing.is_some() || format.schema_version != 1 || cache.binding()?.is_some() {
@@ -541,6 +713,49 @@ fn run_setup(
                     root: root.commit_oid.clone(),
                     capabilities: manifest.capabilities,
                 };
+                (descriptor, Some(root), None)
+            }
+            SetupOperation::Migrate => {
+                if existing.is_some()
+                    || format.schema_version != 1
+                    || cache.binding()?.is_some()
+                    || cache.previous_head()?.is_some()
+                {
+                    return invalid("migration requires an unbound local source and unused cache");
+                }
+                let options = migration_options.ok_or_else(|| {
+                    MoteError::Invalid(
+                        "migration requires an explicit private backup destination".into(),
+                    )
+                })?;
+                if transport.head()?.is_some() {
+                    return invalid("authority branch already exists; migration cannot replace it");
+                }
+                let archive = super::legacy::capture_locked(store, options.cleanup_start)?;
+                let verified = super::legacy::verify(&archive.files, &archive.digest)?;
+                let cleanup_start = verified.transition.cleanup_start;
+                super::coordination::CoordinationState::from_legacy(verified)?;
+                let pack = super::legacy::pack(&archive)?;
+                let backup = super::backup::create(store, &options.backup)?;
+                let manifest = Manifest::migrated(format.store_id.clone(), archive.digest.clone());
+                let root = transport.capture_migrated_root(&manifest, &pack)?;
+                let descriptor = Descriptor {
+                    version: 1,
+                    remote: transport.remote_name().into(),
+                    branch: transport
+                        .branch_ref()
+                        .trim_start_matches("refs/heads/")
+                        .into(),
+                    store_id: manifest.store_id,
+                    generation: manifest.generation,
+                    root: root.commit_oid.clone(),
+                    capabilities: manifest.capabilities,
+                };
+                migration = Some(MigrationSetup {
+                    backup,
+                    export_digest: archive.digest,
+                    cleanup_start,
+                });
                 (descriptor, Some(root), None)
             }
             SetupOperation::Connect => {
@@ -576,6 +791,7 @@ fn run_setup(
             root_artifact,
             confirmed_head,
             phase: SetupPhase::Prepared,
+            migration,
         };
         write_setup(store.root(), &record)?;
         hook(Checkpoint::IntentDurable)?;
@@ -586,7 +802,23 @@ fn run_setup(
     if current != record.original_format && current != record.proposed_format {
         return invalid("local FORMAT changed during Git setup");
     }
-    if source_fingerprint(store)? != record.source_fingerprint {
+    let source = if record.operation == SetupOperation::Migrate {
+        let migration = record
+            .migration
+            .as_ref()
+            .expect("validated migration record");
+        let inventory = super::backup::verify(&migration.backup)?;
+        if inventory.source != store.root()
+            || inventory.store_id != record.local_store_id
+            || inventory.format_digest != record.original_format_digest
+        {
+            return invalid("migration backup differs from retained source identity");
+        }
+        migration_source_fingerprint(store)?
+    } else {
+        source_fingerprint(store)?
+    };
+    if source != record.source_fingerprint {
         return invalid("local source changed during Git setup");
     }
     if let Some(descriptor) = load_descriptor(store.root())? {
@@ -595,11 +827,24 @@ fn run_setup(
         }
     }
     if let Some(root) = &record.root_artifact {
-        transport.import_root(root)?
+        transport.import_root(root)?;
+        if let Some(migration) = &record.migration {
+            let pack = root
+                .legacy_pack
+                .as_ref()
+                .ok_or_else(|| MoteError::Invalid("migration root has no retained pack".into()))?;
+            let files = super::legacy::unpack(&pack.bytes)?;
+            let verified = super::legacy::verify(&files, &migration.export_digest)?;
+            if verified.transition.cleanup_start != migration.cleanup_start {
+                return invalid("migration cleanup boundary differs from retained root");
+            }
+        }
     }
     if transport.head()?.is_none() {
-        if record.operation != SetupOperation::Bootstrap
-            || record.phase != SetupPhase::Prepared
+        if !matches!(
+            record.operation,
+            SetupOperation::Bootstrap | SetupOperation::Migrate
+        ) || record.phase != SetupPhase::Prepared
             || record.confirmed_head.is_some()
             || cache.binding()?.is_some()
             || cache.previous_head()?.is_some()
@@ -643,6 +888,12 @@ fn run_setup(
     record.phase = SetupPhase::Activated;
     write_setup(store.root(), &record)?;
     hook(Checkpoint::Activated)?;
+    if record.migration.is_some() {
+        atomic_write(
+            &store.local_dir().join("git-migration.json"),
+            &encode(&MigrationActivation::from(&record))?,
+        )?;
+    }
     fs::remove_file(setup_path(store.root()))?;
     File::open(store.local_dir())?.sync_all()?;
     Ok(record.descriptor)
@@ -973,5 +1224,76 @@ mod tests {
         assert!(f.transport("a", "check").head().unwrap().is_none());
         assert_eq!(cache.previous_head().unwrap(), before);
         assert_eq!(load_setup(a.root()).unwrap(), Some(record));
+    }
+    #[test]
+    fn migration_backup_is_disjoint_from_scratch_and_canonical_aliases_before_setup() {
+        let f = Fixture::new();
+        let a = f.store("a");
+        let original = fs::read(a.format_path()).unwrap();
+        let scratch = f.td.path().join("owned-scratch");
+        let transport = f.transport("a", "owned-scratch");
+        let mut paths = vec![scratch.join("backup")];
+        #[cfg(unix)]
+        {
+            let alias = f.td.path().join("scratch-alias");
+            std::os::unix::fs::symlink(&scratch, &alias).unwrap();
+            paths.push(alias.join("backup"));
+        }
+        for backup in paths {
+            let error = migrate(
+                &a,
+                transport.clone(),
+                &default_cache_root(&a),
+                &MigrationOptions {
+                    backup: backup.clone(),
+                    cleanup_start: None,
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("disjoint"), "{error}");
+            assert!(!backup.exists());
+            assert!(!setup_path(a.root()).exists());
+            assert_eq!(fs::read(a.format_path()).unwrap(), original);
+            assert!(transport.head().unwrap().is_none());
+        }
+        let custody =
+            super::super::backup::create(&a, &f.td.path().join("external-backup")).unwrap();
+        // All children above have completed; this exact scratch is fixture-owned.
+        fs::remove_dir_all(scratch).unwrap();
+        super::super::backup::verify(&custody).unwrap();
+    }
+    #[test]
+    fn retained_migration_custody_cannot_overlap_replacement_scratch() {
+        let f = Fixture::new();
+        let a = f.store("a");
+        let mut record = f.prepare();
+        let parent = f.td.path().join("replacement-owner");
+        fs::create_dir(&parent).unwrap();
+        let custody = super::super::backup::create(&a, &parent.join("backup")).unwrap();
+        record.operation = SetupOperation::Migrate;
+        record.migration = Some(MigrationSetup {
+            backup: custody.clone(),
+            export_digest: "a".repeat(64),
+            cleanup_start: 0,
+        });
+        let manifest = Manifest::migrated(record.local_store_id.clone(), "a".repeat(64));
+        record.descriptor.capabilities = manifest.capabilities.clone();
+        let root = record.root_artifact.as_mut().unwrap();
+        root.manifest_bytes = encode(&manifest).unwrap();
+        root.legacy_pack = Some(RootBlob {
+            oid: "b".repeat(40),
+            bytes: vec![1],
+        });
+        // Structurally valid retained identity is enough to exercise the path
+        // gate before profile or raw-object validation; no fabricated root is
+        // ever imported or published in this refusal witness.
+        record.validate().unwrap();
+        fs::write(setup_path(a.root()), encode(&record).unwrap()).unwrap();
+        let replacement = f.transport("a", "replacement-owner");
+        let error = resume(&a, replacement.clone(), &default_cache_root(&a)).unwrap_err();
+        assert!(error.to_string().contains("disjoint"), "{error}");
+        assert_eq!(load_setup(a.root()).unwrap(), Some(record));
+        assert!(replacement.head().unwrap().is_none());
+        super::super::backup::verify(&custody).unwrap();
     }
 }

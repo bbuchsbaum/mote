@@ -107,8 +107,11 @@ remote ownership events or request receipts.
 ## Closed archive and migrated root
 
 The root manifest selects a distinct migrated-root capability. Existing roots
-and profiles continue refusing archive files. The complete root is a closed
-file set containing its manifest and this archive:
+and profiles continue refusing archive files. The complete root is exactly `manifest.json` and `legacy.pack`. The distinct
+capability is `legacy-packed-v1`, added to the lifecycle capability set; its
+manifest requires the export digest. Roots without that capability require a
+null legacy digest and continue refusing extra root files. The pack contains
+this closed logical archive:
 
 - `legacy/format.bin`: exact original FORMAT file bytes, without normalization.
 - `legacy/export.json`: schema/profile, source identity/order, raw FORMAT digest,
@@ -123,6 +126,16 @@ file set containing its manifest and this archive:
 - `legacy/task-seed.json`: all task records, including tombstones, scalar
   clocks, creation/deletion provenance, tags, dependencies, relations and notes.
 
+The pack is deterministic and uncompressed: the exact bytes
+`MOTE-LEGACY-PACK\0\x01`, a big-endian u64 entry count, then entries sorted by
+UTF-8 path bytes. Each entry contains a big-endian u32 path byte length, the
+UTF-8 path, a big-endian u64 payload length, and the original payload bytes.
+Reject invalid paths, zero/duplicate/out-of-order names, impossible lengths,
+unknown magic and trailing bytes before interpreting the archive. A pack
+contains at most 1,000,000 entries and 256 MiB of bytes; these development limits
+are explicit refusals, never truncation. One blob avoids one Git subprocess per
+historical source operation during each authority refresh.
+
 Validate canonical metadata, unique ordinals/names, exact file-set equality,
 all digests, actual pinned replay decisions, cleanup and seed before accepting
 a migrated root. Derive the reducer scratch task state from the verified full
@@ -135,7 +148,24 @@ their original operations/evidence remain preserved in the archive.
 
 Remote sequence starts at 1 after the root. History positions distinguish
 legacy ordinal from remote sequence/effect index. Original timestamps order
-neither phase. New remote transactions never mutate the legacy archive.
+neither phase. New remote transactions never mutate the legacy archive. The verified root
+installs a private seed containing the original ordered input bytes and consumed
+ID sets. Every task replay starts from that exact pinned legacy replay, then
+applies only the new typed task adapters in canonical effect order. The full
+legacy state is never deserialized from presentation JSON. Its original records
+remain separate from remote ownership maps and remote task adapters.
+
+Development migration explicitly refuses a selected history if any original
+input filename stem begins with `gaop-` (including rejected inputs), or if any
+consumed task ID, dependency target or relation target fails the current Git
+coordination profile's `bd-` identifier validation. These refusals prevent
+adapter/field-clock identity collisions and preserve usable CAS/lifecycle
+references. Exporting such a source remains supported; migration neither
+renames records nor silently changes the existing profiles' validators.
+
+Root setup retains exact pack, manifest, tree and commit objects before any
+push, so a retry after scratch loss restores the same root identity. Missing
+remote history after any cache or setup confirmation remains a refusal.
 
 ## Required discriminating witnesses
 

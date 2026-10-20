@@ -404,7 +404,7 @@ pub fn plan(
                 return Ok(reject("claim_occupied", &v.id));
             }
             if let Some(rid) = &v.reservation {
-                if state.reservations.contains_key(rid) {
+                if state.reservations.contains_key(rid) || state.consumed_reservation(rid) {
                     return Ok(reject("reservation_exists", rid));
                 }
                 if let Some((id, _)) = state
@@ -506,7 +506,7 @@ pub fn plan(
             };
             let id = id.clone();
             if let Some(rid) = &v.reservation {
-                if state.reservations.contains_key(rid) {
+                if state.reservations.contains_key(rid) || state.consumed_reservation(rid) {
                     return Ok(reject("reservation_exists", rid));
                 }
                 if let Some((rid, _)) = state

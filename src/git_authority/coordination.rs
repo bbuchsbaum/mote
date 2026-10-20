@@ -196,6 +196,17 @@ pub struct CoordinationState {
     claims: BTreeMap<String, Claim>,
     reservations: BTreeMap<String, Reservation>,
     task_entries: Vec<Value>,
+    // This seed is installed only by verified migrated-root replay. It is not
+    // a public deserialization path for legacy state or ownership.
+    #[serde(skip)]
+    legacy_seed: Option<LegacySeed>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacySeed {
+    entries: Vec<(String, Vec<u8>)>,
+    consumed_tasks: BTreeSet<String>,
+    consumed_sessions: BTreeSet<String>,
+    consumed_reservations: BTreeSet<String>,
 }
 fn required_option<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
@@ -358,6 +369,53 @@ fn validate_field(k: &str, v: &Value) -> MoteResult<()> {
     }
 }
 impl CoordinationState {
+    pub(crate) fn from_legacy(verified: super::legacy::Verified) -> MoteResult<Self> {
+        if verified
+            .entries
+            .iter()
+            .any(|(name, _)| name.starts_with("gaop-"))
+        {
+            return bad(
+                "legacy operation names occupy the reserved gaop- adapter namespace; development migration is unavailable",
+            );
+        }
+        for id in &verified.transition.consumed_tasks {
+            task_id(id).map_err(|_| MoteError::Invalid(
+                "legacy task IDs outside the Git coordination profile prevent development migration".into()))?;
+        }
+        for task in verified.state.beads.values() {
+            for (parent, _) in &task.deps {
+                task_id(parent)?;
+            }
+            for (parent, _) in &task.rels {
+                task_id(parent)?;
+            }
+        }
+        Ok(Self {
+            legacy_seed: Some(LegacySeed {
+                entries: verified.entries,
+                consumed_tasks: verified.transition.consumed_tasks,
+                consumed_sessions: verified.transition.consumed_sessions,
+                consumed_reservations: verified.transition.consumed_reservations,
+            }),
+            ..Self::default()
+        })
+    }
+    fn consumed_task(&self, id: &str) -> bool {
+        self.legacy_seed
+            .as_ref()
+            .is_some_and(|s| s.consumed_tasks.contains(id))
+    }
+    fn consumed_session(&self, id: &str) -> bool {
+        self.legacy_seed
+            .as_ref()
+            .is_some_and(|s| s.consumed_sessions.contains(id))
+    }
+    fn consumed_reservation(&self, id: &str) -> bool {
+        self.legacy_seed
+            .as_ref()
+            .is_some_and(|s| s.consumed_reservations.contains(id))
+    }
     pub fn view(&self) -> MoteResult<Value> {
         Ok(
             json!({"tasks":replay_tasks(self)?,"sessions":self.sessions,"claims":self.claims,"reservations":self.reservations}),
@@ -418,7 +476,13 @@ fn replay_tasks(state: &CoordinationState) -> MoteResult<BTreeMap<String, Task>>
             Ok((format!("{op}.json"), serde_json::to_vec(v)?))
         })
         .collect::<MoteResult<Vec<_>>>()?;
-    let r = crate::reducer::replay(entries);
+    let mut r = match &state.legacy_seed {
+        Some(seed) => crate::reducer::replay(seed.entries.clone()),
+        None => crate::state::State::default(),
+    };
+    for (name, bytes) in entries {
+        crate::reducer::apply_entry(&mut r, &name, &bytes);
+    }
     if state
         .task_entries
         .iter()
@@ -428,12 +492,13 @@ fn replay_tasks(state: &CoordinationState) -> MoteResult<BTreeMap<String, Task>>
             "coordination task operation rejected by reducer".into(),
         ));
     }
-    if !r.reservations.is_empty()
-        || !r.sessions.is_empty()
-        || !r.messages.is_empty()
-        || !r.roles.is_empty()
-        || !r.candidates.is_empty()
-        || !r.handoff_orphans.is_empty()
+    if state.legacy_seed.is_none()
+        && (!r.reservations.is_empty()
+            || !r.sessions.is_empty()
+            || !r.messages.is_empty()
+            || !r.roles.is_empty()
+            || !r.candidates.is_empty()
+            || !r.handoff_orphans.is_empty())
     {
         return Err(MoteError::Invalid(
             "coordination task history used unsupported legacy state".into(),
@@ -516,7 +581,9 @@ pub fn plan(
             unreachable!("lifecycle action dispatched before core planning")
         }
         Action::SessionStart { label } => {
-            if state.sessions.contains_key(&request.session) {
+            if state.sessions.contains_key(&request.session)
+                || state.consumed_session(&request.session)
+            {
                 return Ok(reject("session_exists", &request.session));
             };
             next.sessions.insert(
@@ -574,7 +641,7 @@ pub fn plan(
             priority,
             assignee,
         } => {
-            if tasks.contains_key(id) {
+            if tasks.contains_key(id) || state.consumed_task(id) {
                 return Ok(reject("task_exists", id));
             };
             (
@@ -708,7 +775,9 @@ pub fn plan(
             if !eligible(task) {
                 return Ok(reject("task_unavailable", id));
             }
-            if state.reservations.contains_key(reservation) {
+            if state.reservations.contains_key(reservation)
+                || state.consumed_reservation(reservation)
+            {
                 return Ok(reject("reservation_exists", reservation));
             }
             if let Some((rid, _)) = state

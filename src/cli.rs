@@ -1134,6 +1134,18 @@ pub enum AuthorityCmd {
         #[arg(long, default_value = "mote-state")]
         branch: String,
     },
+    /// Migrate one stopped local history with a verified private full backup.
+    MigrateGit {
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long, default_value = "mote-state")]
+        branch: String,
+        /// New private directory outside this project's tree.
+        #[arg(long)]
+        backup: PathBuf,
+        #[arg(long)]
+        cleanup_start: Option<u64>,
+    },
     /// Connect this empty local store to an existing Git authority branch.
     Connect {
         #[arg(long, default_value = "origin")]
@@ -4314,6 +4326,7 @@ fn cmd_authority(store_flag: Option<&Path>, cmd: AuthorityCmd) -> MoteResult<i32
             return Ok(0);
         }
         AuthorityCmd::InitGit { .. }
+        | AuthorityCmd::MigrateGit { .. }
         | AuthorityCmd::Connect { .. }
         | AuthorityCmd::Resume { .. }
         | AuthorityCmd::Refresh

@@ -140,3 +140,48 @@ so `eval "$(mote session start --as actor)"` remains valid. Failure diagnostics
 go to stderr; structured JSON output is available with `--json`.
 Unsupported TTL/force/resume/announcement options refuse rather than changing
 meaning silently. Legacy local command behavior stays unchanged.
+
+## Existing local history (development)
+
+`authority migrate-git --backup /private/path/new-backup` requires the retained
+closed-profile binary. The backup destination must be new, private, and outside
+the selected project tree. The selected history must pass the exact archive,
+cleanup, identity and migrated-seed checks described in
+[the migration contract](git-authority-migration.md). Pending journals require
+explicit recovery before migration; this command does not recover or publish
+cleanup automatically. An existing authority branch refuses conversion.
+
+While holding the local publication lock, migration captures the selected
+archive, makes and verifies a complete private backup, and retains the exact
+manifest/pack/tree/commit objects. The complete backup preserves every regular
+store file, file permissions and empty directories, including machine-local
+files excluded from the shareable archive. Symlinks/nonregular entries refuse.
+Both new backup paths and retained custody must be canonically disjoint from
+Git scratch in both ancestor directions, including symlink aliases. A backup
+inside disposable scratch cannot serve as durable custody. Its inventory binds the canonical source path, store ID, raw FORMAT digest,
+exact file set, byte lengths/digests and original modes. Backup directories
+remain private. All copied files, nested directories, the inventory and its
+parent are synced before custody is accepted. A failed copy remains partial and
+is never accepted without a verified complete inventory.
+
+The existing setup intent additionally binds immutable backup custody, export
+digest and cleanup boundary. It fingerprints all raw operations, admissions,
+terminal landing archives and local authority binding. Resume verifies that cut,
+original/proposed FORMAT, complete backup and matching legacy profile before
+any push or activation. It never calls local replay through the normal writer
+or replaces a retained root. The same missing-branch confirmation rules apply
+as for empty setup. Migration publishes a compact private completion record
+before removing the setup fence, retaining backup custody after activation.
+
+Accepted migrated roots preserve legacy history positions separately from new
+remote sequence/effect positions. `history` reports original entity events with
+`phase:legacy`, input ordinal and per-input event index; new transactions report
+`phase:remote`. Rejected entries remain subject to `--include-rejected`.
+
+Rollback is not implemented by removing a descriptor or copying FORMAT. The
+planned pre-use rollback must first obtain a canonical permanent retirement
+receipt, racing atomically with every other client's first use; any prior
+receipt disqualifies it. Restoration must retain its proof/progress outside the
+restored contents and leave the publication lock inode intact. That distinct
+capability, administrative command and restoration fault qualification remain
+open work; current migration setup does not claim rollback acceptance.

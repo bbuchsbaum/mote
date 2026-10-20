@@ -76,6 +76,103 @@ pub struct Verified {
     pub state: State,
 }
 
+/// Development limits are refusals, never truncation. The packed root keeps a
+/// large legacy history to one immutable Git blob.
+pub const MAX_PACK_BYTES: usize = 256 << 20;
+const MAX_PACK_ENTRIES: usize = 1_000_000;
+const PACK_MAGIC: &[u8] = b"MOTE-LEGACY-PACK\0\x01";
+
+fn archive_path(name: &str) -> bool {
+    name.starts_with("legacy/")
+        && !name.contains('\\')
+        && !name.ends_with('/')
+        && name
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+        && !name.chars().any(char::is_control)
+}
+
+/// Encode a previously captured archive; integrity/profile validation is still
+/// required, even when a caller constructs Archive directly.
+pub fn pack(archive: &Archive) -> MoteResult<Vec<u8>> {
+    verify(&archive.files, &archive.digest)?;
+    pack_files(&archive.files)
+}
+fn pack_files(files: &BTreeMap<String, Vec<u8>>) -> MoteResult<Vec<u8>> {
+    if files.is_empty() || files.len() > MAX_PACK_ENTRIES {
+        return invalid("legacy pack entry count exceeds supported limits");
+    }
+    let mut size = PACK_MAGIC.len() + 8;
+    for (name, bytes) in files {
+        if !archive_path(name) || name.len() > u32::MAX as usize {
+            return invalid("invalid legacy pack path");
+        }
+        size = size
+            .checked_add(12)
+            .and_then(|n| n.checked_add(name.len()))
+            .and_then(|n| n.checked_add(bytes.len()))
+            .filter(|n| *n <= MAX_PACK_BYTES)
+            .ok_or_else(|| MoteError::Invalid("legacy pack exceeds supported size".into()))?;
+    }
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(PACK_MAGIC);
+    out.extend_from_slice(&(files.len() as u64).to_be_bytes());
+    for (name, bytes) in files {
+        out.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
+/// Decode only the closed framing. Call `verify` before using any archive
+/// contents as reducer inputs, task seed, or authority state.
+pub fn unpack(bytes: &[u8]) -> MoteResult<BTreeMap<String, Vec<u8>>> {
+    fn take<'a>(remaining: &mut &'a [u8], n: usize) -> MoteResult<&'a [u8]> {
+        if n > remaining.len() {
+            return invalid("truncated legacy pack");
+        }
+        let (head, tail) = remaining.split_at(n);
+        *remaining = tail;
+        Ok(head)
+    }
+    if bytes.len() > MAX_PACK_BYTES {
+        return invalid("legacy pack exceeds supported size");
+    }
+    let mut remaining = bytes;
+    if take(&mut remaining, PACK_MAGIC.len())? != PACK_MAGIC {
+        return invalid("unsupported legacy pack format");
+    }
+    let count = u64::from_be_bytes(take(&mut remaining, 8)?.try_into().expect("eight bytes"));
+    if count == 0 || count > MAX_PACK_ENTRIES as u64 || count > (remaining.len() / 13) as u64 {
+        return invalid("invalid legacy pack entry count");
+    }
+    let mut files = BTreeMap::<String, Vec<u8>>::new();
+    for _ in 0..count {
+        let name_len = u32::from_be_bytes(take(&mut remaining, 4)?.try_into().expect("four bytes"));
+        let name = std::str::from_utf8(take(&mut remaining, name_len as usize)?)
+            .map_err(|_| MoteError::Invalid("invalid UTF8 legacy pack path".into()))?;
+        if !archive_path(name)
+            || files
+                .last_key_value()
+                .is_some_and(|(prev, _)| prev.as_str() >= name)
+        {
+            return invalid("invalid, duplicate or unordered legacy pack path");
+        }
+        let length = u64::from_be_bytes(take(&mut remaining, 8)?.try_into().expect("eight bytes"));
+        let length = usize::try_from(length).map_err(|_| {
+            MoteError::Invalid("legacy pack payload length exceeds platform limits".into())
+        })?;
+        let payload = take(&mut remaining, length)?;
+        files.insert(name.into(), payload.to_vec());
+    }
+    if !remaining.is_empty() {
+        return invalid("legacy pack has trailing bytes");
+    }
+    Ok(files)
+}
+
 fn hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
@@ -190,6 +287,20 @@ fn capture_profile(
         .write(true)
         .open(store.local_dir().join("publication.lock"))?;
     lock.lock_exclusive()?;
+    capture_locked_profile(store, cleanup_start, profile)
+}
+
+/// Internal orchestration seam; the caller owns publication.lock and must not
+/// acquire a second lock or invoke Writer's automatic journal recovery.
+pub(crate) fn capture_locked(store: &Store, cleanup_start: Option<u64>) -> MoteResult<Archive> {
+    let profile = super::legacy_profile::current()?;
+    capture_locked_profile(store, cleanup_start, &profile)
+}
+fn capture_locked_profile(
+    store: &Store,
+    cleanup_start: Option<u64>,
+    profile: &str,
+) -> MoteResult<Archive> {
     store.require_local_authority()?;
     crate::landing::ensure_migration_quiescent(store)?;
     if crate::authority::directory(store)
@@ -924,5 +1035,278 @@ mod tests {
             Ok("successful export receipt")
         })();
         assert!(result.is_err());
+    }
+    #[test]
+    fn packed_archive_round_trip_retains_every_original_byte() {
+        let a = archive(&ttl_history(), None);
+        let packed = pack_files(&a.files).unwrap();
+        assert_eq!(packed, pack_files(&a.files).unwrap());
+        assert_eq!(unpack(&packed).unwrap(), a.files);
+        let decoded = unpack(&packed).unwrap();
+        let verified = verify_profile(&decoded, &a.digest, "pinned-fixture").unwrap();
+        assert!(verified.state.was_accepted("003"));
+        assert!(!verified.state.was_accepted("005"));
+        let binary = BTreeMap::from([("legacy/raw.bin".into(), vec![0, 255, 13, 10])]);
+        assert_eq!(unpack(&pack_files(&binary).unwrap()).unwrap(), binary);
+    }
+
+    #[test]
+    fn packed_archive_rejects_ambiguous_paths_lengths_order_and_trailing_bytes() {
+        fn raw(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+            let mut b = PACK_MAGIC.to_vec();
+            b.extend_from_slice(&(entries.len() as u64).to_be_bytes());
+            for (name, payload) in entries {
+                b.extend_from_slice(&(name.len() as u32).to_be_bytes());
+                b.extend_from_slice(name);
+                b.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+                b.extend_from_slice(payload);
+            }
+            b
+        }
+        for name in [
+            b"legacy/../bad".as_slice(),
+            b"legacy//bad",
+            b"legacy/./bad",
+            b"legacy/",
+            b"legacy/line\nbreak",
+            b"legacy/\\bad",
+            b"/legacy/a",
+            b"legacy/\xff",
+        ] {
+            assert!(unpack(&raw(&[(name, b"x")])).is_err(), "{name:?}");
+        }
+        assert!(unpack(&raw(&[(b"legacy/a", b"1"), (b"legacy/a", b"2")])).is_err());
+        assert!(unpack(&raw(&[(b"legacy/b", b"1"), (b"legacy/a", b"2")])).is_err());
+        assert!(unpack(&raw(&[])).is_err());
+        let good = raw(&[(b"legacy/a", b"binary\0payload")]);
+        for n in 0..good.len() {
+            assert!(unpack(&good[..n]).is_err(), "prefix {n}");
+        }
+        let mut extra = good.clone();
+        extra.push(0);
+        assert!(unpack(&extra).is_err());
+        let mut enormous = raw(&[(b"legacy/a", b"")]);
+        let len_at = PACK_MAGIC.len() + 8 + 4 + b"legacy/a".len();
+        enormous[len_at..len_at + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(unpack(&enormous).is_err());
+        let mut count = PACK_MAGIC.to_vec();
+        count.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(unpack(&count).is_err());
+        let files = BTreeMap::from([("legacy/../bad".into(), vec![1])]);
+        assert!(pack_files(&files).is_err());
+    }
+
+    #[test]
+    fn verified_seed_preserves_clocks_tombstones_and_explicit_remote_ownership() {
+        use super::super::{
+            coordination::{self, Action, CoordinationState},
+            protocol::{Command, OutcomeStatus, Request},
+        };
+        let mut inputs = ttl_history();
+        inputs.extend([
+            input(
+                "006",
+                "create",
+                "a",
+                "2026-01-01T00:00:06Z",
+                json!({"entity":"bd-deleted","set":{"title":"gone"}}),
+            ),
+            input(
+                "007",
+                "delete",
+                "a",
+                "2026-01-01T00:00:07Z",
+                json!({"entity":"bd-deleted"}),
+            ),
+            input(
+                "008",
+                "session_start",
+                "a",
+                "2026-01-01T00:00:08Z",
+                json!({"session_id":"sess-old","ttl_s":1}),
+            ),
+            input(
+                "009",
+                "session_end",
+                "a",
+                "2026-01-01T00:00:09Z",
+                json!({"session_id":"sess-old"}),
+            ),
+            input(
+                "010",
+                "reserve_open",
+                "a",
+                "2026-01-01T00:00:10Z",
+                json!({"reservation_id":"rv-old","entity":"bd-task","paths":["src/old"],"ttl_s":1}),
+            ),
+            input(
+                "011",
+                "reserve_close",
+                "a",
+                "2026-01-01T00:00:10.5Z",
+                json!({"reservation_id":"rv-old"}),
+            ),
+        ]);
+        let a = archive(&inputs, None);
+        let original_pack = pack_files(&a.files).unwrap();
+        let verified = verify_profile(&a.files, &a.digest, "pinned-fixture").unwrap();
+        for id in ["006", "007", "008", "009", "010", "011"] {
+            assert!(verified.state.was_accepted(id), "{id}");
+        }
+        let mut state = CoordinationState::from_legacy(verified).unwrap();
+        let initial = state.view().unwrap();
+        assert_eq!(initial["tasks"]["bd-task"]["clock"]["title"], "001");
+        assert!(initial["tasks"].get("bd-deleted").is_none());
+        for field in ["sessions", "claims", "reservations"] {
+            assert_eq!(initial[field], json!({}));
+        }
+        let mut seq = 0;
+        let mut step = |session: &str, action: Action| {
+            seq += 1;
+            let req = Request {
+                version: 1,
+                request_id: format!("new-{seq}"),
+                actor: "a".into(),
+                session: session.into(),
+                timestamp: "2026-10-20T00:00:00Z".into(),
+                command: Command::Coordination { action },
+            };
+            let p = coordination::plan(&state, &req, seq).unwrap();
+            state = p.next_state;
+            p.outcome
+        };
+        assert_eq!(
+            step(
+                "sess-old",
+                Action::SessionStart {
+                    label: "no reuse".into()
+                }
+            )
+            .result["code"],
+            "session_exists"
+        );
+        assert_eq!(
+            step(
+                "sess-new",
+                Action::SessionStart {
+                    label: "fresh".into()
+                }
+            )
+            .status,
+            OutcomeStatus::Accepted
+        );
+        assert_eq!(
+            step(
+                "sess-new",
+                Action::TaskCreate {
+                    id: "bd-deleted".into(),
+                    title: "reuse".into(),
+                    body: "".into(),
+                    priority: 1,
+                    assignee: None
+                }
+            )
+            .result["code"],
+            "task_exists"
+        );
+        assert_eq!(
+            step(
+                "sess-new",
+                Action::TaskPatch {
+                    id: "bd-task".into(),
+                    set: BTreeMap::from([("title".into(), json!("new title"))]),
+                    expect: BTreeMap::from([("title".into(), Some("001".into()))])
+                }
+            )
+            .status,
+            OutcomeStatus::Accepted
+        );
+        assert_eq!(
+            step(
+                "sess-new",
+                Action::TaskPatch {
+                    id: "bd-task".into(),
+                    set: BTreeMap::from([("title".into(), json!("stale"))]),
+                    expect: BTreeMap::from([("title".into(), Some("001".into()))])
+                }
+            )
+            .result["code"],
+            "stale_field"
+        );
+        assert_eq!(
+            step(
+                "sess-new",
+                Action::ReservationAcquire {
+                    id: "bd-task".into(),
+                    reservation: "rv-old".into(),
+                    paths: vec!["src/old".into()]
+                }
+            )
+            .result["code"],
+            "reservation_exists"
+        );
+        let status_clock = "001".to_owned();
+        assert_eq!(
+            step(
+                "sess-new",
+                Action::Begin(coordination::lifecycle::Begin {
+                    id: "bd-task".into(),
+                    expect_status: status_clock,
+                    paths: vec!["src/new".into()],
+                    reservation: Some("rv-old".into()),
+                    note: None
+                })
+            )
+            .result["code"],
+            "reservation_exists"
+        );
+        assert_eq!(
+            step(
+                "sess-new",
+                Action::ClaimAcquire {
+                    id: "bd-task".into()
+                }
+            )
+            .status,
+            OutcomeStatus::Accepted
+        );
+        assert_eq!(
+            state.view().unwrap()["tasks"]["bd-task"]["title"],
+            "new title"
+        );
+        assert_eq!(
+            state.view().unwrap()["claims"]["bd-task"]["session"],
+            "sess-new"
+        );
+        assert_eq!(pack_files(&a.files).unwrap(), original_pack);
+        // The private verified seed cannot be injected through serde input.
+        let fake =
+            json!({"sessions":{},"claims":{},"reservations":{},"task_entries":[],"legacy_seed":{}});
+        assert!(serde_json::from_value::<CoordinationState>(fake).is_err());
+    }
+
+    #[test]
+    fn development_seed_refuses_adapter_names_and_unsupported_task_ids() {
+        use super::super::coordination::CoordinationState;
+        for inputs in [
+            vec![input(
+                "gaop-reserved",
+                "unknown_future",
+                "a",
+                "2026-01-01T00:00:00Z",
+                json!({}),
+            )],
+            vec![input(
+                "001",
+                "create",
+                "a",
+                "2026-01-01T00:00:00Z",
+                json!({"entity":"custom","set":{"title":"custom"}}),
+            )],
+        ] {
+            let a = archive(&inputs, None);
+            let verified = verify_profile(&a.files, &a.digest, "pinned-fixture").unwrap();
+            assert!(CoordinationState::from_legacy(verified).is_err());
+        }
     }
 }

@@ -4,6 +4,7 @@
 //! Empty stores can explicitly bootstrap or connect; existing local histories
 //! require a separately qualified migration. Connected stores fence local writes.
 
+pub mod backup;
 pub mod cache;
 pub mod cli;
 pub mod client;

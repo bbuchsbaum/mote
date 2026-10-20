@@ -50,6 +50,7 @@ pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
         &cli.command,
         Command::Authority {
             cmd: AuthorityCmd::InitGit { .. }
+                | AuthorityCmd::MigrateGit { .. }
                 | AuthorityCmd::Connect { .. }
                 | AuthorityCmd::Resume { .. }
                 | AuthorityCmd::Refresh
@@ -733,6 +734,29 @@ fn authority_command(cli: &Cli, store: &crate::repo::Store, cmd: &AuthorityCmd) 
             );
             Ok(0)
         }
+        AuthorityCmd::MigrateGit {
+            remote,
+            branch,
+            backup,
+            cleanup_start,
+        } => {
+            super::legacy_profile::current()?;
+            let (transport, _scratch) = transport(store, remote, branch)?;
+            let descriptor = connection::migrate(
+                store,
+                transport,
+                &connection::default_cache_root(store),
+                &connection::MigrationOptions {
+                    backup: backup.clone(),
+                    cleanup_start: *cleanup_start,
+                },
+            )?;
+            print_value(
+                cli.json,
+                json!({"operation":"migrate","descriptor":descriptor,"backup":backup}),
+            );
+            Ok(0)
+        }
         AuthorityCmd::Connect { remote, branch } => {
             let (transport, _scratch) = transport(store, remote, branch)?;
             let descriptor =
@@ -1072,6 +1096,25 @@ fn remote_history(
     let snapshot = client.refresh()?;
     let view = snapshot.state.coordination.view()?;
     let mut entries = Vec::new();
+    if let Some(pack) = snapshot.files.get("legacy.pack") {
+        // The fresh snapshot already validated this exact root archive and its
+        // pinned replay. Retain source positions instead of fabricating remote
+        // request IDs or ordering old events by timestamp.
+        let files = super::legacy::unpack(pack)?;
+        let decisions: Value = super::protocol::decode(&files["legacy/decisions.json"])?;
+        for input in decisions["inputs"]
+            .as_array()
+            .ok_or_else(|| MoteError::Invalid("invalid validated legacy history".into()))?
+        {
+            if let Some(events) = input["entity_events"][id].as_array() {
+                for (event_index, event) in events.iter().enumerate() {
+                    if include_rejected || event["accepted"] == Value::Bool(true) {
+                        entries.push(json!({"phase":"legacy","ordinal":input["ordinal"],"event_index":event_index,"event":event}));
+                    }
+                }
+            }
+        }
+    }
     for (path, bytes) in &snapshot.files {
         if !path.starts_with("transactions/") {
             continue;
@@ -1096,7 +1139,7 @@ fn remote_history(
                     || value["transition"]["task"].as_str() == Some(id)
             });
         if touches {
-            entries.push(json!({"sequence":tx.sequence,"request_id":tx.request.request_id,"actor":tx.request.actor,"session":tx.request.session,"timestamp":tx.request.timestamp,"outcome":tx.outcome,"effects":tx.effects}));
+            entries.push(json!({"phase":"remote","sequence":tx.sequence,"request_id":tx.request.request_id,"actor":tx.request.actor,"session":tx.request.session,"timestamp":tx.request.timestamp,"outcome":tx.outcome,"effects":tx.effects}));
         }
     }
     print_value(cli.json, view_with_data(&snapshot, json!(entries)));

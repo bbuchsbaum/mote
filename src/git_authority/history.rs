@@ -63,8 +63,8 @@ pub fn validate_chain(
     let Some(root) = commits.first() else {
         return invalid("authority history is empty");
     };
-    if !valid_oid(&root.oid) || !root.parents.is_empty() || root.files.len() != 1 {
-        return invalid("invalid authority root; migrated roots are not supported yet");
+    if !valid_oid(&root.oid) || !root.parents.is_empty() {
+        return invalid("invalid authority root");
     }
     let blob = root
         .files
@@ -76,6 +76,21 @@ pub fn validate_chain(
     if encode(&manifest)? != blob.bytes {
         return invalid("authority manifest is not canonical JSON");
     }
+    let mut state = SyntheticState::default();
+    let expected_root_files = if manifest.legacy_digest.is_some() {
+        BTreeSet::from(["manifest.json", "legacy.pack"])
+    } else {
+        BTreeSet::from(["manifest.json"])
+    };
+    if root
+        .files
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected_root_files
+    {
+        return invalid("authority root has an invalid file set");
+    }
     if let Some(binding) = binding {
         if binding.version != 1
             || binding.root != root.oid
@@ -85,9 +100,21 @@ pub fn validate_chain(
             return invalid("authority root, store, generation or protocol differs from binding");
         }
     }
+    if let Some(digest) = &manifest.legacy_digest {
+        let pack = root
+            .files
+            .get("legacy.pack")
+            .ok_or_else(|| crate::MoteError::Invalid("migrated root has no legacy pack".into()))?;
+        check_blob(pack)?;
+        let archive = super::legacy::unpack(&pack.bytes)?;
+        let verified = super::legacy::verify(&archive, digest)?;
+        if verified.export.source.store_id != manifest.store_id {
+            return invalid("migrated archive source store differs from authority manifest");
+        }
+        state.coordination = super::coordination::CoordinationState::from_legacy(verified)?;
+    }
     let mut seen = BTreeSet::from([root.oid.as_str()]);
     let mut previous = root;
-    let mut state = SyntheticState::default();
     let mut receipts = BTreeMap::new();
     for commit in &commits[1..] {
         if !valid_oid(&commit.oid)

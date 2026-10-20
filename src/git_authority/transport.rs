@@ -21,7 +21,7 @@ use std::{
 };
 
 use super::{
-    connection::RootArtifact,
+    connection::{RootArtifact, RootBlob},
     protocol::{Manifest, encode},
 };
 use crate::{MoteError, MoteResult};
@@ -170,6 +170,9 @@ impl GitTransport {
 
     /// Durable identity and journals must survive disposal of transport scratch.
     pub(crate) fn checked_cache_path(&self, path: &Path) -> MoteResult<PathBuf> {
+        self.checked_durable_path(path)
+    }
+    pub(crate) fn checked_durable_path(&self, path: &Path) -> MoteResult<PathBuf> {
         let mut ancestor = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -189,7 +192,7 @@ impl GitTransport {
         }
         if resolved.starts_with(&self.scratch) || self.scratch.starts_with(&resolved) {
             return Err(MoteError::Invalid(
-                "durable authority cache must be disjoint from disposable Git scratch".into(),
+                "durable authority data must be disjoint from disposable Git scratch".into(),
             ));
         }
         Ok(resolved)
@@ -385,11 +388,39 @@ impl GitTransport {
 
     pub fn capture_root(&self, manifest: &Manifest) -> MoteResult<RootArtifact> {
         manifest.validate()?;
+        if manifest.legacy_digest.is_some() {
+            return Err(MoteError::Invalid(
+                "migrated roots require a retained legacy pack".into(),
+            ));
+        }
+        self.capture_root_files(manifest, None)
+    }
+
+    pub fn capture_migrated_root(
+        &self,
+        manifest: &Manifest,
+        legacy_pack: &[u8],
+    ) -> MoteResult<RootArtifact> {
+        manifest.validate()?;
+        let digest = manifest.legacy_digest.as_deref().ok_or_else(|| {
+            MoteError::Invalid("ordinary roots must not retain a legacy pack".into())
+        })?;
+        let archive = super::legacy::unpack(legacy_pack)?;
+        super::legacy::verify(&archive, digest)?;
+        self.capture_root_files(manifest, Some(legacy_pack))
+    }
+
+    fn capture_root_files(
+        &self,
+        manifest: &Manifest,
+        legacy_pack: Option<&[u8]>,
+    ) -> MoteResult<RootArtifact> {
         let manifest_bytes = encode(manifest)?;
-        let commit_oid = self.create_commit(
-            None,
-            &BTreeMap::from([("manifest.json".into(), manifest_bytes.clone())]),
-        )?;
+        let mut files = BTreeMap::from([("manifest.json".into(), manifest_bytes.clone())]);
+        if let Some(pack) = legacy_pack {
+            files.insert("legacy.pack".into(), pack.to_vec());
+        }
+        let commit_oid = self.create_commit(None, &files)?;
         let commit_bytes = self.git_bytes(
             "read root commit",
             ["cat-file", "commit", &commit_oid],
@@ -412,6 +443,22 @@ impl GitTransport {
             .trim()
             .to_owned();
         self.validate_oid(&manifest_oid)?;
+        let legacy_pack = if legacy_pack.is_some() {
+            let oid = self
+                .git_text(
+                    "read root legacy pack",
+                    ["rev-parse", &format!("{commit_oid}:legacy.pack")],
+                )?
+                .trim()
+                .to_owned();
+            self.validate_oid(&oid)?;
+            Some(RootBlob {
+                oid,
+                bytes: files["legacy.pack"].clone(),
+            })
+        } else {
+            None
+        };
         let artifact = RootArtifact {
             object_format: if self.oid_len == 40 { "sha1" } else { "sha256" }.into(),
             manifest_oid,
@@ -420,6 +467,7 @@ impl GitTransport {
             tree_bytes,
             commit_oid,
             commit_bytes,
+            legacy_pack,
         };
         self.import_root(&artifact)?;
         Ok(artifact)
@@ -432,11 +480,15 @@ impl GitTransport {
                 "root artifact object format differs from transport".into(),
             ));
         }
-        for (kind, oid, bytes) in [
+        let mut objects = vec![
             ("blob", &artifact.manifest_oid, &artifact.manifest_bytes),
             ("tree", &artifact.tree_oid, &artifact.tree_bytes),
             ("commit", &artifact.commit_oid, &artifact.commit_bytes),
-        ] {
+        ];
+        if let Some(pack) = &artifact.legacy_pack {
+            objects.push(("blob", &pack.oid, &pack.bytes));
+        }
+        for (kind, oid, bytes) in objects {
             let got = self.git_bytes(
                 "import retained root object",
                 ["hash-object", "-w", "-t", kind, "--stdin"],
@@ -452,13 +504,30 @@ impl GitTransport {
             }
         }
         let commit = self.commit(&artifact.commit_oid)?;
+        let manifest: Manifest = super::protocol::decode(&artifact.manifest_bytes)?;
+        let expected_files = if let Some(pack) = &artifact.legacy_pack {
+            BTreeMap::from([
+                (
+                    "manifest.json".to_owned(),
+                    (&artifact.manifest_oid, &artifact.manifest_bytes),
+                ),
+                ("legacy.pack".to_owned(), (&pack.oid, &pack.bytes)),
+            ])
+        } else {
+            BTreeMap::from([(
+                "manifest.json".to_owned(),
+                (&artifact.manifest_oid, &artifact.manifest_bytes),
+            )])
+        };
         if !commit.parents.is_empty()
-            || commit.files.len() != 1
-            || commit.files.get("manifest.json").is_none_or(|b| {
-                b.mode != "100644"
-                    || b.oid != artifact.manifest_oid
-                    || b.bytes != artifact.manifest_bytes
+            || commit.files.len() != expected_files.len()
+            || expected_files.iter().any(|(path, (oid, bytes))| {
+                commit
+                    .files
+                    .get(path)
+                    .is_none_or(|b| b.mode != "100644" || b.oid != **oid || b.bytes != **bytes)
             })
+            || (manifest.legacy_digest.is_some()) != artifact.legacy_pack.is_some()
         {
             return Err(MoteError::Invalid(
                 "retained root artifact does not describe an authority root".into(),
@@ -476,6 +545,7 @@ impl GitTransport {
                 "retained root tree differs from commit".into(),
             ));
         }
+        super::history::validate_chain(&[commit], None, None)?;
         Ok(())
     }
 

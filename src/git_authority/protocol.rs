@@ -28,6 +28,13 @@ pub const LIFECYCLE_CAPABILITIES: [&str; 4] = [
     "coordination-lifecycle-v1",
     "explicit-release-v1",
 ];
+pub const MIGRATED_ROOT_CAPABILITIES: [&str; 5] = [
+    "canonical-transactions-v1",
+    "coordination-core-v1",
+    "coordination-lifecycle-v1",
+    "explicit-release-v1",
+    "legacy-packed-v1",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,6 +73,7 @@ impl Manifest {
     pub fn is_coordination(&self) -> bool {
         self.capabilities == COORDINATION_CAPABILITIES
             || self.capabilities == LIFECYCLE_CAPABILITIES
+            || self.capabilities == MIGRATED_ROOT_CAPABILITIES
     }
 
     pub fn lifecycle(store_id: String) -> Self {
@@ -74,12 +82,27 @@ impl Manifest {
         manifest
     }
 
+    /// A lifecycle root whose initial coordination state is pinned in a
+    /// retained legacy archive. The archive digest is part of the manifest,
+    /// while its bytes live in the root's `legacy.pack` blob.
+    pub fn migrated(store_id: String, legacy_digest: String) -> Self {
+        let mut manifest = Self::lifecycle(store_id);
+        manifest.capabilities = MIGRATED_ROOT_CAPABILITIES
+            .iter()
+            .map(|x| (*x).into())
+            .collect();
+        manifest.legacy_digest = Some(legacy_digest);
+        manifest
+    }
+
     pub fn allows(&self, command: &Command) -> MoteResult<()> {
         self.validate()?;
         match (self.is_coordination(), command) {
             (false, Command::SyntheticCas { .. }) => Ok(()),
             (true, Command::Coordination { action })
-                if !action.is_lifecycle() || self.capabilities == LIFECYCLE_CAPABILITIES =>
+                if !action.is_lifecycle()
+                    || self.capabilities == LIFECYCLE_CAPABILITIES
+                    || self.capabilities == MIGRATED_ROOT_CAPABILITIES =>
             {
                 Ok(())
             }
@@ -106,14 +129,26 @@ impl Manifest {
         if self.capabilities != CAPABILITIES
             && self.capabilities != COORDINATION_CAPABILITIES
             && self.capabilities != LIFECYCLE_CAPABILITIES
+            && self.capabilities != MIGRATED_ROOT_CAPABILITIES
         {
             return invalid("unsupported or noncanonical Git authority capabilities");
         }
-        if self.legacy_digest.is_some() {
-            return invalid("migrated roots require a reviewed legacy profile; not supported yet");
+        if self.capabilities == MIGRATED_ROOT_CAPABILITIES {
+            if !self.legacy_digest.as_deref().is_some_and(valid_digest) {
+                return invalid("migrated root requires a lowercase legacy archive digest");
+            }
+        } else if self.legacy_digest.is_some() {
+            return invalid("non-migrated roots must not carry a legacy archive digest");
         }
         Ok(())
     }
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
