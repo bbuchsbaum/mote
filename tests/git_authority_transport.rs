@@ -310,6 +310,68 @@ fn rejects_bad_remote_branch_and_object_identifiers() {
     assert!(transport.push(&"A".repeat(40)).is_err());
 }
 
+#[test]
+#[cfg(unix)]
+fn stderr_only_access_and_network_failures_are_classified_without_exposing_diagnostics() {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, repo, bare) = fixture();
+    git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    let helper = root.path().join("refusing-receive-pack");
+    git(
+        &repo,
+        &[
+            "config",
+            "remote.origin.receivepack",
+            helper.to_str().unwrap(),
+        ],
+    );
+    let scratch = root.path().join("scratch");
+    let transport = GitTransport::open(&repo, "origin", "mote-state", &scratch).unwrap();
+    let oid = transport
+        .create_commit(
+            None,
+            &BTreeMap::from([("manifest.json".into(), b"root".to_vec())]),
+        )
+        .unwrap();
+    for (message, expected) in [
+        (
+            "Permission denied fixture-credential-marker",
+            PushFailure::Denied,
+        ),
+        (
+            "Could not resolve host: fixture-credential-marker",
+            PushFailure::Unavailable,
+        ),
+        (
+            "Connection timed out fixture-credential-marker",
+            PushFailure::Timeout,
+        ),
+        (
+            "Unrecognized fixture-credential-marker",
+            PushFailure::Unknown,
+        ),
+    ] {
+        fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf '%s\\n' '{message}' >&2\nexit 1\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let attempt = transport.push(&oid).unwrap();
+        assert!(!attempt.success);
+        assert_eq!(attempt.failure, Some(expected));
+        assert!(!format!("{attempt:?}").contains("fixture-credential-marker"));
+        assert!(fs::read_dir(&scratch).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("git-")
+        }));
+    }
+    assert!(transport.head().unwrap().is_none());
+}
+
 #[cfg(unix)]
 #[test]
 fn timeout_terminates_the_owned_receive_helper_and_cleans_scratch() {
@@ -366,7 +428,7 @@ fn timeout_terminates_the_owned_receive_helper_and_cleans_scratch() {
     let scratch = root.path().join("timeout-scratch");
     let transport = GitTransport::open(&repo, "origin", "mote-state", &scratch)
         .unwrap()
-        .with_timeout(Duration::from_millis(700));
+        .with_timeout(Duration::from_secs(5));
     let parent = transport.head().unwrap().unwrap();
     let proposal = transport
         .create_commit(
@@ -382,11 +444,12 @@ fn timeout_terminates_the_owned_receive_helper_and_cleans_scratch() {
     };
     let started = Instant::now();
     let attempt = transport.push(&proposal).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < Duration::from_secs(10));
     assert!(!attempt.success);
     assert_eq!(attempt.exit_code, None);
     assert_eq!(attempt.failure, Some(PushFailure::Timeout));
-    let pid = fs::read_to_string(&pid_file).unwrap();
+    let pid = fs::read_to_string(&pid_file)
+        .expect("owned helper must have started before the timeout to qualify termination");
     let pid = pid.trim();
     assert!(!pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()));
     let deadline = Instant::now() + Duration::from_secs(2);

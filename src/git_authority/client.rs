@@ -1,4 +1,4 @@
-//! Experimental local client for the reviewed synthetic transaction profile.
+//! Experimental local client for the reviewed Git transaction profiles.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -65,7 +65,7 @@ pub struct Diagnostic {
 
 impl Client {
     /// Explicitly connect a cache to an existing authority. This does not
-    /// initialize a branch, migrate a task store, or enable real task commands.
+    /// initialize a branch, migrate a task store, or enable CLI task commands.
     pub fn connect(transport: GitTransport, cache_root: &Path) -> MoteResult<Self> {
         let cache = Cache::open(cache_root)?;
         let client = Self { transport, cache };
@@ -173,6 +173,9 @@ impl Client {
             };
             if let Some(receipt) = snapshot.receipts.get(&request.request_id) {
                 return confirmed(&request, receipt, true);
+            }
+            if let Err(error) = snapshot.manifest.allows(&request.command) {
+                return uncertain_or_error(&journal, error, "profile");
             }
             let transaction =
                 match Transaction::prepare(&snapshot.state, &snapshot.head, request.clone()) {

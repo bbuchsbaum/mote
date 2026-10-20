@@ -1,4 +1,4 @@
-//! Pure, deterministic planning for the initial synthetic command profile.
+//! Pure, deterministic dispatch for the reviewed authority profiles.
 
 use std::collections::BTreeMap;
 
@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::protocol::{
-    Command, Effect, EffectKind, Outcome, OutcomeStatus, Request, TRANSACTION_SCHEMA, Transaction,
-    invalid, valid_oid,
+    Command, Effect, Outcome, OutcomeStatus, Request, TRANSACTION_SCHEMA, Transaction, invalid,
+    valid_oid,
 };
 use crate::errors::MoteResult;
 
@@ -19,10 +19,14 @@ pub struct Cell {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SyntheticState {
+pub struct AuthorityState {
     pub sequence: u64,
     pub values: BTreeMap<String, Cell>,
+    pub coordination: super::coordination::CoordinationState,
 }
+
+/// Compatibility name for development clients of the initial synthetic API.
+pub type SyntheticState = AuthorityState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -38,7 +42,26 @@ pub fn plan(state: &SyntheticState, request: &Request) -> MoteResult<Plan> {
     };
     let mut next_state = state.clone();
     next_state.sequence = sequence;
-    let Command::SyntheticCas { changes } = &request.command;
+    let changes = match &request.command {
+        Command::Coordination { .. } => {
+            if !state.values.is_empty() {
+                return invalid("coordination profile cannot contain synthetic values");
+            }
+            let planned = super::coordination::plan(&state.coordination, request, sequence)?;
+            next_state.coordination = planned.next_state;
+            return Ok(Plan {
+                effects: planned.effects,
+                outcome: planned.outcome,
+                next_state,
+            });
+        }
+        Command::SyntheticCas { changes } => {
+            if state.coordination != super::coordination::CoordinationState::default() {
+                return invalid("synthetic profile cannot contain coordination state");
+            }
+            changes
+        }
+    };
     for (index, change) in changes.iter().enumerate() {
         let actual = state.values.get(&change.key).map(|v| &v.token);
         if actual != change.expected.as_ref() {
@@ -73,11 +96,10 @@ pub fn plan(state: &SyntheticState, request: &Request) -> MoteResult<Plan> {
             None
         };
         results.push(json!({"key":change.key,"token":token}));
-        effects.push(Effect {
+        effects.push(Effect::SyntheticSet {
             effect_id,
             sequence,
             index: index as u32,
-            kind: EffectKind::SyntheticSet,
             key: change.key.clone(),
             value: change.value.clone(),
         });

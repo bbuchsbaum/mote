@@ -50,6 +50,14 @@ pub struct PushAttempt {
     pub failure: Option<PushFailure>,
 }
 
+// Diagnostics stay private: URLs and authentication helpers may write secrets.
+// Only a bounded category is ever returned to the caller.
+struct GitOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GitTransport {
     repo: PathBuf,
@@ -319,10 +327,11 @@ impl GitTransport {
         }
         push_args.extend([self.remote.as_str(), refspec.as_str()]);
         match self.run_git("push authority reference", push_args, None, false) {
-            Ok((status, porcelain)) => Ok(PushAttempt {
-                success: status.success(),
-                exit_code: status.code(),
-                failure: (!status.success()).then(|| classify_push_failure(&porcelain)),
+            Ok(output) => Ok(PushAttempt {
+                success: output.status.success(),
+                exit_code: output.status.code(),
+                failure: (!output.status.success())
+                    .then(|| classify_push_failure(&output.stdout, &output.stderr)),
             }),
             Err(MoteError::Other(detail)) if detail.contains("timed out") => Ok(PushAttempt {
                 success: false,
@@ -365,9 +374,9 @@ impl GitTransport {
         args: impl IntoIterator<Item = &'a str>,
         input: Option<&[u8]>,
     ) -> MoteResult<Vec<u8>> {
-        let (status, stdout) = self.run_git(operation, args, input, true)?;
-        debug_assert!(status.success());
-        Ok(stdout)
+        let output = self.run_git(operation, args, input, true)?;
+        debug_assert!(output.status.success());
+        Ok(output.stdout)
     }
 
     fn run_git<'a>(
@@ -376,7 +385,7 @@ impl GitTransport {
         args: impl IntoIterator<Item = &'a str>,
         input: Option<&[u8]>,
         checked: bool,
-    ) -> MoteResult<(ExitStatus, Vec<u8>)> {
+    ) -> MoteResult<GitOutput> {
         let marker = format!("{}-{}", std::process::id(), random_suffix());
         let stdout_path = self.scratch.join(format!("git-{marker}.stdout"));
         let stderr_path = self.scratch.join(format!("git-{marker}.stderr"));
@@ -418,6 +427,7 @@ impl GitTransport {
         command
             .args(&args)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
             .env("GIT_OBJECT_DIRECTORY", &self.objects)
             .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", self.source_objects()?)
             .env("GIT_INDEX_FILE", &self.index)
@@ -460,8 +470,10 @@ impl GitTransport {
             }
             thread::sleep(Duration::from_millis(10));
         };
-        let bytes = fs::read(&stdout_path)?;
+        let bytes =
+            (|| -> std::io::Result<_> { Ok((fs::read(&stdout_path)?, fs::read(&stderr_path)?)) })();
         cleanup(&[&stdout_path, &stderr_path, &stdin_path]);
+        let (stdout, stderr) = bytes?;
         if checked && !status.success() {
             return Err(MoteError::Rejected(format!(
                 "Git {operation} failed (exit {})",
@@ -470,7 +482,11 @@ impl GitTransport {
                     .map_or_else(|| "signal".into(), |n| n.to_string())
             )));
         }
-        Ok((status, bytes))
+        Ok(GitOutput {
+            status,
+            stdout,
+            stderr,
+        })
     }
 
     fn source_objects(&self) -> MoteResult<OsString> {
@@ -570,17 +586,47 @@ impl GitTransport {
     }
 }
 
-fn classify_push_failure(porcelain: &[u8]) -> PushFailure {
+fn classify_push_failure(porcelain: &[u8], diagnostics: &[u8]) -> PushFailure {
     let text = String::from_utf8_lossy(porcelain).to_ascii_lowercase();
+    let diagnostic = String::from_utf8_lossy(diagnostics).to_ascii_lowercase();
     if (text.contains("[remote rejected]") && text.contains("failed to update ref"))
         || text.contains("[rejected]")
     {
         PushFailure::Contention
     } else if text.contains("[remote rejected]")
         || text.contains("hook declined")
-        || text.contains("permission denied")
+        || [
+            "permission denied",
+            "authentication failed",
+            "access denied",
+            "could not read username",
+            "requested url returned error: 401",
+            "requested url returned error: 403",
+            "authorization failed",
+        ]
+        .iter()
+        .any(|pattern| diagnostic.contains(pattern))
     {
         PushFailure::Denied
+    } else if ["connection timed out", "operation timed out"]
+        .iter()
+        .any(|pattern| diagnostic.contains(pattern))
+    {
+        PushFailure::Timeout
+    } else if [
+        "could not resolve host",
+        "could not resolve hostname",
+        "connection refused",
+        "network is unreachable",
+        "connection reset",
+        "connection closed",
+        "does not appear to be a git repository",
+        "ssl certificate problem",
+    ]
+    .iter()
+    .any(|pattern| diagnostic.contains(pattern))
+    {
+        PushFailure::Unavailable
     } else {
         PushFailure::Unknown
     }

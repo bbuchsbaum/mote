@@ -115,6 +115,7 @@ pub fn validate_chain(
         let blob = &commit.files[&path];
         check_blob(blob)?;
         let transaction: Transaction = decode(&blob.bytes)?;
+        manifest.allows(&transaction.request.command)?;
         if encode(&transaction)? != blob.bytes {
             return invalid("authority transaction is not canonical JSON");
         }

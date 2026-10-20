@@ -17,6 +17,11 @@ pub const CAPABILITIES: [&str; 3] = [
     "explicit-release-v1",
     "synthetic-cas-v1",
 ];
+pub const COORDINATION_CAPABILITIES: [&str; 3] = [
+    "canonical-transactions-v1",
+    "coordination-core-v1",
+    "explicit-release-v1",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +47,28 @@ impl Manifest {
         }
     }
 
+    /// Development-only coordination core; never a synthetic profile upgrade.
+    pub fn coordination(store_id: String) -> Self {
+        let mut manifest = Self::new(store_id);
+        manifest.capabilities = COORDINATION_CAPABILITIES
+            .iter()
+            .map(|x| (*x).into())
+            .collect();
+        manifest
+    }
+
+    pub fn is_coordination(&self) -> bool {
+        self.capabilities == COORDINATION_CAPABILITIES
+    }
+
+    pub fn allows(&self, command: &Command) -> MoteResult<()> {
+        self.validate()?;
+        match (self.is_coordination(), command) {
+            (false, Command::SyntheticCas { .. }) | (true, Command::Coordination { .. }) => Ok(()),
+            _ => invalid("command is not supported by the immutable authority profile"),
+        }
+    }
+
     pub fn validate(&self) -> MoteResult<()> {
         if self.schema != MANIFEST_SCHEMA {
             return invalid("unsupported Git authority schema");
@@ -58,7 +85,7 @@ impl Manifest {
         if self.generation == 0 || self.ownership != "explicit-release-v1" {
             return invalid("unsupported authority generation or ownership policy");
         }
-        if self.capabilities != CAPABILITIES {
+        if self.capabilities != CAPABILITIES && self.capabilities != COORDINATION_CAPABILITIES {
             return invalid("unsupported or noncanonical Git authority capabilities");
         }
         if self.legacy_digest.is_some() {
@@ -98,6 +125,7 @@ impl Request {
             .parse::<jiff::Timestamp>()
             .map_err(|_| MoteError::Invalid("invalid request timestamp".into()))?;
         match &self.command {
+            Command::Coordination { action } => super::coordination::validate_action(action)?,
             Command::SyntheticCas { changes } => {
                 if changes.is_empty() || changes.len() > 64 {
                     return invalid("synthetic CAS requires 1-64 changes");
@@ -124,6 +152,8 @@ impl Request {
 pub enum Command {
     #[serde(rename = "synthetic.cas")]
     SyntheticCas { changes: Vec<Change> },
+    #[serde(rename = "coordination")]
+    Coordination { action: super::coordination::Action },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,31 +167,64 @@ pub struct Change {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Effect {
-    pub effect_id: String,
-    pub sequence: u64,
-    pub index: u32,
-    pub kind: EffectKind,
-    pub key: String,
-    #[serde(deserialize_with = "required_option")]
-    pub value: Option<String>,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Effect {
+    SyntheticSet {
+        effect_id: String,
+        sequence: u64,
+        index: u32,
+        key: String,
+        #[serde(deserialize_with = "required_option")]
+        value: Option<String>,
+    },
+    TaskOp {
+        effect_id: String,
+        sequence: u64,
+        index: u32,
+        op: Value,
+    },
+    Ownership {
+        effect_id: String,
+        sequence: u64,
+        index: u32,
+        transition: super::coordination::Transition,
+    },
 }
 
 impl Effect {
+    pub fn effect_id(&self) -> &str {
+        match self {
+            Self::SyntheticSet { effect_id, .. }
+            | Self::TaskOp { effect_id, .. }
+            | Self::Ownership { effect_id, .. } => effect_id,
+        }
+    }
+
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::SyntheticSet { sequence, .. }
+            | Self::TaskOp { sequence, .. }
+            | Self::Ownership { sequence, .. } => *sequence,
+        }
+    }
+
+    pub fn index(&self) -> u32 {
+        match self {
+            Self::SyntheticSet { index, .. }
+            | Self::TaskOp { index, .. }
+            | Self::Ownership { index, .. } => *index,
+        }
+    }
+
     /// An ordered adapter ID for legacy consumers that compare op IDs.
     pub fn adapter_id(&self) -> String {
         format!(
             "gaop-{:020}-{:06}-{}",
-            self.sequence, self.index, self.effect_id
+            self.sequence(),
+            self.index(),
+            self.effect_id()
         )
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EffectKind {
-    SyntheticSet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

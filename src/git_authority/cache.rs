@@ -116,7 +116,11 @@ impl Cache {
             sequence: snapshot.state.sequence,
             observed_at: crate::ids::format_rfc3339(jiff::Timestamp::now()),
             fresh: false,
-            values: serde_json::to_value(&snapshot.state.values)?,
+            values: if snapshot.manifest.is_coordination() {
+                snapshot.state.coordination.view()?
+            } else {
+                serde_json::to_value(&snapshot.state.values)?
+            },
         };
         atomic_write(&self.root.join("view.json"), &encode(&view)?)
     }

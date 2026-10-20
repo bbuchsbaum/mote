@@ -40,8 +40,13 @@ suffix. Generation is a positive integer. Capability arrays are sorted,
 duplicate-free, and exact: unknown required capabilities fail closed. Root OID
 is recorded in the local binding, not inside its own manifest. If present,
 `legacy_digest` is the full lowercase BLAKE3 digest of canonical `legacy.json`.
-The initial engine implements only the `synthetic-cas-v1` command profile and
-roots with `legacy_digest: null` and no legacy file. It refuses migrated roots
+The initial engine implements the `synthetic-cas-v1` command profile. The next
+development slice adds the separately reviewed [coordination core profile](git-authority-coordination.md).
+Its exact capability array is `["canonical-transactions-v1", "coordination-core-v1", "explicit-release-v1"]`.
+The immutable manifest selects exactly one of these arrays; a synthetic root
+never gains coordination semantics, and inactive-profile requests are refused
+before planning and during replay. Both profiles require roots with
+`legacy_digest: null` and no legacy file. The engine refuses migrated roots
 until GA-22 supplies a separately reviewed import schema and semantic profile.
 The migration requirements below remain mandatory for that later capability.
 
@@ -172,9 +177,9 @@ accepted recorded effect. The exact accepted outcome is:
 For a deletion the result token is null. Result entries retain input order.
 Digest/identity mismatch is a submission error and never replaces an existing
 receipt. Parent sequence plus one supplies each effect's sequence; an empty
-root has sequence zero. No other command/profile is accepted in this initial
-engine. Ordinary task/session ownership is added through later reviewed
-profiles, with equally explicit schemas and outcome vectors.
+root has sequence zero. No other command is accepted under the synthetic
+profile. Ordinary task/session ownership is defined by the separate coordination
+core contract and its vectors; its state is never mixed with synthetic entries.
 
 The transaction's exact required fields are `schema`, `sequence`, `parent`,
 `request`, `request_digest`, `effects`, and `outcome`. OIDs are lowercase hex

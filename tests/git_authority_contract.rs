@@ -44,6 +44,7 @@ fn transition_vectors_match_effects_results_and_final_state() {
         let state = SyntheticState {
             sequence: vector["sequence"].as_u64().unwrap() - 1,
             values: serde_json::from_value(vector["parent_state"].clone()).unwrap(),
+            ..Default::default()
         };
         let planned = plan(&state, &request).unwrap();
         assert_eq!(
@@ -120,7 +121,10 @@ fn semantic_validator_refuses_false_rejection_missing_effect_and_changed_intent(
     changed.request.actor = "another-actor".into();
     assert!(changed.validate(&state, &transaction.parent).is_err());
     let mut wrong_position = transaction.clone();
-    wrong_position.effects[0].sequence = 2;
+    match &mut wrong_position.effects[0] {
+        mote::git_authority::protocol::Effect::SyntheticSet { sequence, .. } => *sequence = 2,
+        _ => panic!("synthetic fixture must retain its effect type"),
+    }
     assert!(
         wrong_position
             .validate(&state, &transaction.parent)
@@ -182,12 +186,12 @@ fn effect_identity_does_not_choose_chronological_order() {
         }))
         .unwrap();
         let p = plan(&state, &request).unwrap();
-        assert_eq!(p.effects[0].effect_id, v["effect_id"]);
+        assert_eq!(p.effects[0].effect_id(), v["effect_id"].as_str().unwrap());
         assert_eq!(p.effects[0].adapter_id(), v["adapter_id"]);
         effects.push(p.effects[0].clone());
         state = p.next_state;
     }
-    assert!(effects[0].effect_id > effects[1].effect_id);
+    assert!(effects[0].effect_id() > effects[1].effect_id());
     assert!(effects[0].adapter_id() < effects[1].adapter_id());
 }
 
@@ -197,6 +201,7 @@ fn sequence_overflow_and_invalid_parent_fail_without_effects() {
     let state = SyntheticState {
         sequence: u64::MAX,
         values: BTreeMap::<String, Cell>::new(),
+        ..Default::default()
     };
     assert!(plan(&state, &request).is_err());
     assert!(Transaction::prepare(&SyntheticState::default(), "bad", request).is_err());
