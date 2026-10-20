@@ -25,6 +25,8 @@ use super::{
 use crate::cli::{AuthorityCmd, Cli, Command, SessionCmd, open_store};
 use crate::{MoteError, MoteResult, ids};
 
+mod communications;
+
 /// Returns `None` only for an ordinary command against a non-Git store.
 pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
     if matches!(
@@ -504,6 +506,10 @@ pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
             )?;
             finish_submission(cli.json, client.submit(req, 4)?)?
         }
+        Command::Send { .. }
+        | Command::Msg { .. }
+        | Command::Discuss { .. }
+        | Command::Inbox { .. } => communications::run(cli, &store)?,
         Command::Show { id } => show_task(cli, &store, id)?,
         Command::Next {
             ttl,

@@ -12,6 +12,7 @@ pub mod connection;
 pub mod coordination;
 pub mod history;
 pub mod legacy;
+mod legacy_communications;
 pub mod legacy_profile;
 pub mod planner;
 pub mod protocol;

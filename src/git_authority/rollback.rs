@@ -95,8 +95,10 @@ impl Journal {
             || self.destination.file_name() != Some(std::ffi::OsStr::new(".mote"))
             || !self.working.is_absolute()
             || legacy_digest != &self.source.migration.export_digest
-            || self.source.descriptor.capabilities
+            || (self.source.descriptor.capabilities
                 != super::protocol::RECOVERABLE_MIGRATED_CAPABILITIES
+                && self.source.descriptor.capabilities
+                    != super::protocol::MIGRATED_COMMUNICATION_CAPABILITIES)
             || self.working != working_path(&self.destination, &self.nonce)?
             || (self.phase != Phase::Retiring && self.proof.is_none())
             || (matches!(

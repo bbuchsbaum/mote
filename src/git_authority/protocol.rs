@@ -43,6 +43,22 @@ pub const RECOVERABLE_MIGRATED_CAPABILITIES: [&str; 6] = [
     "explicit-release-v1",
     "legacy-packed-v1",
 ];
+pub const COMMUNICATION_CAPABILITIES: [&str; 5] = [
+    "canonical-transactions-v1",
+    "coordination-communications-v1",
+    "coordination-core-v1",
+    "coordination-lifecycle-v1",
+    "explicit-release-v1",
+];
+pub const MIGRATED_COMMUNICATION_CAPABILITIES: [&str; 7] = [
+    "authority-retirement-v1",
+    "canonical-transactions-v1",
+    "coordination-communications-v1",
+    "coordination-core-v1",
+    "coordination-lifecycle-v1",
+    "explicit-release-v1",
+    "legacy-packed-v1",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +99,8 @@ impl Manifest {
             || self.capabilities == LIFECYCLE_CAPABILITIES
             || self.capabilities == MIGRATED_ROOT_CAPABILITIES
             || self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES
+            || self.capabilities == COMMUNICATION_CAPABILITIES
+            || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES
     }
 
     pub fn lifecycle(store_id: String) -> Self {
@@ -112,6 +130,22 @@ impl Manifest {
             .collect();
         manifest
     }
+    pub fn communications(store_id: String) -> Self {
+        let mut m = Self::lifecycle(store_id);
+        m.capabilities = COMMUNICATION_CAPABILITIES
+            .iter()
+            .map(|x| (*x).into())
+            .collect();
+        m
+    }
+    pub fn migrated_communications(store_id: String, legacy_digest: String) -> Self {
+        let mut m = Self::migrated_recoverable(store_id, legacy_digest);
+        m.capabilities = MIGRATED_COMMUNICATION_CAPABILITIES
+            .iter()
+            .map(|x| (*x).into())
+            .collect();
+        m
+    }
 
     pub fn allows(&self, command: &Command) -> MoteResult<()> {
         self.validate()?;
@@ -122,13 +156,22 @@ impl Manifest {
                 Command::Coordination {
                     action: super::coordination::Action::AuthorityRetire { .. },
                 },
-            ) if self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES => Ok(()),
+            ) if self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES
+                || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES =>
+            {
+                Ok(())
+            }
             (true, Command::Coordination { action })
                 if !matches!(action, super::coordination::Action::AuthorityRetire { .. })
+                    && (!matches!(action, super::coordination::Action::Communication { .. })
+                        || self.capabilities == COMMUNICATION_CAPABILITIES
+                        || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES)
                     && (!action.is_lifecycle()
                         || self.capabilities == LIFECYCLE_CAPABILITIES
                         || self.capabilities == MIGRATED_ROOT_CAPABILITIES
-                        || self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES) =>
+                        || self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES
+                        || self.capabilities == COMMUNICATION_CAPABILITIES
+                        || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES) =>
             {
                 Ok(())
             }
@@ -157,11 +200,14 @@ impl Manifest {
             && self.capabilities != LIFECYCLE_CAPABILITIES
             && self.capabilities != MIGRATED_ROOT_CAPABILITIES
             && self.capabilities != RECOVERABLE_MIGRATED_CAPABILITIES
+            && self.capabilities != COMMUNICATION_CAPABILITIES
+            && self.capabilities != MIGRATED_COMMUNICATION_CAPABILITIES
         {
             return invalid("unsupported or noncanonical Git authority capabilities");
         }
         if self.capabilities == MIGRATED_ROOT_CAPABILITIES
             || self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES
+            || self.capabilities == MIGRATED_COMMUNICATION_CAPABILITIES
         {
             if !self.legacy_digest.as_deref().is_some_and(valid_digest) {
                 return invalid("migrated root requires a lowercase legacy archive digest");
@@ -268,6 +314,12 @@ pub enum Effect {
         index: u32,
         op: Value,
     },
+    CommunicationOp {
+        effect_id: String,
+        sequence: u64,
+        index: u32,
+        op: Value,
+    },
     Ownership {
         effect_id: String,
         sequence: u64,
@@ -281,6 +333,7 @@ impl Effect {
         match self {
             Self::SyntheticSet { effect_id, .. }
             | Self::TaskOp { effect_id, .. }
+            | Self::CommunicationOp { effect_id, .. }
             | Self::Ownership { effect_id, .. } => effect_id,
         }
     }
@@ -289,6 +342,7 @@ impl Effect {
         match self {
             Self::SyntheticSet { sequence, .. }
             | Self::TaskOp { sequence, .. }
+            | Self::CommunicationOp { sequence, .. }
             | Self::Ownership { sequence, .. } => *sequence,
         }
     }
@@ -297,12 +351,22 @@ impl Effect {
         match self {
             Self::SyntheticSet { index, .. }
             | Self::TaskOp { index, .. }
+            | Self::CommunicationOp { index, .. }
             | Self::Ownership { index, .. } => *index,
         }
     }
 
     /// An ordered adapter ID for legacy consumers that compare op IDs.
+    /// Communication IDs include the seed-derived prefix; callers must use
+    /// effects whose exact adapters have passed canonical transaction replay.
     pub fn adapter_id(&self) -> String {
+        if let Self::CommunicationOp { op, .. } = self {
+            return op
+                .get("op")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .into();
+        }
         format!(
             "gaop-{:020}-{:06}-{}",
             self.sequence(),

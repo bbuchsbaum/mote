@@ -28,7 +28,8 @@ class SelectorIsolation(unittest.TestCase):
             (unrelated / "keep.txt").write_bytes(b"unrelated fixture bytes\0")
             before = files(unrelated)
             for script, extra in [(SCRIPT, ["--ordinary-binary", sys.executable]),
-                                  (SCRIPT.with_name("qualify_git_rollback.py"), [])]:
+                                  (SCRIPT.with_name("qualify_git_rollback.py"), []),
+                                  (SCRIPT.with_name("qualify_git_communications.py"), [])]:
                 for name, value in [("GIT_DIR", str(unrelated / ".git")),
                                     ("GIT_COMMON_DIR", str(unrelated / ".git")),
                                     ("GIT_WORK_TREE", str(unrelated)), ("GIT_NAMESPACE", "fixture")]:

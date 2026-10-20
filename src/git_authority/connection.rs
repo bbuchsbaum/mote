@@ -304,7 +304,9 @@ pub(crate) fn checked_rollback_source(
     if source.version != 1
         || original.schema_version != 1
         || original.store_id != source.descriptor.store_id
-        || source.descriptor.capabilities != super::protocol::RECOVERABLE_MIGRATED_CAPABILITIES
+        || (source.descriptor.capabilities != super::protocol::RECOVERABLE_MIGRATED_CAPABILITIES
+            && source.descriptor.capabilities
+                != super::protocol::MIGRATED_COMMUNICATION_CAPABILITIES)
         || source.proposed_format != proposed_format(&source.original_format, &source.descriptor)?
         || (format != source.original_format && format != source.proposed_format)
         || source.endpoint_digest != transport.endpoint_digest()
@@ -756,7 +758,7 @@ fn run_setup_inner(
                 if transport.head()?.is_some() {
                     return invalid("authority branch already exists; use authority connect");
                 }
-                let manifest = Manifest::lifecycle(format.store_id.clone());
+                let manifest = Manifest::communications(format.store_id.clone());
                 let root = transport.capture_root(&manifest)?;
                 let descriptor = Descriptor {
                     version: 1,
@@ -790,12 +792,15 @@ fn run_setup_inner(
                 }
                 let archive = super::legacy::capture_locked(store, options.cleanup_start)?;
                 let verified = super::legacy::verify(&archive.files, &archive.digest)?;
+                super::legacy_communications::validate(&verified)?;
                 let cleanup_start = verified.transition.cleanup_start;
                 super::coordination::CoordinationState::from_legacy(verified)?;
                 let pack = super::legacy::pack(&archive)?;
                 let backup = super::backup::create(store, &options.backup)?;
-                let manifest =
-                    Manifest::migrated_recoverable(format.store_id.clone(), archive.digest.clone());
+                let manifest = Manifest::migrated_communications(
+                    format.store_id.clone(),
+                    archive.digest.clone(),
+                );
                 let root = transport.capture_migrated_root(&manifest, &pack)?;
                 let descriptor = Descriptor {
                     version: 1,

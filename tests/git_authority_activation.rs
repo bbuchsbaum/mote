@@ -75,13 +75,13 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 #[test]
-fn bootstrap_and_explicit_second_machine_connection_share_one_lifecycle_authority() {
+fn bootstrap_and_explicit_second_machine_connection_share_one_communication_authority() {
     let f = Fixture::new();
     let original_b = f.b.read_format().unwrap().store_id;
     let descriptor = f.bootstrap();
     assert_eq!(
         descriptor.capabilities,
-        Manifest::lifecycle(descriptor.store_id.clone()).capabilities
+        Manifest::communications(descriptor.store_id.clone()).capabilities
     );
     assert!(!connection::setup_path(f.a.root()).exists());
     assert!(f.a.require_local_authority().is_err());

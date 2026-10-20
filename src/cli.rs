@@ -389,7 +389,7 @@ pub enum Command {
         /// Message kind (note | request | handoff | blocked | fyi)
         #[arg(long = "kind", default_value = "note")]
         msg_kind: String,
-        /// Sender-scoped retry key; an identical retry returns the first msg-id
+        /// Sender-scoped key; Git authority retries use `authority retry <request-id>`
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Reject unless the recipient has a valid session lease at send time
@@ -1263,7 +1263,7 @@ pub enum MsgCmd {
         /// Message kind (note | request | handoff | blocked | fyi)
         #[arg(long = "kind", default_value = "note")]
         msg_kind: String,
-        /// Sender-scoped retry key; an identical retry returns the first msg-id
+        /// Sender-scoped key; Git authority retries use `authority retry <request-id>`
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Reject unless the recipient has a valid session lease at send time
@@ -1286,7 +1286,7 @@ pub enum MsgCmd {
         /// Reply kind (response | decline)
         #[arg(long = "kind", default_value = "response")]
         msg_kind: String,
-        /// Sender-scoped retry key; an identical retry returns the first msg-id
+        /// Sender-scoped key; Git authority retries use `authority retry <request-id>`
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Body text (positional)
@@ -1341,7 +1341,7 @@ pub enum DiscussCmd {
         /// Explicit notification recipient; repeatable
         #[arg(long = "notify")]
         notify: Vec<String>,
-        /// Author-scoped retry key for identical post content and routing
+        /// Author-scoped key; Git authority retries use `authority retry <request-id>`
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Body text; pass - to read literal UTF-8 from stdin
@@ -7942,7 +7942,11 @@ fn print_discussion_publish_result(
     Ok(())
 }
 
-fn require_post_text(text: Option<String>, body: Option<String>, what: &str) -> MoteResult<String> {
+pub(crate) fn require_post_text(
+    text: Option<String>,
+    body: Option<String>,
+    what: &str,
+) -> MoteResult<String> {
     let input = match (text, body) {
         (Some(_), Some(_)) => {
             return Err(MoteError::Invalid(format!(
@@ -8043,7 +8047,10 @@ fn parse_discussion_reference(raw: &str) -> MoteResult<crate::op::DiscussionRefe
     }
 }
 
-fn resolve_decision_body(text: Option<String>, body: Option<String>) -> MoteResult<String> {
+pub(crate) fn resolve_decision_body(
+    text: Option<String>,
+    body: Option<String>,
+) -> MoteResult<String> {
     let value = match (text, body) {
         (Some(_), Some(_)) => {
             return Err(MoteError::Invalid(
@@ -8972,7 +8979,7 @@ fn cmd_discuss_promote(
 }
 
 /// First non-empty line of a post body, truncated to a usable bead title.
-fn first_line_title(body: &str) -> String {
+pub(crate) fn first_line_title(body: &str) -> String {
     let line = body
         .lines()
         .map(str::trim)

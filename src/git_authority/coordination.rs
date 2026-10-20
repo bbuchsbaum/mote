@@ -6,11 +6,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod communications;
 pub mod lifecycle;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum Action {
+    #[serde(rename = "communication")]
+    Communication { action: communications::Action },
     #[serde(rename = "session.start")]
     SessionStart { label: String },
     #[serde(rename = "session.presence")]
@@ -244,6 +247,7 @@ pub struct CoordinationPlan {
 
 pub fn validate_action(a: &Action) -> MoteResult<()> {
     match a {
+        Action::Communication { action } => communications::validate(action)?,
         Action::Begin(_)
         | Action::Next(_)
         | Action::Done(_)
@@ -398,6 +402,73 @@ fn validate_field(k: &str, v: &Value) -> MoteResult<()> {
     }
 }
 impl CoordinationState {
+    pub(crate) fn active_session(&self, session: &str, actor: &str) -> bool {
+        self.sessions
+            .get(session)
+            .is_some_and(|s| s.status == "active" && s.actor == actor)
+    }
+    pub fn communication_state(&self) -> MoteResult<crate::state::State> {
+        let mut result = match &self.legacy_seed {
+            Some(seed) => crate::reducer::replay(seed.entries.clone()),
+            None => crate::state::State::default(),
+        };
+        for value in &self.task_entries {
+            let typed: crate::op::Op = serde_json::from_value(value.clone())?;
+            if !matches!(
+                typed,
+                crate::op::Op::Create(_)
+                    | crate::op::Op::Patch(_)
+                    | crate::op::Op::TagAdd(_)
+                    | crate::op::Op::TagRemove(_)
+                    | crate::op::Op::DepAdd(_)
+                    | crate::op::Op::DepRemove(_)
+                    | crate::op::Op::RelAdd(_)
+                    | crate::op::Op::RelRemove(_)
+                    | crate::op::Op::Note(_)
+                    | crate::op::Op::MsgSend(_)
+                    | crate::op::Op::MsgAck(_)
+                    | crate::op::Op::MsgResolve(_)
+                    | crate::op::Op::BoardPost(_)
+                    | crate::op::Op::BoardDecision(_)
+                    | crate::op::Op::BoardQuestion(_)
+                    | crate::op::Op::BoardRead(_)
+                    | crate::op::Op::BoardWatch(_)
+                    | crate::op::Op::BoardTopic(_)
+                    | crate::op::Op::BoardSticky(_)
+                    | crate::op::Op::BoardSupersede(_)
+                    | crate::op::Op::BoardRetract(_)
+                    | crate::op::Op::BoardRoute(_)
+            ) {
+                return bad("unsupported canonical domain adapter");
+            }
+            let id = typed.op_id();
+            crate::reducer::apply_entry(
+                &mut result,
+                &format!("{id}.json"),
+                &serde_json::to_vec(value)?,
+            );
+            if !result.was_accepted(id) {
+                return bad("canonical domain adapter rejected by reducer");
+            }
+        }
+        Ok(result)
+    }
+    pub(crate) fn communication_adapter_id(
+        &self,
+        sequence: u64,
+        index: u32,
+        effect_id: &str,
+    ) -> String {
+        let Some(seed) = self.legacy_seed.as_ref().and_then(|s| {
+            s.entries
+                .iter()
+                .map(|(name, _)| name.strip_suffix(".json").unwrap_or(name))
+                .max()
+        }) else {
+            return format!("gaop-{sequence:020}-{index:06}-{effect_id}");
+        };
+        format!("{seed}~gaop-{sequence:020}-{index:06}-{effect_id}")
+    }
     pub(crate) fn from_legacy(verified: super::legacy::Verified) -> MoteResult<Self> {
         if verified
             .entries
@@ -448,6 +519,14 @@ impl CoordinationState {
     }
     pub fn view(&self) -> MoteResult<Value> {
         let mut view = json!({"tasks":replay_tasks(self)?,"sessions":self.sessions,"claims":self.claims,"reservations":self.reservations});
+        let domain = self.communication_state()?;
+        view["communications"] = json!({
+            "messages":domain.messages,"board_posts":domain.board_posts,
+            "board_decisions":domain.board_decisions,"board_questions":domain.board_questions,
+            "board_topics":domain.board_topics,"board_read_cursors":domain.board_read_cursors,
+            "board_topic_read_cursors":domain.board_topic_read_cursors.iter().map(|((actor,topic),op)|json!({"actor":actor,"topic":topic,"op_id":op})).collect::<Vec<_>>(),
+            "board_topic_watches":domain.board_topic_watches.values().collect::<Vec<_>>()
+        });
         if let Some(retirement) = &self.retirement {
             view["retirement"] = serde_json::to_value(retirement)?;
         }
@@ -484,40 +563,7 @@ impl CoordinationState {
 }
 
 fn replay_tasks(state: &CoordinationState) -> MoteResult<BTreeMap<String, Task>> {
-    let entries = state
-        .task_entries
-        .iter()
-        .map(|v| {
-            let op = v
-                .get("op")
-                .and_then(Value::as_str)
-                .ok_or_else(|| MoteError::Invalid("invalid coordination task entry".into()))?;
-            match serde_json::from_value::<crate::op::Op>(v.clone())? {
-                crate::op::Op::Create(_)
-                | crate::op::Op::Patch(_)
-                | crate::op::Op::TagAdd(_)
-                | crate::op::Op::TagRemove(_)
-                | crate::op::Op::DepAdd(_)
-                | crate::op::Op::DepRemove(_)
-                | crate::op::Op::RelAdd(_)
-                | crate::op::Op::RelRemove(_)
-                | crate::op::Op::Note(_) => (),
-                _ => {
-                    return Err(MoteError::Invalid(
-                        "unsupported coordination task operation".into(),
-                    ));
-                }
-            }
-            Ok((format!("{op}.json"), serde_json::to_vec(v)?))
-        })
-        .collect::<MoteResult<Vec<_>>>()?;
-    let mut r = match &state.legacy_seed {
-        Some(seed) => crate::reducer::replay(seed.entries.clone()),
-        None => crate::state::State::default(),
-    };
-    for (name, bytes) in entries {
-        crate::reducer::apply_entry(&mut r, &name, &bytes);
-    }
+    let r = state.communication_state()?;
     if state
         .task_entries
         .iter()
@@ -530,7 +576,6 @@ fn replay_tasks(state: &CoordinationState) -> MoteResult<BTreeMap<String, Task>>
     if state.legacy_seed.is_none()
         && (!r.reservations.is_empty()
             || !r.sessions.is_empty()
-            || !r.messages.is_empty()
             || !r.roles.is_empty()
             || !r.candidates.is_empty()
             || !r.handoff_orphans.is_empty())
@@ -639,6 +684,12 @@ pub fn plan(
     if action.is_lifecycle() {
         return lifecycle::plan(state, request, sequence);
     }
+    if let Action::Communication { action } = action {
+        if !state.active_session(&request.session, &request.actor) {
+            return Ok(reject("session_unavailable", &request.session));
+        }
+        return communications::plan(state, request, sequence, action);
+    }
     let mut next = state.clone();
     let eid = format!("eff-{}-000000", request.request_id);
     let active = |s: &CoordinationState| {
@@ -660,6 +711,9 @@ pub fn plan(
         }
         Action::AuthorityRetire { .. } => {
             unreachable!("retirement dispatched before core planning")
+        }
+        Action::Communication { .. } => {
+            unreachable!("communication dispatched before core planning")
         }
         Action::SessionStart { label } => {
             if state.sessions.contains_key(&request.session)

@@ -111,6 +111,9 @@ pub fn validate_chain(
         if verified.export.source.store_id != manifest.store_id {
             return invalid("migrated archive source store differs from authority manifest");
         }
+        if manifest.capabilities == super::protocol::MIGRATED_COMMUNICATION_CAPABILITIES {
+            super::legacy_communications::validate(&verified)?;
+        }
         state.coordination = super::coordination::CoordinationState::from_legacy(verified)?;
     }
     let mut seen = BTreeSet::from([root.oid.as_str()]);

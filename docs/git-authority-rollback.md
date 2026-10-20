@@ -10,7 +10,8 @@ pathname. Other machines remain attached to a permanently retired authority.
 
 The immutable `authority-retirement-v1` capability is a distinct profile; the
 previous five-capability migrated profile retains its meaning and refuses this
-action. Retirement requires matching verified legacy export identity and prior
+action. Both the six-capability recoverable profile and the new seven-capability
+communication profile support the same retirement rule. Retirement requires matching verified legacy export identity and prior
 canonical sequence zero. Every existing receipt, including rejected requests
 and session enrollment, disqualifies retirement. A single CAS append records a
 permanent effect. All subsequent ordinary actions, including session enrollment

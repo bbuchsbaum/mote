@@ -132,6 +132,11 @@ observation. Receipt lookup reports the same validated observation used for its
 lookup, including when no receipt was found. Task history with rejected entries
 includes ownership requests referenced indirectly by claim/reservation intent.
 
+New bootstrap and migration select the distinct communication-capable profiles
+specified in [the communication contract](git-authority-communications.md).
+Existing immutable profiles remain supported with their original capabilities;
+connecting never silently upgrades them.
+
 Remote lifecycle uses MOTE_ACTOR and MOTE_SESSION, with explicit enrollment.
 Session-start shell output activates those values only after a confirmed
 accepted receipt. A rejected or unconfirmed start must not emit shell activation.
