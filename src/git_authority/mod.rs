@@ -15,4 +15,5 @@ pub mod legacy;
 pub mod legacy_profile;
 pub mod planner;
 pub mod protocol;
+pub mod rollback;
 pub mod transport;

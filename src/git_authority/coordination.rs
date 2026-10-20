@@ -75,6 +75,11 @@ pub enum Action {
     SessionEnd(lifecycle::SessionEnd),
     #[serde(rename = "session.recover")]
     SessionRecover(lifecycle::SessionRecover),
+    #[serde(rename = "authority.retire")]
+    AuthorityRetire {
+        legacy_digest: String,
+        reason: String,
+    },
 }
 
 impl Action {
@@ -94,6 +99,7 @@ impl Action {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Transition {
+    AuthorityRetired(Retirement),
     SessionStarted {
         session: String,
         actor: String,
@@ -140,6 +146,17 @@ pub enum Transition {
     ClaimRecovered(lifecycle::ClaimRecovered),
     ReservationRecovered(lifecycle::ReservationRecovered),
     SessionRevoked(lifecycle::SessionRevoked),
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Retirement {
+    pub request_id: String,
+    pub legacy_digest: String,
+    pub actor: String,
+    pub session: String,
+    pub reason: String,
+    pub token: String,
+    pub timestamp: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -200,10 +217,13 @@ pub struct CoordinationState {
     // a public deserialization path for legacy state or ownership.
     #[serde(skip)]
     legacy_seed: Option<LegacySeed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retirement: Option<Retirement>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LegacySeed {
     entries: Vec<(String, Vec<u8>)>,
+    export_digest: String,
     consumed_tasks: BTreeSet<String>,
     consumed_sessions: BTreeSet<String>,
     consumed_reservations: BTreeSet<String>,
@@ -230,6 +250,15 @@ pub fn validate_action(a: &Action) -> MoteResult<()> {
         | Action::Handoff(_)
         | Action::SessionEnd(_)
         | Action::SessionRecover(_) => lifecycle::validate(a)?,
+        Action::AuthorityRetire {
+            legacy_digest,
+            reason,
+        } => {
+            if !protocol::valid_digest(legacy_digest) {
+                return bad("invalid legacy digest");
+            }
+            nonblank(reason, 4096, "retirement reason")?;
+        }
         Action::SessionStart { label } | Action::SessionPresence { text: label } => {
             text(label, 4096, "session text")?
         }
@@ -394,6 +423,7 @@ impl CoordinationState {
         Ok(Self {
             legacy_seed: Some(LegacySeed {
                 entries: verified.entries,
+                export_digest: super::legacy::export_digest(&verified.export)?,
                 consumed_tasks: verified.transition.consumed_tasks,
                 consumed_sessions: verified.transition.consumed_sessions,
                 consumed_reservations: verified.transition.consumed_reservations,
@@ -417,9 +447,14 @@ impl CoordinationState {
             .is_some_and(|s| s.consumed_reservations.contains(id))
     }
     pub fn view(&self) -> MoteResult<Value> {
-        Ok(
-            json!({"tasks":replay_tasks(self)?,"sessions":self.sessions,"claims":self.claims,"reservations":self.reservations}),
-        )
+        let mut view = json!({"tasks":replay_tasks(self)?,"sessions":self.sessions,"claims":self.claims,"reservations":self.reservations});
+        if let Some(retirement) = &self.retirement {
+            view["retirement"] = serde_json::to_value(retirement)?;
+        }
+        Ok(view)
+    }
+    pub fn retirement(&self) -> Option<&Retirement> {
+        self.retirement.as_ref()
     }
     pub fn task_view(&self) -> MoteResult<Value> {
         Ok(json!(replay_tasks(self)?))
@@ -550,11 +585,6 @@ pub fn plan(
         protocol::Command::Coordination { action } => action,
         _ => return bad("inactive command profile"),
     };
-    if action.is_lifecycle() {
-        return lifecycle::plan(state, request, sequence);
-    }
-    let mut next = state.clone();
-    let eid = format!("eff-{}-000000", request.request_id);
     let reject = |code: &str, subject: &str| CoordinationPlan {
         effects: vec![],
         outcome: Outcome {
@@ -563,6 +593,54 @@ pub fn plan(
         },
         next_state: state.clone(),
     };
+    if state.retirement.is_some() {
+        return Ok(reject("authority_retired", "authority"));
+    }
+    if let Action::AuthorityRetire {
+        legacy_digest,
+        reason,
+    } = action
+    {
+        if sequence != 1 {
+            return Ok(reject("authority_used", "authority"));
+        }
+        let Some(seed) = &state.legacy_seed else {
+            return Ok(reject("legacy_digest_mismatch", "authority"));
+        };
+        if legacy_digest != &seed.export_digest {
+            return Ok(reject("legacy_digest_mismatch", "authority"));
+        }
+        let token = format!("eff-{}-000000", request.request_id);
+        let retirement = Retirement {
+            request_id: request.request_id.clone(),
+            legacy_digest: legacy_digest.clone(),
+            actor: request.actor.clone(),
+            session: request.session.clone(),
+            reason: reason.clone(),
+            token: token.clone(),
+            timestamp: request.timestamp.clone(),
+        };
+        let mut next_state = state.clone();
+        next_state.retirement = Some(retirement.clone());
+        return Ok(CoordinationPlan {
+            effects: vec![Effect::Ownership {
+                effect_id: token.clone(),
+                sequence,
+                index: 0,
+                transition: Box::new(Transition::AuthorityRetired(retirement)),
+            }],
+            outcome: Outcome {
+                status: OutcomeStatus::Accepted,
+                result: json!({"code":"authority_retired","legacy_digest":legacy_digest,"effect_ids":[token]}),
+            },
+            next_state,
+        });
+    }
+    if action.is_lifecycle() {
+        return lifecycle::plan(state, request, sequence);
+    }
+    let mut next = state.clone();
+    let eid = format!("eff-{}-000000", request.request_id);
     let active = |s: &CoordinationState| {
         s.sessions
             .get(&request.session)
@@ -579,6 +657,9 @@ pub fn plan(
         | Action::SessionEnd(_)
         | Action::SessionRecover(_) => {
             unreachable!("lifecycle action dispatched before core planning")
+        }
+        Action::AuthorityRetire { .. } => {
+            unreachable!("retirement dispatched before core planning")
         }
         Action::SessionStart { label } => {
             if state.sessions.contains_key(&request.session)

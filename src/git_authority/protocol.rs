@@ -35,6 +35,14 @@ pub const MIGRATED_ROOT_CAPABILITIES: [&str; 5] = [
     "explicit-release-v1",
     "legacy-packed-v1",
 ];
+pub const RECOVERABLE_MIGRATED_CAPABILITIES: [&str; 6] = [
+    "authority-retirement-v1",
+    "canonical-transactions-v1",
+    "coordination-core-v1",
+    "coordination-lifecycle-v1",
+    "explicit-release-v1",
+    "legacy-packed-v1",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +82,7 @@ impl Manifest {
         self.capabilities == COORDINATION_CAPABILITIES
             || self.capabilities == LIFECYCLE_CAPABILITIES
             || self.capabilities == MIGRATED_ROOT_CAPABILITIES
+            || self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES
     }
 
     pub fn lifecycle(store_id: String) -> Self {
@@ -95,14 +104,31 @@ impl Manifest {
         manifest
     }
 
+    pub fn migrated_recoverable(store_id: String, legacy_digest: String) -> Self {
+        let mut manifest = Self::migrated(store_id, legacy_digest);
+        manifest.capabilities = RECOVERABLE_MIGRATED_CAPABILITIES
+            .iter()
+            .map(|x| (*x).into())
+            .collect();
+        manifest
+    }
+
     pub fn allows(&self, command: &Command) -> MoteResult<()> {
         self.validate()?;
         match (self.is_coordination(), command) {
             (false, Command::SyntheticCas { .. }) => Ok(()),
+            (
+                true,
+                Command::Coordination {
+                    action: super::coordination::Action::AuthorityRetire { .. },
+                },
+            ) if self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES => Ok(()),
             (true, Command::Coordination { action })
-                if !action.is_lifecycle()
-                    || self.capabilities == LIFECYCLE_CAPABILITIES
-                    || self.capabilities == MIGRATED_ROOT_CAPABILITIES =>
+                if !matches!(action, super::coordination::Action::AuthorityRetire { .. })
+                    && (!action.is_lifecycle()
+                        || self.capabilities == LIFECYCLE_CAPABILITIES
+                        || self.capabilities == MIGRATED_ROOT_CAPABILITIES
+                        || self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES) =>
             {
                 Ok(())
             }
@@ -130,10 +156,13 @@ impl Manifest {
             && self.capabilities != COORDINATION_CAPABILITIES
             && self.capabilities != LIFECYCLE_CAPABILITIES
             && self.capabilities != MIGRATED_ROOT_CAPABILITIES
+            && self.capabilities != RECOVERABLE_MIGRATED_CAPABILITIES
         {
             return invalid("unsupported or noncanonical Git authority capabilities");
         }
-        if self.capabilities == MIGRATED_ROOT_CAPABILITIES {
+        if self.capabilities == MIGRATED_ROOT_CAPABILITIES
+            || self.capabilities == RECOVERABLE_MIGRATED_CAPABILITIES
+        {
             if !self.legacy_digest.as_deref().is_some_and(valid_digest) {
                 return invalid("migrated root requires a lowercase legacy archive digest");
             }
@@ -144,7 +173,7 @@ impl Manifest {
     }
 }
 
-fn valid_digest(value: &str) -> bool {
+pub(crate) fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

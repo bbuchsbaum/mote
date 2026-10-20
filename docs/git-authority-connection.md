@@ -178,10 +178,12 @@ remote sequence/effect positions. `history` reports original entity events with
 `phase:legacy`, input ordinal and per-input event index; new transactions report
 `phase:remote`. Rejected entries remain subject to `--include-rejected`.
 
-Rollback is not implemented by removing a descriptor or copying FORMAT. The
-planned pre-use rollback must first obtain a canonical permanent retirement
-receipt, racing atomically with every other client's first use; any prior
-receipt disqualifies it. Restoration must retain its proof/progress outside the
-restored contents and leave the publication lock inode intact. That distinct
-capability, administrative command and restoration fault qualification remain
-open work; current migration setup does not claim rollback acceptance.
+Pre-use rollback is explicit: `authority rollback-git --output /private/new-local-store/.mote
+--reason "reason"`. It first races a permanent canonical retirement against the
+first remote transaction, then restores the stopped backup into one new private
+local store. The original attached store and its lock remain intact; use the
+result through `MOTE_STORE`. See the [rollback contract](git-authority-rollback.md)
+for publication, recovery and qualification limits. An authority with any prior
+receipt refuses this command. Returning to local mode after use still requires
+a separate migration from current canonical history; removing a descriptor or
+copying FORMAT is never a rollback.

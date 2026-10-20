@@ -27,17 +27,19 @@ class SelectorIsolation(unittest.TestCase):
             subprocess.run(["git", "-C", str(unrelated), "remote", "add", "origin", str(root / "sentinel.git")], check=True, env=env)
             (unrelated / "keep.txt").write_bytes(b"unrelated fixture bytes\0")
             before = files(unrelated)
-            for name, value in [("GIT_DIR", str(unrelated / ".git")),
-                                ("GIT_COMMON_DIR", str(unrelated / ".git")),
-                                ("GIT_WORK_TREE", str(unrelated)), ("GIT_NAMESPACE", "fixture")]:
-                output = root / ("output-" + name)
-                result = subprocess.run([sys.executable, str(SCRIPT), "--binary", sys.executable,
-                                         "--ordinary-binary", sys.executable, "--output", str(output)],
-                                        cwd=unrelated, env={**env, name: value}, capture_output=True)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(b"refuses inherited Git repository selectors", result.stderr)
-                self.assertFalse(output.exists())
-                self.assertEqual(files(unrelated), before)
+            for script, extra in [(SCRIPT, ["--ordinary-binary", sys.executable]),
+                                  (SCRIPT.with_name("qualify_git_rollback.py"), [])]:
+                for name, value in [("GIT_DIR", str(unrelated / ".git")),
+                                    ("GIT_COMMON_DIR", str(unrelated / ".git")),
+                                    ("GIT_WORK_TREE", str(unrelated)), ("GIT_NAMESPACE", "fixture")]:
+                    output = root / (script.stem + "-output-" + name)
+                    result = subprocess.run([sys.executable, str(script), "--binary", sys.executable,
+                                             *extra, "--output", str(output)],
+                                            cwd=unrelated, env={**env, name: value}, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(b"refuses inherited Git repository selectors", result.stderr)
+                    self.assertFalse(output.exists())
+                    self.assertEqual(files(unrelated), before)
 
 
 if __name__ == "__main__":

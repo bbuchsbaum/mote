@@ -248,6 +248,7 @@ impl Store {
         if self.read_format()?.schema_version != 1
             || self.root.join("remote.json").exists()
             || self.local_dir().join("git-setup.json").exists()
+            || self.local_dir().join("git-rollback.json").exists()
         {
             return Err(MoteError::Invalid(
                 "Git-authority, pending Git setup, or unsupported store: local publication/replay is refused; finish setup or use the remote client".into(),

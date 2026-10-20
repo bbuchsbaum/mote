@@ -1146,6 +1146,14 @@ pub enum AuthorityCmd {
         #[arg(long)]
         cleanup_start: Option<u64>,
     },
+    /// Retire an unused migrated authority and restore its stopped backup into a new local store.
+    RollbackGit {
+        /// New .mote directory beneath an existing parent outside this project.
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        reason: String,
+    },
     /// Connect this empty local store to an existing Git authority branch.
     Connect {
         #[arg(long, default_value = "origin")]
@@ -4327,6 +4335,7 @@ fn cmd_authority(store_flag: Option<&Path>, cmd: AuthorityCmd) -> MoteResult<i32
         }
         AuthorityCmd::InitGit { .. }
         | AuthorityCmd::MigrateGit { .. }
+        | AuthorityCmd::RollbackGit { .. }
         | AuthorityCmd::Connect { .. }
         | AuthorityCmd::Resume { .. }
         | AuthorityCmd::Refresh

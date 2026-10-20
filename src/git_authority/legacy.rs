@@ -183,6 +183,10 @@ fn digest<T: Serialize>(domain: &str, value: &T) -> MoteResult<String> {
     hasher.update(&encode(value)?);
     Ok(hasher.finalize().to_hex().to_string())
 }
+/// Digest an export under the retained archive's canonical domain.
+pub fn export_digest(export: &Export) -> MoteResult<String> {
+    digest("mote.legacy-export.v1", export)
+}
 fn state_digest(profile: &str, state: &State) -> MoteResult<String> {
     digest(
         "mote.legacy-state.v1",
@@ -1308,5 +1312,101 @@ mod tests {
             let verified = verify_profile(&a.files, &a.digest, "pinned-fixture").unwrap();
             assert!(CoordinationState::from_legacy(verified).is_err());
         }
+    }
+
+    #[test]
+    fn verified_seed_allows_one_permanent_retirement_only_at_sequence_one() {
+        use super::super::{
+            coordination::{self, Action, CoordinationState, Transition},
+            protocol::{Command, Manifest, OutcomeStatus, Request},
+        };
+        let archive = archive(&ttl_history(), None);
+        let verified = verify_profile(&archive.files, &archive.digest, "pinned-fixture").unwrap();
+        let digest = export_digest(&verified.export).unwrap();
+        let state = CoordinationState::from_legacy(verified).unwrap();
+        let request = |id: &str, legacy_digest: String| Request {
+            version: 1,
+            request_id: id.into(),
+            actor: "writer".into(),
+            session: "un-enrolled".into(),
+            timestamp: "2026-10-20T00:00:00Z".into(),
+            command: Command::Coordination {
+                action: Action::AuthorityRetire {
+                    legacy_digest,
+                    reason: "explicit recovery boundary".into(),
+                },
+            },
+        };
+        let command = request("profile", digest.clone()).command;
+        assert!(
+            Manifest::migrated("st-fixture".into(), "1".repeat(64))
+                .allows(&command)
+                .is_err()
+        );
+        assert!(
+            Manifest::migrated_recoverable("st-fixture".into(), "1".repeat(64))
+                .allows(&command)
+                .is_ok()
+        );
+        assert_eq!(
+            coordination::plan(&state, &request("wrong", "0".repeat(64)), 1)
+                .unwrap()
+                .outcome
+                .result["code"],
+            "legacy_digest_mismatch"
+        );
+        assert_eq!(
+            coordination::plan(&state, &request("late", digest.clone()), 2)
+                .unwrap()
+                .outcome
+                .result["code"],
+            "authority_used"
+        );
+        let accepted = coordination::plan(&state, &request("retire", digest.clone()), 1).unwrap();
+        assert_eq!(accepted.outcome.status, OutcomeStatus::Accepted);
+        assert_eq!(accepted.outcome.result["code"], "authority_retired");
+        assert_eq!(accepted.effects.len(), 1);
+        assert!(matches!(
+            &accepted.effects[0],
+            super::super::protocol::Effect::Ownership {
+                transition,
+                ..
+            } if matches!(transition.as_ref(), Transition::AuthorityRetired(retirement)
+                if retirement.request_id == "retire" && retirement.legacy_digest == digest)
+        ));
+        assert_eq!(
+            accepted.next_state.retirement().unwrap().token,
+            "eff-retire-000000"
+        );
+        assert_eq!(
+            accepted.next_state.view().unwrap()["retirement"]["reason"],
+            "explicit recovery boundary"
+        );
+        let blocked = Request {
+            version: 1,
+            request_id: "blocked".into(),
+            actor: "writer".into(),
+            session: "un-enrolled".into(),
+            timestamp: "2026-10-20T00:00:00Z".into(),
+            command: Command::Coordination {
+                action: Action::SessionStart {
+                    label: "must not enroll".into(),
+                },
+            },
+        };
+        assert_eq!(
+            coordination::plan(&accepted.next_state, &blocked, 2)
+                .unwrap()
+                .outcome
+                .result["code"],
+            "authority_retired"
+        );
+        assert_eq!(
+            coordination::plan(&accepted.next_state, &request("retry", digest), 2)
+                .unwrap()
+                .outcome
+                .result["code"],
+            "authority_retired"
+        );
     }
 }

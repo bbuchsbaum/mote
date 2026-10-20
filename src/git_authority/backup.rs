@@ -54,7 +54,7 @@ fn mode(metadata: &fs::Metadata) -> u32 {
         0o600
     }
 }
-fn private_directory(path: &Path) -> MoteResult<()> {
+pub(crate) fn private_directory(path: &Path) -> MoteResult<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -245,6 +245,158 @@ pub fn verify(custody: &Custody) -> MoteResult<Inventory> {
         return invalid("migration backup does not contain the selected local store");
     }
     Ok(inventory)
+}
+
+fn copy_link(bytes: &[u8], mode: u32, temporary: &Path, destination: &Path) -> MoteResult<()> {
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        if !metadata.file_type().is_file() || fs::read(destination)? != bytes {
+            return invalid("rollback output contains a changed or unexpected file");
+        }
+        return set_file_mode(destination, mode);
+    }
+    if temporary.exists() {
+        if !fs::symlink_metadata(temporary)?.file_type().is_file() {
+            return invalid("rollback staging file is not regular");
+        }
+        if fs::read(temporary)? != bytes {
+            // This exact staging file is private, owned by the pinned restore
+            // journal and regenerable from the verified complete backup.
+            fs::remove_file(temporary)?;
+        }
+    }
+    if !temporary.exists() {
+        crate::publish::write_tmp_durable(temporary, bytes)?;
+    }
+    set_file_mode(temporary, mode)?;
+    fs::hard_link(temporary, destination)?;
+    crate::publish::fsync_dir(destination.parent().expect("copy path has parent"))
+}
+
+/// The caller has exclusively established and pinned both private directories.
+/// FORMAT remains absent, so this cannot expose a partly restored Mote store.
+pub(crate) fn copy_without_format(
+    custody: &Custody,
+    destination: &Path,
+    working: &Path,
+    hook: &mut dyn FnMut() -> MoteResult<()>,
+) -> MoteResult<Inventory> {
+    let inventory = verify(custody)?;
+    if destination.join("FORMAT.json").exists() {
+        return invalid("rollback FORMAT may already be visible; copying is forbidden");
+    }
+    for relative in inventory.directories.keys().filter(|p| !p.is_empty()) {
+        let path = destination.join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return invalid("rollback output directory is not regular"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => private_directory(&path)?,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    for (index, (relative, record)) in inventory.files.iter().enumerate() {
+        if relative == "FORMAT.json" {
+            continue;
+        }
+        let bytes = fs::read(custody.path.join("store").join(relative))?;
+        if hash(&bytes) != record.digest || bytes.len() as u64 != record.bytes {
+            return invalid("backup changed while restoring a file");
+        }
+        copy_link(
+            &bytes,
+            record.mode,
+            &working.join(format!("{index:020}.bin")),
+            &destination.join(relative),
+        )?;
+        hook()?;
+    }
+    let mut directories: Vec<_> = inventory.directories.iter().collect();
+    directories.sort_by_key(|(p, _)| std::cmp::Reverse(p.split('/').count()));
+    for (name, original_mode) in directories {
+        let path = destination.join(name);
+        // Preserve a private root even when the original store was public.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                &path,
+                fs::Permissions::from_mode(if name.is_empty() {
+                    0o700
+                } else {
+                    *original_mode
+                }),
+            )?;
+        }
+        #[cfg(not(unix))]
+        let _ = original_mode;
+        crate::publish::fsync_dir(&path)?;
+    }
+    crate::publish::fsync_dir(working)?;
+    Ok(inventory)
+}
+
+pub(crate) fn verify_unpublished_copy(inventory: &Inventory, destination: &Path) -> MoteResult<()> {
+    let mut directories = BTreeMap::new();
+    let mut files = BTreeMap::new();
+    walk(destination, "", &mut directories, &mut files, None)?;
+    let mut expected_files = inventory.files.clone();
+    expected_files.remove("FORMAT.json");
+    let mut expected_directories = inventory.directories.clone();
+    expected_directories.insert("".into(), 0o700);
+    if files != expected_files || directories != expected_directories {
+        return invalid(
+            "rollback copy bytes, modes or complete inventory differ before publication",
+        );
+    }
+    Ok(())
+}
+
+/// Prepare complete FORMAT bytes on the same filesystem as the destination.
+/// Linking them later is atomic and refuses an existing destination FORMAT.
+pub(crate) fn prepare_format(custody: &Custody, working: &Path) -> MoteResult<PathBuf> {
+    let inventory = verify(custody)?;
+    let record = inventory
+        .files
+        .get("FORMAT.json")
+        .ok_or_else(|| MoteError::Invalid("backup has no FORMAT".into()))?;
+    let bytes = fs::read(custody.path.join("store/FORMAT.json"))?;
+    let path = working.join("FORMAT.complete");
+    if path.exists() {
+        if !fs::symlink_metadata(&path)?.file_type().is_file() {
+            return invalid("rollback FORMAT staging is not a regular file");
+        }
+        if fs::read(&path)? != bytes {
+            // Called only while positively prepublication, in the pinned
+            // private working directory; this file is verified-regenerable.
+            fs::remove_file(&path)?;
+        }
+    }
+    if !path.exists() {
+        crate::publish::write_tmp_durable(&path, &bytes)?;
+    }
+    set_file_mode(&path, record.mode)?;
+    crate::publish::fsync_dir(working)?;
+    Ok(path)
+}
+
+pub(crate) fn verify_prepared_format(
+    inventory: &Inventory,
+    working: &Path,
+    expected: &[u8],
+) -> MoteResult<PathBuf> {
+    let record = inventory
+        .files
+        .get("FORMAT.json")
+        .ok_or_else(|| MoteError::Invalid("backup has no FORMAT".into()))?;
+    let path = working.join("FORMAT.complete");
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file()
+        || mode(&metadata) != record.mode
+        || fs::read(&path)? != expected
+        || hash(expected) != record.digest
+    {
+        return invalid("authorized rollback FORMAT bytes or mode differ");
+    }
+    Ok(path)
 }
 
 #[cfg(test)]

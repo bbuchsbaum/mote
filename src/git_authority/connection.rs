@@ -49,7 +49,10 @@ impl Descriptor {
             generation: self.generation,
             ownership: "explicit-release-v1".into(),
             capabilities: self.capabilities.clone(),
-            legacy_digest: (self.capabilities == super::protocol::MIGRATED_ROOT_CAPABILITIES)
+            legacy_digest: self
+                .capabilities
+                .iter()
+                .any(|c| c == "legacy-packed-v1")
                 .then(|| "0".repeat(64)),
         }
         .validate()
@@ -253,15 +256,15 @@ impl SetupRecord {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MigrationActivation {
-    version: u32,
-    migration: MigrationSetup,
-    original_format: Vec<u8>,
-    proposed_format: Vec<u8>,
-    source_fingerprint: String,
-    endpoint_digest: String,
-    cache_root: PathBuf,
-    descriptor: Descriptor,
+pub(crate) struct MigrationActivation {
+    pub version: u32,
+    pub migration: MigrationSetup,
+    pub original_format: Vec<u8>,
+    pub proposed_format: Vec<u8>,
+    pub source_fingerprint: String,
+    pub endpoint_digest: String,
+    pub cache_root: PathBuf,
+    pub descriptor: Descriptor,
 }
 impl From<&SetupRecord> for MigrationActivation {
     fn from(record: &SetupRecord) -> Self {
@@ -276,6 +279,60 @@ impl From<&SetupRecord> for MigrationActivation {
             descriptor: record.descriptor.clone(),
         }
     }
+}
+
+pub(crate) fn migration_activation(store: &Store) -> MoteResult<MigrationActivation> {
+    if let Some(record) = load_setup(store.root())? {
+        if record.operation != SetupOperation::Migrate || record.migration.is_none() {
+            return invalid("rollback requires a selected legacy migration and complete backup");
+        }
+        Ok(MigrationActivation::from(&record))
+    } else {
+        read_canonical(&store.local_dir().join("git-migration.json"))?.ok_or_else(|| {
+            MoteError::Invalid("store has no retained migration backup custody".into())
+        })
+    }
+}
+pub(crate) fn checked_rollback_source(
+    store: &Store,
+    transport: &GitTransport,
+) -> MoteResult<MigrationActivation> {
+    let source = migration_activation(store)?;
+    source.descriptor.validate()?;
+    let original: Format = decode(&source.original_format)?;
+    let format = fs::read(store.format_path())?;
+    if source.version != 1
+        || original.schema_version != 1
+        || original.store_id != source.descriptor.store_id
+        || source.descriptor.capabilities != super::protocol::RECOVERABLE_MIGRATED_CAPABILITIES
+        || source.proposed_format != proposed_format(&source.original_format, &source.descriptor)?
+        || (format != source.original_format && format != source.proposed_format)
+        || source.endpoint_digest != transport.endpoint_digest()
+        || source
+            .descriptor
+            .binding(source.endpoint_digest.clone())
+            .branch_ref
+            != transport.branch_ref()
+        || checked_project_cache(store, transport, &source.cache_root)?.canonicalize()?
+            != source.cache_root
+        || source.source_fingerprint != migration_source_fingerprint(store)?
+    {
+        return invalid("rollback source identity, endpoint, format or selected cut differs");
+    }
+    if let Some(descriptor) = load_descriptor(store.root())? {
+        if descriptor != source.descriptor {
+            return invalid("rollback descriptor differs from selected migration");
+        }
+    }
+    transport.checked_durable_path(&source.migration.backup.path)?;
+    let backup = super::backup::verify(&source.migration.backup)?;
+    if backup.source != store.root().canonicalize()?
+        || backup.store_id != source.descriptor.store_id
+        || backup.format_digest != blake3::hash(&source.original_format).to_hex().as_str()
+    {
+        return invalid("rollback backup differs from selected source");
+    }
+    Ok(source)
 }
 
 fn digest_ok(s: &str) -> bool {
@@ -737,7 +794,8 @@ fn run_setup_inner(
                 super::coordination::CoordinationState::from_legacy(verified)?;
                 let pack = super::legacy::pack(&archive)?;
                 let backup = super::backup::create(store, &options.backup)?;
-                let manifest = Manifest::migrated(format.store_id.clone(), archive.digest.clone());
+                let manifest =
+                    Manifest::migrated_recoverable(format.store_id.clone(), archive.digest.clone());
                 let root = transport.capture_migrated_root(&manifest, &pack)?;
                 let descriptor = Descriptor {
                     version: 1,

@@ -44,13 +44,15 @@ pub fn run_if_remote(cli: &Cli) -> MoteResult<Option<i32>> {
         Err(MoteError::StoreNotFound(_)) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let pending = connection::setup_path(store.root()).exists();
+    let pending = connection::setup_path(store.root()).exists()
+        || store.local_dir().join("git-rollback.json").exists();
     let bound = connection::load_descriptor(store.root())?.is_some();
     let is_setup = matches!(
         &cli.command,
         Command::Authority {
             cmd: AuthorityCmd::InitGit { .. }
                 | AuthorityCmd::MigrateGit { .. }
+                | AuthorityCmd::RollbackGit { .. }
                 | AuthorityCmd::Connect { .. }
                 | AuthorityCmd::Resume { .. }
                 | AuthorityCmd::Refresh
@@ -755,6 +757,18 @@ fn authority_command(cli: &Cli, store: &crate::repo::Store, cmd: &AuthorityCmd) 
                 cli.json,
                 json!({"operation":"migrate","descriptor":descriptor,"backup":backup}),
             );
+            Ok(0)
+        }
+        AuthorityCmd::RollbackGit { output, reason } => {
+            if let Some(completed) = super::rollback::completed(store, output, reason)? {
+                print_value(cli.json, serde_json::to_value(completed)?);
+                return Ok(0);
+            }
+            let (remote, branch) = super::rollback::route_hint(store)?;
+            let (transport, _scratch) = transport(store, &remote, &branch)?;
+            let result =
+                super::rollback::run(store, transport, output, cli.actor.as_deref(), reason)?;
+            print_value(cli.json, serde_json::to_value(result)?);
             Ok(0)
         }
         AuthorityCmd::Connect { remote, branch } => {
