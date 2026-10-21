@@ -17,7 +17,7 @@ fn blob(bytes: Vec<u8>) -> GitBlob {
     GitBlob {
         mode: "100644".into(),
         oid: "b".repeat(40),
-        bytes,
+        bytes: bytes.into(),
     }
 }
 
@@ -32,17 +32,43 @@ fn migrated_root(manifest: Manifest, pack: Vec<u8>) -> GitCommit {
     }
 }
 
+fn git_command(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(dir);
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(|key| key.starts_with("GIT_") || key.starts_with("MOTE_"))
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "Mote test")
+        .env("GIT_AUTHOR_EMAIL", "test@mote.invalid")
+        .env("GIT_COMMITTER_NAME", "Mote test")
+        .env("GIT_COMMITTER_EMAIL", "test@mote.invalid");
+    command
+}
+
 fn git(dir: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
-    let mut child = Command::new("git")
-        .current_dir(dir)
+    let mut child = git_command(dir)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     output.stdout
 }
 
@@ -114,24 +140,21 @@ fn ordinary_binary_refuses_a_retained_migrated_root_before_remote_mutation() {
     let repo = root.path().join("repo");
     let bare = root.path().join("remote.git");
     assert!(
-        Command::new("git")
-            .current_dir(root.path())
+        git_command(root.path())
             .args(["init", repo.to_str().unwrap()])
             .status()
             .unwrap()
             .success()
     );
     assert!(
-        Command::new("git")
-            .current_dir(root.path())
+        git_command(root.path())
             .args(["init", "--bare", bare.to_str().unwrap()])
             .status()
             .unwrap()
             .success()
     );
     assert!(
-        Command::new("git")
-            .current_dir(&repo)
+        git_command(&repo)
             .args(["remote", "add", "origin", bare.to_str().unwrap()])
             .status()
             .unwrap()

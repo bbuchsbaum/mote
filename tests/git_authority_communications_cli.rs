@@ -365,3 +365,173 @@ fn discussions_watch_read_promote_and_route_with_complete_provenance() {
     assert_eq!(f.sequence(), before);
     f.no_local_ops();
 }
+
+#[test]
+fn discussion_search_matches_local_cli_fields_and_rejects_blank_queries() {
+    let f = Fixture::new();
+    let alice = f.start("a", "alice");
+    f.ok(
+        "a",
+        "alice",
+        Some(&alice),
+        &["discuss", "topic", "new", "design"],
+    );
+    f.ok(
+        "a",
+        "alice",
+        Some(&alice),
+        &["discuss", "topic", "new", "operations"],
+    );
+    let design_post = f.ok(
+        "a",
+        "alice",
+        Some(&alice),
+        &[
+            "discuss",
+            "post",
+            "--topic",
+            "design",
+            "CaseFolded implementation detail",
+        ],
+    );
+    let design_post_id = subject(&design_post).to_owned();
+    f.ok(
+        "a",
+        "alice",
+        Some(&alice),
+        &[
+            "discuss",
+            "post",
+            "--topic",
+            "operations",
+            "CaseFolded operations detail",
+        ],
+    );
+
+    for query in [
+        design_post_id.to_ascii_uppercase(),
+        "ALICE".into(),
+        " DESIGN ".into(),
+        "CASEFOLDED".into(),
+    ] {
+        let search = f.ok("b", "bob", None, &["discuss", "search", &query]);
+        assert!(
+            search["data"]["posts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|post| post["post_id"] == design_post_id)
+        );
+    }
+
+    let filtered = f.ok(
+        "b",
+        "bob",
+        None,
+        &[
+            "discuss",
+            "search",
+            "casefolded",
+            "--topic",
+            "design",
+            "--limit",
+            "1",
+        ],
+    );
+    let posts = filtered["data"]["posts"].as_array().unwrap();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0]["post_id"], design_post_id);
+    assert_eq!(posts[0]["topic"], "design");
+
+    let blank = f.run("b", "bob", None, &["discuss", "search", "   "]);
+    assert_eq!(blank.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&blank.stderr)
+            .contains("discussion search query must be non-empty")
+    );
+    f.no_local_ops();
+}
+
+#[test]
+fn discussion_search_limit_matches_local_activity_and_sticky_ordering() {
+    let f = Fixture::new();
+    let alice = f.start("a", "alice");
+    f.ok(
+        "a",
+        "alice",
+        Some(&alice),
+        &["discuss", "topic", "new", "alpha-shared"],
+    );
+    f.ok(
+        "a",
+        "alice",
+        Some(&alice),
+        &["discuss", "topic", "new", "zulu-shared"],
+    );
+
+    let sticky = f.ok(
+        "a",
+        "alice",
+        Some(&alice),
+        &[
+            "discuss",
+            "post",
+            "--topic",
+            "alpha-shared",
+            "shared sticky anchor",
+        ],
+    );
+    let sticky_id = subject(&sticky).to_owned();
+    f.ok(
+        "a",
+        "alice",
+        Some(&alice),
+        &["discuss", "sticky", &sticky_id],
+    );
+    let first = f.ok(
+        "a",
+        "alice",
+        Some(&alice),
+        &[
+            "discuss",
+            "post",
+            "--topic",
+            "zulu-shared",
+            "shared older update",
+        ],
+    );
+    let second = f.ok(
+        "a",
+        "alice",
+        Some(&alice),
+        &[
+            "discuss",
+            "post",
+            "--topic",
+            "zulu-shared",
+            "shared newer update",
+        ],
+    );
+
+    let search = f.ok(
+        "b",
+        "bob",
+        None,
+        &["discuss", "search", "shared", "--limit", "1"],
+    );
+    assert_eq!(search["data"]["topics"][0]["topic"], "zulu-shared");
+    assert_eq!(search["data"]["posts"][0]["post_id"], sticky_id);
+
+    let search = f.ok(
+        "b",
+        "bob",
+        None,
+        &["discuss", "search", "shared", "--limit", "2"],
+    );
+    let posts = search["data"]["posts"].as_array().unwrap();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[0]["post_id"], sticky_id);
+    assert_eq!(posts[1]["post_id"], subject(&second));
+    assert_ne!(posts[1]["post_id"], subject(&first));
+    f.no_local_ops();
+}

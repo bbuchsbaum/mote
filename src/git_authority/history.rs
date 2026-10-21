@@ -73,7 +73,7 @@ pub fn validate_chain(
     check_blob(blob)?;
     let manifest: Manifest = decode(&blob.bytes)?;
     manifest.validate()?;
-    if encode(&manifest)? != blob.bytes {
+    if encode(&manifest)?.as_slice() != blob.bytes.as_ref() {
         return invalid("authority manifest is not canonical JSON");
     }
     let mut state = SyntheticState::default();
@@ -148,7 +148,7 @@ pub fn validate_chain(
         check_blob(blob)?;
         let transaction: Transaction = decode(&blob.bytes)?;
         manifest.allows(&transaction.request.command)?;
-        if encode(&transaction)? != blob.bytes {
+        if encode(&transaction)?.as_slice() != blob.bytes.as_ref() {
             return invalid("authority transaction is not canonical JSON");
         }
         if receipts.contains_key(&transaction.request.request_id) {
@@ -178,7 +178,7 @@ pub fn validate_chain(
         files: previous
             .files
             .iter()
-            .map(|(name, blob)| (name.clone(), blob.bytes.clone()))
+            .map(|(name, blob)| (name.clone(), blob.bytes.to_vec()))
             .collect(),
     })
 }

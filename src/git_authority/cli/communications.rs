@@ -693,7 +693,13 @@ fn discussion_read(cli: &Cli, store: &Store, cmd: &DiscussCmd) -> MoteResult<i32
             topic,
             limit,
         } => {
-            let query = query.to_lowercase();
+            let query = query.trim();
+            if query.is_empty() {
+                return Err(MoteError::Invalid(
+                    "discussion search query must be non-empty".into(),
+                ));
+            }
+            let query = query.to_ascii_lowercase();
             let topic = topic
                 .as_deref()
                 .map(normalize_discussion_topic)
@@ -701,20 +707,25 @@ fn discussion_read(cli: &Cli, store: &Store, cmd: &DiscussCmd) -> MoteResult<i32
             let mut posts: Vec<_> = state
                 .board_posts_for(topic.as_deref())
                 .into_iter()
-                .filter(|p| p.body.to_lowercase().contains(&query))
+                .filter(|p| {
+                    p.post_id.to_ascii_lowercase().contains(&query)
+                        || p.topic.to_ascii_lowercase().contains(&query)
+                        || p.from.to_ascii_lowercase().contains(&query)
+                        || p.body.to_ascii_lowercase().contains(&query)
+                })
                 .collect();
             let mut topics: Vec<_> = state
-                .board_topics
-                .values()
+                .board_topics_by_activity()
+                .into_iter()
                 .filter(|t| topic.as_ref().is_none_or(|wanted| &t.topic == wanted))
                 .filter(|t| {
-                    t.topic.to_lowercase().contains(&query)
-                        || t.title.to_lowercase().contains(&query)
-                        || t.body.to_lowercase().contains(&query)
+                    t.topic.to_ascii_lowercase().contains(&query)
+                        || t.title.to_ascii_lowercase().contains(&query)
+                        || t.body.to_ascii_lowercase().contains(&query)
                 })
                 .collect();
             if let Some(limit) = limit {
-                posts.truncate(*limit);
+                posts = crate::cli::limit_board_posts_preserving_stickies(posts, *limit);
                 topics.truncate(*limit);
             }
             json!({"topics":topics.iter().map(|t| crate::cli::topic_json(&state,t)).collect::<Vec<_>>(),"posts":post_values(&state,&posts)})

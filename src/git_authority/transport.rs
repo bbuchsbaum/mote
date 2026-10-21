@@ -32,7 +32,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
 pub struct GitBlob {
     pub mode: String,
     pub oid: String,
-    pub bytes: Vec<u8>,
+    /// Immutable payload shared by every historical tree containing this OID.
+    pub bytes: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,7 +305,7 @@ impl GitTransport {
                 let blob = GitBlob {
                     mode: mode.to_owned(),
                     oid: blob_oid.to_owned(),
-                    bytes,
+                    bytes: bytes.into(),
                 };
                 blobs.insert(blob_oid.to_owned(), blob.clone());
                 blob
@@ -522,10 +523,9 @@ impl GitTransport {
         if !commit.parents.is_empty()
             || commit.files.len() != expected_files.len()
             || expected_files.iter().any(|(path, (oid, bytes))| {
-                commit
-                    .files
-                    .get(path)
-                    .is_none_or(|b| b.mode != "100644" || b.oid != **oid || b.bytes != **bytes)
+                commit.files.get(path).is_none_or(|b| {
+                    b.mode != "100644" || b.oid != **oid || b.bytes.as_ref() != bytes.as_slice()
+                })
             })
             || (manifest.legacy_digest.is_some()) != artifact.legacy_pack.is_some()
         {
@@ -611,13 +611,28 @@ impl GitTransport {
 
     pub fn push(&self, oid: &str) -> MoteResult<PushAttempt> {
         self.validate_oid(oid)?;
+        // A direct URL is not anonymous on Git 2.56: it may be matched back
+        // to a configured remote and update source tracking refs. Use a fresh
+        // command-local named remote with no fetch mapping instead.
+        let remote =
+            self.private_push_remote(|| format!("mote-authority-{}", ulid::Ulid::new()))?;
+        let url = format!("remote.{remote}.url={}", self.endpoint);
+        let push_url = format!("remote.{remote}.pushurl={}", self.endpoint);
         let refspec = format!("{oid}:{}", self.reference);
-        let mut push_args = vec!["push", "--porcelain", "--no-follow-tags"];
+        let mut push_args = vec![
+            "-c",
+            &url,
+            "-c",
+            &push_url,
+            "push",
+            "--porcelain",
+            "--no-follow-tags",
+        ];
         if let Some(receive_pack) = &self.receive_pack {
             push_args.push("--receive-pack");
             push_args.push(receive_pack);
         }
-        push_args.extend([self.remote.as_str(), refspec.as_str()]);
+        push_args.extend([remote.as_str(), refspec.as_str()]);
         match self.run_git("push authority reference", push_args, None, false) {
             Ok(output) => Ok(PushAttempt {
                 success: output.status.success(),
@@ -637,6 +652,29 @@ impl GitTransport {
             }),
             Err(error) => Err(error),
         }
+    }
+
+    fn private_push_remote(&self, mut candidate: impl FnMut() -> String) -> MoteResult<String> {
+        for _ in 0..8 {
+            let name = candidate();
+            let pattern = format!("^remote\\.{}\\.", name);
+            let output = Command::new("git")
+                .current_dir(&self.repo)
+                .args(["config", "--get-regexp", &pattern])
+                .output()?;
+            match output.status.code() {
+                Some(1) => return Ok(name),
+                Some(0) => continue,
+                _ => {
+                    return Err(MoteError::Invalid(
+                        "unable to inspect Git remote configuration".into(),
+                    ));
+                }
+            }
+        }
+        Err(MoteError::Invalid(
+            "unable to allocate a private Git push remote".into(),
+        ))
     }
 
     fn validate_oid(&self, oid: &str) -> MoteResult<()> {
@@ -1041,6 +1079,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_push_remote_skips_effective_configuration_collisions() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(&repo)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (key, value) in [
+            ("remote.origin.url", "unused"),
+            (
+                "remote.mote-authority-collision.fetch",
+                "+refs/heads/*:refs/remotes/collision/*",
+            ),
+        ] {
+            assert!(
+                Command::new("git")
+                    .current_dir(&repo)
+                    .args(["config", key, value])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let transport =
+            GitTransport::open(&repo, "origin", "authority", &root.path().join("scratch")).unwrap();
+        let config = fs::read(repo.join(".git/config")).unwrap();
+        let mut candidates = ["mote-authority-collision", "mote-authority-fresh"].into_iter();
+        assert_eq!(
+            transport
+                .private_push_remote(|| candidates.next().unwrap().into())
+                .unwrap(),
+            "mote-authority-fresh"
+        );
+        assert!(
+            transport
+                .private_push_remote(|| "mote-authority-collision".into())
+                .is_err()
+        );
+        assert_eq!(fs::read(repo.join(".git/config")).unwrap(), config);
+    }
+
+    #[test]
     fn git_reference_transaction_cas_rejections_are_contention() {
         for reason in [
             "incorrect old value provided",
@@ -1162,10 +1247,11 @@ mod tests {
         );
         let transport =
             GitTransport::open(&repo, "origin", "authority", &root.path().join("scratch")).unwrap();
+        let payload = vec![b'x'; 256 * 1024];
         let first = transport
             .create_commit(
                 None,
-                &BTreeMap::from([("manifest.json".into(), b"same".to_vec())]),
+                &BTreeMap::from([("manifest.json".into(), payload.clone())]),
             )
             .unwrap();
         let second = transport
@@ -1183,6 +1269,19 @@ mod tests {
         assert_eq!(memo_first, cold_first);
         assert_eq!(transport.blob_reads.load(Ordering::Relaxed), 2);
         assert_eq!(cold_reads, 3);
+        assert_eq!(memo_first.files["manifest.json"].bytes.as_ref(), payload);
+        assert!(Arc::ptr_eq(
+            &memo_first.files["manifest.json"].bytes,
+            &memo_second.files["manifest.json"].bytes
+        ));
+        assert!(Arc::ptr_eq(
+            &memo_first.files["manifest.json"].bytes,
+            &memo[&memo_first.files["manifest.json"].oid].bytes
+        ));
+        assert!(!Arc::ptr_eq(
+            &cold_first.files["manifest.json"].bytes,
+            &cold_second.files["manifest.json"].bytes
+        ));
     }
 
     #[test]
@@ -1214,7 +1313,7 @@ mod tests {
             assert_eq!(after.files[&path], blob);
         }
         assert_eq!(after.files["transactions/0002.json"].mode, "100644");
-        assert_eq!(after.files["transactions/0002.json"].bytes, b"new");
+        assert_eq!(after.files["transactions/0002.json"].bytes.as_ref(), b"new");
         assert!(
             transport
                 .append_commit(&child, "transactions/0001.json", b"replace")

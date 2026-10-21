@@ -64,7 +64,9 @@ fn linked_worktree_uses_common_objects_and_replacement_refs_do_not_reinterpret_a
         ],
     );
     assert_eq!(
-        transport.commit(&original).unwrap().files["seed"].bytes,
+        transport.commit(&original).unwrap().files["seed"]
+            .bytes
+            .as_ref(),
         b"one"
     );
 }

@@ -30,7 +30,9 @@ fn retained_root_survives_scratch_loss_with_exact_object_identity() {
         GitTransport::open(&repo, "origin", "authority", &root.path().join("scratch-2")).unwrap();
     restored.import_root(&artifact).unwrap();
     assert_eq!(
-        restored.commit(&artifact.commit_oid).unwrap().files["manifest.json"].bytes,
+        restored.commit(&artifact.commit_oid).unwrap().files["manifest.json"]
+            .bytes
+            .as_ref(),
         artifact.manifest_bytes
     );
     let mut changed = artifact.clone();

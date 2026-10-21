@@ -103,6 +103,7 @@ fn creates_reads_and_pushes_a_cumulative_tree_without_touching_source_state() {
         &repo,
         &["config", "remote.origin.receivepack", "git-receive-pack"],
     );
+    let config = fs::read(repo.join(".git/config")).unwrap();
 
     let transport = GitTransport::open(
         &repo,
@@ -126,9 +127,11 @@ fn creates_reads_and_pushes_a_cumulative_tree_without_touching_source_state() {
     assert!(transport.push(&second).unwrap().success);
     let commit = transport.commit(&second).unwrap();
     assert_eq!(commit.parents, vec![first]);
-    assert_eq!(commit.files["manifest.json"].bytes, b"one\0raw");
+    assert_eq!(commit.files["manifest.json"].bytes.as_ref(), b"one\0raw");
     assert_eq!(
-        commit.files["transactions/00000000000000000001.json"].bytes,
+        commit.files["transactions/00000000000000000001.json"]
+            .bytes
+            .as_ref(),
         b"two"
     );
     assert_eq!(
@@ -140,6 +143,11 @@ fn creates_reads_and_pushes_a_cumulative_tree_without_touching_source_state() {
         ),
         (refs, index, fetch_head, status)
     );
+    assert_eq!(fs::read(repo.join(".git/config")).unwrap(), config);
+    drop(transport);
+    fs::remove_dir_all(root.path().join("scratch-a")).unwrap();
+    git(&repo, &["fetch", "origin", "refs/heads/source"]);
+    git(&repo, &["fsck", "--full"]);
 }
 
 #[test]

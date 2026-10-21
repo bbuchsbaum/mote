@@ -10,7 +10,7 @@ fn blob(bytes: Vec<u8>) -> GitBlob {
     GitBlob {
         mode: "100644".into(),
         oid: "b".repeat(40),
-        bytes,
+        bytes: bytes.into(),
     }
 }
 
@@ -91,12 +91,10 @@ fn changed_prefix_merges_unexpected_files_and_nonregular_modes_fail_closed() {
     let mut good = vec![root()];
     append(&mut good, request("one", "task"));
     let mut changed = good.clone();
-    changed[1]
-        .files
-        .get_mut("manifest.json")
-        .unwrap()
-        .bytes
-        .push(b' ');
+    let altered = changed[1].files.get_mut("manifest.json").unwrap();
+    let mut bytes = altered.bytes.to_vec();
+    bytes.push(b' ');
+    altered.bytes = bytes.into();
     assert!(validate_chain(&changed, None, None).is_err());
     let mut merged = good.clone();
     merged[1].parents.push("f".repeat(40));

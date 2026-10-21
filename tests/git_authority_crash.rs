@@ -132,7 +132,8 @@ fn worker(f: &Fixture, phase: &str, barrier: &Path, release: &Path, hook_pid: &P
 if [ \"$MOTE_GA_CRASH_PHASE\" = journal ] && [ -f \"$MOTE_GA_CRASH_CACHE/requests/crash-request.json\" ]; then\n\
   : > \"$MOTE_GA_CRASH_BARRIER\"; while [ ! -f \"$MOTE_GA_CRASH_RELEASE\" ]; do sleep 1; done\n\
 fi\n\
-if [ \"$MOTE_GA_CRASH_PHASE\" = attempt ] && [ \"$1\" = push ] && grep -q 'attempted_commits.*[0-9a-f]' \"$MOTE_GA_CRASH_CACHE/requests/crash-request.json\"; then\n\
+is_push=; for arg do [ \"$arg\" != push ] || is_push=1; done\n\
+if [ \"$MOTE_GA_CRASH_PHASE\" = attempt ] && [ \"$is_push\" = 1 ] && grep -q 'attempted_commits.*[0-9a-f]' \"$MOTE_GA_CRASH_CACHE/requests/crash-request.json\"; then\n\
   : > \"$MOTE_GA_CRASH_BARRIER\"; while [ ! -f \"$MOTE_GA_CRASH_RELEASE\" ]; do sleep 1; done\n\
 fi\n\
 exec /usr/bin/git \"$@\"\n").unwrap();
@@ -221,7 +222,7 @@ fn race_child(
     let wrapper = f.root.join(format!("race-wrapper-{label}"));
     fs::create_dir(&wrapper).unwrap();
     let script = wrapper.join("git");
-    fs::write(&script, "#!/bin/sh\nif [ \"$1\" = push ]; then : > \"$MOTE_GA_RACE_READY\"; while [ ! -f \"$MOTE_GA_RACE_RELEASE\" ]; do sleep 1; done; fi\nexec /usr/bin/git \"$@\"\n").unwrap();
+    fs::write(&script, "#!/bin/sh\nis_push=; for arg do [ \"$arg\" != push ] || is_push=1; done\nif [ \"$is_push\" = 1 ]; then : > \"$MOTE_GA_RACE_READY\"; while [ ! -f \"$MOTE_GA_RACE_RELEASE\" ]; do sleep 1; done; fi\nexec /usr/bin/git \"$@\"\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     Command::new(std::env::current_exe().unwrap())
