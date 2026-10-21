@@ -106,14 +106,16 @@ fn two_independent_clients_have_one_winner_and_agree_on_history() {
             .iter()
             .filter(|s| s.status == SubmissionStatus::Accepted)
             .count(),
-        1
+        1,
+        "outcomes={outcomes:?}"
     );
     assert_eq!(
         outcomes
             .iter()
             .filter(|s| s.status == SubmissionStatus::Rejected)
             .count(),
-        1
+        1,
+        "outcomes={outcomes:?}"
     );
     let a = f.client(&f.a, "client-a").refresh().unwrap();
     let b = f.client(&f.b, "client-b").refresh().unwrap();

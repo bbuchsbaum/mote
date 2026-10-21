@@ -557,7 +557,15 @@ fn cli_announcement_race_retry_and_cache_loss_preserve_one_canonical_receipt() {
     let second = second_result.unwrap();
     let mut codes = [first.status.code().unwrap(), second.status.code().unwrap()];
     codes.sort();
-    assert_eq!(codes, [0, 2]);
+    assert_eq!(
+        codes,
+        [0, 2],
+        "first stdout={} stderr={}\nsecond stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
     let (winner_name, winner, loser) = if first.status.code() == Some(0) {
         (
             "a",
