@@ -883,8 +883,29 @@ impl GitTransport {
 fn classify_push_failure(porcelain: &[u8], diagnostics: &[u8]) -> PushFailure {
     let text = String::from_utf8_lossy(porcelain).to_ascii_lowercase();
     let diagnostic = String::from_utf8_lossy(diagnostics).to_ascii_lowercase();
+    // Git 2.55 reports per-reference transaction failures instead of the
+    // older generic "failed to update ref". Match only its CAS/create
+    // conflicts, in the same porcelain status line; other remote rejections
+    // (including hooks, missing refs and invalid values) stay denied.
+    let reference_contention = text.lines().any(|line| {
+        let mut fields = line.split('\t');
+        fields.next() == Some("!")
+            && fields
+                .next()
+                .and_then(|reference| reference.split_once(':'))
+                .is_some_and(|(source, target)| !source.is_empty() && !target.is_empty())
+            && matches!(
+                fields.next(),
+                Some(
+                    "[remote rejected] (incorrect old value provided)"
+                        | "[remote rejected] (reference already exists)"
+                )
+            )
+            && fields.next().is_none()
+    });
     if (text.contains("[remote rejected]") && text.contains("failed to update ref"))
         || text.contains("[rejected]")
+        || reference_contention
     {
         PushFailure::Contention
     } else if text.contains("[remote rejected]")
@@ -1018,6 +1039,75 @@ fn validate_tree_path(path: &str) -> MoteResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_reference_transaction_cas_rejections_are_contention() {
+        for reason in [
+            "incorrect old value provided",
+            "reference already exists",
+            "failed to update ref",
+        ] {
+            let status = format!(
+                "To /synthetic/authority.git\n!\tHEAD:refs/heads/mote-state\t[remote rejected] ({reason})\nDone\n"
+            );
+            assert_eq!(
+                classify_push_failure(status.as_bytes(), b""),
+                PushFailure::Contention,
+                "{reason}"
+            );
+        }
+        assert_eq!(
+            classify_push_failure(
+                b"!\tHEAD:refs/heads/mote-state\t[rejected] (fetch first)\n",
+                b""
+            ),
+            PushFailure::Contention
+        );
+    }
+
+    #[test]
+    fn non_cas_remote_rejections_and_stderr_phrases_do_not_become_contention() {
+        for reason in [
+            "pre-receive hook declined",
+            "invalid new value provided",
+            "reference does not exist",
+            "refname conflict",
+            "unknown failure",
+        ] {
+            let status = format!("!\tHEAD:refs/heads/mote-state\t[remote rejected] ({reason})\n");
+            assert_eq!(
+                classify_push_failure(status.as_bytes(), b"incorrect old value provided"),
+                PushFailure::Denied,
+                "{reason}"
+            );
+        }
+        assert_eq!(classify_push_failure(b"!\tHEAD:refs/heads/mote-state\t[remote rejected] (hook declined)\nremote: (incorrect old value provided)\n", b""), PushFailure::Denied);
+        assert_eq!(
+            classify_push_failure(b"", b"Permission denied: incorrect old value provided"),
+            PushFailure::Denied
+        );
+        assert_eq!(
+            classify_push_failure(b"", b"Connection reset: reference already exists"),
+            PushFailure::Unavailable
+        );
+        for status in [
+            "remote: [remote rejected] (incorrect old value provided)\n",
+            "!\tHEAD:refs/heads/mote-state\t[remote rejected] (incorrect old value provided extra)\n",
+            "!\tHEAD:refs/heads/mote-state\t[remote rejected] (reference already exists)\textra\n",
+            "!\tHEAD:refs/heads/mote-state\t[remote rejected] (reference already exists)\t\n",
+            "!\t:refs/heads/mote-state\t[remote rejected] (incorrect old value provided)\n",
+        ] {
+            assert_eq!(
+                classify_push_failure(status.as_bytes(), b""),
+                PushFailure::Denied,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            classify_push_failure(b"reference already exists\n", b""),
+            PushFailure::Unknown
+        );
+    }
 
     #[test]
     fn cache_paths_cannot_overlap_scratch_even_through_symlinks() {
