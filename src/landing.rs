@@ -53,6 +53,45 @@ struct Journal {
     detail: Option<String>,
 }
 
+/// Validate a stopped migration source without performing landing recovery.
+pub(crate) fn ensure_migration_quiescent(store: &Store) -> MoteResult<()> {
+    let directory = authority::directory(store);
+    if directory.join("landing-active.json").exists() {
+        return Err(MoteError::Invalid(
+            "landing recovery is required before migration".into(),
+        ));
+    }
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| MoteError::Invalid("invalid authority metadata path".into()))?;
+        if name.starts_with("landing-") {
+            if !entry.file_type()?.is_file() || !name.ends_with(".json") {
+                return Err(MoteError::Invalid("invalid landing archive path".into()));
+            }
+            let journal: Journal = serde_json::from_slice(&fs::read(entry.path())?)?;
+            if !matches!(journal.phase, Phase::Confirmed | Phase::Aborted) {
+                return Err(MoteError::Invalid(
+                    "nonterminal landing archive requires recovery before migration".into(),
+                ));
+            }
+            if entry.path() != archive_path(store, &journal.request) {
+                return Err(MoteError::Invalid(
+                    "landing archive identity differs from filename".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn git(cwd: &Path, args: &[&str]) -> MoteResult<String> {
     let output = Command::new("git").current_dir(cwd).args(args).output()?;
     if !output.status.success() {

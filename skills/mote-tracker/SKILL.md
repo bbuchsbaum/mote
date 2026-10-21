@@ -11,6 +11,12 @@ Use the CLI for all state changes; never hand-edit `.mote/ops/*.json`.
 Run `mote help --all` when exact or newly added command syntax matters. Its JSON
 form, `mote --json help --all`, is the stable discovery surface for automation.
 
+If `mote authority status` identifies a Git authority, read
+[Git authority workflows](references/git-authority.md) before using ownership,
+sessions or recovery. That mode uses canonical remote transactions and explicit
+release, with no TTL expiry or local fallback. The replica/admission guidance
+below applies to ordinary local stores, not to the dedicated authority branch.
+
 ## Core workflow
 
 Start with the scope the request needs:

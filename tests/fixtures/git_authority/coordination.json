@@ -1,0 +1,690 @@
+{
+  "provenance": "Independent contract-derived witnesses from authority_plan_review; two specified setup transitions expanded by parent. No implementation-derived expected values. Null-expectation adapter witness added from independent reviewer finding, before implementation rerun.",
+  "vectors": [
+    {
+      "name": "enrollment",
+      "sequence": 1,
+      "request": {
+        "version": 1,
+        "request_id": "enroll",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "session.start",
+            "label": "laptop"
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-enroll-000000",
+          "sequence": 1,
+          "index": 0,
+          "kind": "ownership",
+          "transition": {
+            "kind": "session_started",
+            "session": "sess-a",
+            "actor": "alice",
+            "token": "eff-enroll-000000",
+            "label": "laptop",
+            "timestamp": "2026-10-20T00:00:00Z"
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "sess-a",
+          "effect_ids": [
+            "eff-enroll-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "task-create",
+      "sequence": 2,
+      "request": {
+        "version": 1,
+        "request_id": "create",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "task.create",
+            "id": "bd-one",
+            "title": "First title",
+            "body": "Initial body",
+            "priority": 2,
+            "assignee": null
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-create-000000",
+          "sequence": 2,
+          "index": 0,
+          "kind": "task_op",
+          "op": {
+            "kind": "create",
+            "v": 1,
+            "op": "gaop-00000000000000000002-000000-eff-create-000000",
+            "ts": "2026-10-20T00:00:00Z",
+            "actor": "alice",
+            "entity": "bd-one",
+            "set": {
+              "title": "First title",
+              "status": "open",
+              "priority": 2,
+              "body": "Initial body"
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "bd-one",
+          "effect_ids": [
+            "eff-create-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "independent-body-edit-setup",
+      "sequence": 3,
+      "request": {
+        "version": 1,
+        "request_id": "edit-body",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "task.patch",
+            "id": "bd-one",
+            "set": {
+              "body": "Body updated"
+            },
+            "expect": {
+              "body": "gaop-00000000000000000002-000000-eff-create-000000"
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-edit-body-000000",
+          "sequence": 3,
+          "index": 0,
+          "kind": "task_op",
+          "op": {
+            "kind": "patch",
+            "v": 1,
+            "op": "gaop-00000000000000000003-000000-eff-edit-body-000000",
+            "ts": "2026-10-20T00:00:00Z",
+            "actor": "alice",
+            "entity": "bd-one",
+            "expect": {
+              "body": "gaop-00000000000000000002-000000-eff-create-000000"
+            },
+            "set": {
+              "body": "Body updated"
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "bd-one",
+          "effect_ids": [
+            "eff-edit-body-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "title-patch-survives-independent-body-edit",
+      "sequence": 4,
+      "request": {
+        "version": 1,
+        "request_id": "edit-title",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "task.patch",
+            "id": "bd-one",
+            "set": {
+              "title": "Second title"
+            },
+            "expect": {
+              "title": "gaop-00000000000000000002-000000-eff-create-000000"
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-edit-title-000000",
+          "sequence": 4,
+          "index": 0,
+          "kind": "task_op",
+          "op": {
+            "kind": "patch",
+            "v": 1,
+            "op": "gaop-00000000000000000004-000000-eff-edit-title-000000",
+            "ts": "2026-10-20T00:00:00Z",
+            "actor": "alice",
+            "entity": "bd-one",
+            "expect": {
+              "title": "gaop-00000000000000000002-000000-eff-create-000000"
+            },
+            "set": {
+              "title": "Second title"
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "bd-one",
+          "effect_ids": [
+            "eff-edit-title-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "second-session-setup",
+      "sequence": 5,
+      "request": {
+        "version": 1,
+        "request_id": "enroll-b",
+        "actor": "alice",
+        "session": "sess-b",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "session.start",
+            "label": "second terminal"
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-enroll-b-000000",
+          "sequence": 5,
+          "index": 0,
+          "kind": "ownership",
+          "transition": {
+            "kind": "session_started",
+            "session": "sess-b",
+            "actor": "alice",
+            "token": "eff-enroll-b-000000",
+            "label": "second terminal",
+            "timestamp": "2026-10-20T00:00:00Z"
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "sess-b",
+          "effect_ids": [
+            "eff-enroll-b-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "claim-acquisition",
+      "sequence": 6,
+      "request": {
+        "version": 1,
+        "request_id": "claim-a",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "claim.acquire",
+            "id": "bd-one"
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-claim-a-000000",
+          "sequence": 6,
+          "index": 0,
+          "kind": "ownership",
+          "transition": {
+            "kind": "claim_acquired",
+            "task": "bd-one",
+            "actor": "alice",
+            "session": "sess-a",
+            "token": "eff-claim-a-000000"
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "bd-one",
+          "effect_ids": [
+            "eff-claim-a-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "same-actor-other-session-cannot-acquire",
+      "sequence": 7,
+      "request": {
+        "version": 1,
+        "request_id": "claim-b",
+        "actor": "alice",
+        "session": "sess-b",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "claim.acquire",
+            "id": "bd-one"
+          }
+        }
+      },
+      "effects": [],
+      "outcome": {
+        "status": "rejected",
+        "result": {
+          "code": "claim_occupied",
+          "subject": "bd-one"
+        }
+      }
+    },
+    {
+      "name": "backwards-presence-does-not-expire-claim",
+      "sequence": 8,
+      "request": {
+        "version": 1,
+        "request_id": "presence",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-19T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "session.presence",
+            "text": "still working"
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-presence-000000",
+          "sequence": 8,
+          "index": 0,
+          "kind": "ownership",
+          "transition": {
+            "kind": "session_presence",
+            "session": "sess-a",
+            "actor": "alice",
+            "text": "still working",
+            "timestamp": "2026-10-19T00:00:00Z"
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "sess-a",
+          "effect_ids": [
+            "eff-presence-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "reservation-acquisition",
+      "sequence": 9,
+      "request": {
+        "version": 1,
+        "request_id": "reserve",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "reservation.acquire",
+            "id": "bd-one",
+            "reservation": "rv-one",
+            "paths": [
+              "src/a.rs"
+            ]
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-reserve-000000",
+          "sequence": 9,
+          "index": 0,
+          "kind": "ownership",
+          "transition": {
+            "kind": "reservation_acquired",
+            "reservation": "rv-one",
+            "task": "bd-one",
+            "actor": "alice",
+            "session": "sess-a",
+            "token": "eff-reserve-000000",
+            "paths": [
+              "src/a.rs"
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "rv-one",
+          "effect_ids": [
+            "eff-reserve-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "overlapping-parent-path-rejected",
+      "sequence": 10,
+      "request": {
+        "version": 1,
+        "request_id": "overlap",
+        "actor": "alice",
+        "session": "sess-b",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "reservation.acquire",
+            "id": "bd-one",
+            "reservation": "rv-two",
+            "paths": [
+              "src"
+            ]
+          }
+        }
+      },
+      "effects": [],
+      "outcome": {
+        "status": "rejected",
+        "result": {
+          "code": "path_conflict",
+          "subject": "rv-one"
+        }
+      }
+    },
+    {
+      "name": "wrong-token-release-rejected",
+      "sequence": 11,
+      "request": {
+        "version": 1,
+        "request_id": "release-wrong",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "reservation.release",
+            "reservation": "rv-one",
+            "token": "eff-wrong-000000"
+          }
+        }
+      },
+      "effects": [],
+      "outcome": {
+        "status": "rejected",
+        "result": {
+          "code": "reservation_mismatch",
+          "subject": "rv-one"
+        }
+      }
+    },
+    {
+      "name": "exact-token-release",
+      "sequence": 12,
+      "request": {
+        "version": 1,
+        "request_id": "release",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "reservation.release",
+            "reservation": "rv-one",
+            "token": "eff-reserve-000000"
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-release-000000",
+          "sequence": 12,
+          "index": 0,
+          "kind": "ownership",
+          "transition": {
+            "kind": "reservation_released",
+            "reservation": "rv-one",
+            "task": "bd-one",
+            "actor": "alice",
+            "session": "sess-a",
+            "token": "eff-reserve-000000"
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "rv-one",
+          "effect_ids": [
+            "eff-release-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "first-assignee-omits-verified-null-in-legacy-adapter",
+      "sequence": 13,
+      "request": {
+        "version": 1,
+        "request_id": "assign",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "task.patch",
+            "id": "bd-one",
+            "set": {
+              "assignee": "bob"
+            },
+            "expect": {
+              "assignee": null
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-assign-000000",
+          "sequence": 13,
+          "index": 0,
+          "kind": "task_op",
+          "op": {
+            "v": 1,
+            "op": "gaop-00000000000000000013-000000-eff-assign-000000",
+            "ts": "2026-10-20T00:00:00Z",
+            "actor": "alice",
+            "kind": "patch",
+            "entity": "bd-one",
+            "set": {
+              "assignee": "bob"
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "bd-one",
+          "effect_ids": [
+            "eff-assign-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "create-mixed",
+      "sequence": 14,
+      "request": {
+        "version": 1,
+        "request_id": "create-mixed",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "task.create",
+            "id": "bd-two",
+            "title": "Other task",
+            "body": "",
+            "priority": 2,
+            "assignee": null
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-create-mixed-000000",
+          "sequence": 14,
+          "index": 0,
+          "kind": "task_op",
+          "op": {
+            "kind": "create",
+            "set": {
+              "title": "Other task",
+              "body": "",
+              "priority": 2,
+              "status": "open"
+            },
+            "v": 1,
+            "op": "gaop-00000000000000000014-000000-eff-create-mixed-000000",
+            "actor": "alice",
+            "ts": "2026-10-20T00:00:00Z",
+            "entity": "bd-two"
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "bd-two",
+          "effect_ids": [
+            "eff-create-mixed-000000"
+          ]
+        }
+      }
+    },
+    {
+      "name": "mixed-null-and-clock",
+      "sequence": 15,
+      "request": {
+        "version": 1,
+        "request_id": "mixed-null-and-clock",
+        "actor": "alice",
+        "session": "sess-a",
+        "timestamp": "2026-10-20T00:00:00Z",
+        "command": {
+          "kind": "coordination",
+          "action": {
+            "kind": "task.patch",
+            "id": "bd-two",
+            "set": {
+              "assignee": "charlie",
+              "title": "Mixed title"
+            },
+            "expect": {
+              "assignee": null,
+              "title": "gaop-00000000000000000014-000000-eff-create-mixed-000000"
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-mixed-null-and-clock-000000",
+          "sequence": 15,
+          "index": 0,
+          "kind": "task_op",
+          "op": {
+            "kind": "patch",
+            "set": {
+              "assignee": "charlie",
+              "title": "Mixed title"
+            },
+            "expect": {
+              "title": "gaop-00000000000000000014-000000-eff-create-mixed-000000"
+            },
+            "v": 1,
+            "op": "gaop-00000000000000000015-000000-eff-mixed-null-and-clock-000000",
+            "actor": "alice",
+            "ts": "2026-10-20T00:00:00Z",
+            "entity": "bd-two"
+          }
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "code": "ok",
+          "subject": "bd-two",
+          "effect_ids": [
+            "eff-mixed-null-and-clock-000000"
+          ]
+        }
+      }
+    }
+  ]
+}

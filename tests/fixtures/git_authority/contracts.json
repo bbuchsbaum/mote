@@ -1,0 +1,420 @@
+{
+  "schema": "mote.git-authority.contract-fixtures.v1",
+  "valid_manifests": [
+    {
+      "schema": "mote.git-authority.v1",
+      "store_id": "st-example",
+      "generation": 1,
+      "ownership": "explicit-release-v1",
+      "capabilities": [
+        "canonical-transactions-v1",
+        "explicit-release-v1",
+        "synthetic-cas-v1"
+      ],
+      "legacy_digest": null
+    }
+  ],
+  "invalid_manifest_mutations": [
+    {
+      "field": "schema",
+      "value": "mote.git-authority.v99",
+      "reason": "unsupported version"
+    },
+    {
+      "field": "generation",
+      "value": 0,
+      "reason": "generation must be positive"
+    },
+    {
+      "field": "store_id",
+      "value": "../other",
+      "reason": "invalid store ID"
+    },
+    {
+      "field": "ownership",
+      "value": "client-clock-ttl",
+      "reason": "unsupported ownership policy"
+    },
+    {
+      "field": "capabilities",
+      "value": [
+        "unknown"
+      ],
+      "reason": "unknown required capability"
+    },
+    {
+      "field": "capabilities",
+      "value": [
+        "explicit-release-v1",
+        "canonical-transactions-v1"
+      ],
+      "reason": "noncanonical capability order"
+    },
+    {
+      "field": "legacy_digest",
+      "value": "short",
+      "reason": "invalid legacy digest"
+    },
+    {
+      "field": "unexpected",
+      "value": true,
+      "reason": "unknown field"
+    },
+    {
+      "field": "legacy_digest",
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "reason": "migrated roots not supported by the initial engine"
+    }
+  ],
+  "valid_requests": [
+    {
+      "version": 1,
+      "request_id": "req-example",
+      "actor": "alice",
+      "session": "sess-example",
+      "timestamp": "2026-10-20T14:00:00Z",
+      "command": {
+        "kind": "synthetic.cas",
+        "changes": [
+          {
+            "key": "task-1",
+            "expected": null,
+            "value": "alice"
+          }
+        ]
+      }
+    }
+  ],
+  "invalid_request_mutations": [
+    {
+      "field": "version",
+      "value": 99,
+      "reason": "unsupported request version"
+    },
+    {
+      "field": "request_id",
+      "value": "../escape",
+      "reason": "invalid request ID"
+    },
+    {
+      "field": "actor",
+      "value": "",
+      "reason": "empty actor"
+    },
+    {
+      "field": "timestamp",
+      "value": "tomorrow",
+      "reason": "invalid timestamp"
+    },
+    {
+      "field": "unexpected",
+      "value": true,
+      "reason": "unknown field"
+    },
+    {
+      "field": "session",
+      "value": "",
+      "reason": "empty session"
+    }
+  ],
+  "scenarios": [
+    "two-bootstrap-proposals-one-root",
+    "copied-store-id-on-unrelated-endpoint-refused",
+    "same-parent-conflicting-claims-one-winner",
+    "cross-issue-path-overlap-one-winner",
+    "same-actor-different-session-refused",
+    "compound-effect-failure-publishes-zero-effects",
+    "same-request-same-payload-recovers-original-result",
+    "same-request-changed-payload-refused",
+    "rejected-receipt-is-durable-and-reproducible",
+    "false-rejection-and-omitted-effect-refused",
+    "explicit-field-clock-not-refreshed-on-retry",
+    "lost-response-remains-unconfirmed-until-receipt",
+    "delayed-push-can-commit-after-client-timeout",
+    "fresh-client-recovers-retained-request-id",
+    "clock-jump-and-suspension-do-not-expire-holdings",
+    "concurrent-recovery-one-token-winner",
+    "old-holder-refused-after-recovery",
+    "session-end-isolated-from-other-same-actor-session",
+    "legacy-expired-claim-takeover-decision-preserved",
+    "legacy-unknown-op-rejection-not-reinterpreted",
+    "new-timeout-only-takeover-refused",
+    "all-unported-writers-refuse-connected-store",
+    "missing-branch-does-not-rebootstrap",
+    "source-head-index-dirt-refs-fetch-head-preserved"
+  ],
+  "vectors": [
+    {
+      "name": "accepted",
+      "sequence": 1,
+      "parent_state": {},
+      "request": {
+        "version": 1,
+        "request_id": "req-example",
+        "actor": "alice",
+        "session": "sess-example",
+        "timestamp": "2026-10-20T14:00:00Z",
+        "command": {
+          "kind": "synthetic.cas",
+          "changes": [
+            {
+              "key": "task-1",
+              "expected": null,
+              "value": "alice"
+            }
+          ]
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-req-example-000000",
+          "sequence": 1,
+          "index": 0,
+          "kind": "synthetic_set",
+          "key": "task-1",
+          "value": "alice"
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "changes": [
+            {
+              "key": "task-1",
+              "token": "eff-req-example-000000"
+            }
+          ]
+        }
+      },
+      "result_state": {
+        "task-1": {
+          "value": "alice",
+          "token": "eff-req-example-000000"
+        }
+      }
+    },
+    {
+      "name": "rejected",
+      "sequence": 2,
+      "parent_state": {
+        "task-1": {
+          "value": "alice",
+          "token": "eff-req-example-000000"
+        }
+      },
+      "request": {
+        "version": 1,
+        "request_id": "req-bob",
+        "actor": "bob",
+        "session": "sess-bob",
+        "timestamp": "2026-10-20T14:00:00Z",
+        "command": {
+          "kind": "synthetic.cas",
+          "changes": [
+            {
+              "key": "task-1",
+              "expected": null,
+              "value": "bob"
+            }
+          ]
+        }
+      },
+      "effects": [],
+      "outcome": {
+        "status": "rejected",
+        "result": {
+          "code": "compare_failed",
+          "index": 0,
+          "key": "task-1",
+          "expected": null,
+          "actual": "eff-req-example-000000"
+        }
+      },
+      "result_state": {
+        "task-1": {
+          "value": "alice",
+          "token": "eff-req-example-000000"
+        }
+      }
+    },
+    {
+      "name": "compound-failure",
+      "sequence": 2,
+      "parent_state": {
+        "task-1": {
+          "value": "alice",
+          "token": "eff-req-example-000000"
+        }
+      },
+      "request": {
+        "version": 1,
+        "request_id": "req-batch",
+        "actor": "alice",
+        "session": "sess-alice",
+        "timestamp": "2026-10-20T14:00:00Z",
+        "command": {
+          "kind": "synthetic.cas",
+          "changes": [
+            {
+              "key": "free-key",
+              "expected": null,
+              "value": "must-not-leak"
+            },
+            {
+              "key": "task-1",
+              "expected": null,
+              "value": "bob"
+            }
+          ]
+        }
+      },
+      "effects": [],
+      "outcome": {
+        "status": "rejected",
+        "result": {
+          "code": "compare_failed",
+          "index": 1,
+          "key": "task-1",
+          "expected": null,
+          "actual": "eff-req-example-000000"
+        }
+      },
+      "result_state": {
+        "task-1": {
+          "value": "alice",
+          "token": "eff-req-example-000000"
+        }
+      }
+    },
+    {
+      "name": "delete",
+      "sequence": 2,
+      "parent_state": {
+        "task-1": {
+          "value": "alice",
+          "token": "eff-req-example-000000"
+        }
+      },
+      "request": {
+        "version": 1,
+        "request_id": "req-delete",
+        "actor": "alice",
+        "session": "sess-alice",
+        "timestamp": "2026-10-20T14:00:00Z",
+        "command": {
+          "kind": "synthetic.cas",
+          "changes": [
+            {
+              "key": "task-1",
+              "expected": "eff-req-example-000000",
+              "value": null
+            }
+          ]
+        }
+      },
+      "effects": [
+        {
+          "effect_id": "eff-req-delete-000000",
+          "sequence": 2,
+          "index": 0,
+          "kind": "synthetic_set",
+          "key": "task-1",
+          "value": null
+        }
+      ],
+      "outcome": {
+        "status": "accepted",
+        "result": {
+          "changes": [
+            {
+              "key": "task-1",
+              "token": null
+            }
+          ]
+        }
+      },
+      "result_state": {}
+    }
+  ],
+  "duplicate_vectors": [
+    {
+      "first": "accepted",
+      "repeat": "same request bytes",
+      "expected": "original accepted receipt; no append"
+    },
+    {
+      "first": "accepted",
+      "mutation": {
+        "command.changes.0.value": "bob"
+      },
+      "expected": "request_id_mismatch; no append"
+    },
+    {
+      "first": "rejected",
+      "repeat": "same request bytes",
+      "expected": "original rejected receipt; no append"
+    }
+  ],
+  "position_vectors": [
+    {
+      "sequence": 1,
+      "index": 0,
+      "request_id": "z",
+      "timestamp": "2030-01-01T00:00:00Z",
+      "effect_id": "eff-z-000000",
+      "adapter_id": "gaop-00000000000000000001-000000-eff-z-000000"
+    },
+    {
+      "sequence": 2,
+      "index": 0,
+      "request_id": "a",
+      "timestamp": "2000-01-01T00:00:00Z",
+      "effect_id": "eff-a-000000",
+      "adapter_id": "gaop-00000000000000000002-000000-eff-a-000000"
+    }
+  ],
+  "complete_transaction": {
+    "schema": "mote.git-transaction.v1",
+    "sequence": 1,
+    "parent": "1111111111111111111111111111111111111111",
+    "request": {
+      "version": 1,
+      "request_id": "req-example",
+      "actor": "alice",
+      "session": "sess-example",
+      "timestamp": "2026-10-20T14:00:00Z",
+      "command": {
+        "kind": "synthetic.cas",
+        "changes": [
+          {
+            "key": "task-1",
+            "expected": null,
+            "value": "alice"
+          }
+        ]
+      }
+    },
+    "request_digest": "103dc087ee7bdfdc6c19f6694651157efec9f6a9ae9eb3beaf1a27df5f335cc9",
+    "effects": [
+      {
+        "effect_id": "eff-req-example-000000",
+        "sequence": 1,
+        "index": 0,
+        "kind": "synthetic_set",
+        "key": "task-1",
+        "value": "alice"
+      }
+    ],
+    "outcome": {
+      "status": "accepted",
+      "result": {
+        "changes": [
+          {
+            "key": "task-1",
+            "token": "eff-req-example-000000"
+          }
+        ]
+      }
+    }
+  }
+}

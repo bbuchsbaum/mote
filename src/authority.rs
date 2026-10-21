@@ -403,6 +403,15 @@ impl<'a> Writer<'a> {
         admitting: bool,
         discard_foreign: bool,
     ) -> MoteResult<(Self, bool)> {
+        store.require_local_authority()?;
+        Self::acquire_after_mode_check(store, admitting, discard_foreign)
+    }
+
+    fn acquire_after_mode_check(
+        store: &'a Store,
+        admitting: bool,
+        discard_foreign: bool,
+    ) -> MoteResult<(Self, bool)> {
         // Neither per-replica directory is replicated: a fresh Git clone of a
         // versioned store has `ops/` but no `local/` or `tmp/`.
         fs::create_dir_all(store.local_dir())?;
@@ -414,6 +423,9 @@ impl<'a> Writer<'a> {
             .write(true)
             .open(store.local_dir().join("publication.lock"))?;
         file.lock_exclusive()?;
+        // A mode transition holds this same lock. A writer that waited for it
+        // must not use the mode it observed before waiting.
+        store.require_local_authority()?;
         let writer = Self { store, _lock: file };
         let discarded = discard_foreign && writer.discard_foreign_format()?;
         if enabled(store) {
@@ -742,9 +754,51 @@ pub(crate) fn checkpoint(name: &str) -> MoteResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_git_setup_is_rechecked_inside_the_publication_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::repo::Store::init(root.path()).unwrap();
+        store.require_local_authority().unwrap();
+        std::fs::write(store.local_dir().join("git-setup.json"), b"prepared").unwrap();
+        // Enter after the outer mode check, as a writer that waited for a
+        // concurrent setup lock would. The under-lock check must still refuse.
+        let result = super::Writer::acquire_after_mode_check(&store, false, false);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(store.ops_dir()).unwrap().count(), 0);
+    }
+
     use super::*;
     use crate::op::{ScalarSet, make_create, make_note};
     use jiff::Timestamp;
+
+    #[test]
+    fn mode_transition_fences_a_writer_that_passed_its_first_check() {
+        let root = tempfile::TempDir::new().unwrap();
+        let store = Store::init(root.path()).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(store.local_dir().join("publication.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        let other = store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            other.require_local_authority().unwrap();
+            tx.send(()).unwrap();
+            Writer::acquire_after_mode_check(&other, false, false).is_err()
+        });
+        rx.recv().unwrap();
+        // The transition is protected by the publication lock, exactly as a
+        // future migration must install its incompatible mode marker.
+        fs::write(store.root().join("remote.json"), b"{}").unwrap();
+        drop(lock);
+        assert!(writer.join().unwrap());
+        assert_eq!(fs::read_dir(store.ops_dir()).unwrap().count(), 0);
+        assert!(!directory(&store).exists());
+    }
 
     fn fixture() -> (tempfile::TempDir, Store, String) {
         let root = tempfile::TempDir::new().unwrap();

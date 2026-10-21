@@ -107,7 +107,7 @@ impl EventFilter {
         self
     }
 
-    fn matches(&self, op: &Op, state: &State) -> bool {
+    pub(crate) fn matches(&self, op: &Op, state: &State) -> bool {
         let category = event_category(op);
         if !self.categories.is_empty() && !self.categories.contains(category) {
             return false;
@@ -117,7 +117,7 @@ impl EventFilter {
             .is_none_or(|actor| op_relates_to_actor(op, state, actor))
     }
 
-    fn matches_projection(&self, category: &str, actor: &str) -> bool {
+    pub(crate) fn matches_projection(&self, category: &str, actor: &str) -> bool {
         (self.categories.is_empty() || self.categories.contains(category))
             && self.actor.as_deref().is_none_or(|wanted| wanted == actor)
     }
@@ -1163,7 +1163,7 @@ pub fn write_inbox_event(event: &EventEnvelope, json_mode: bool) -> MoteResult<(
     Ok(())
 }
 
-fn event_from_op(store_id: &str, op: Op) -> MoteResult<EventEnvelope> {
+pub(crate) fn event_from_op(store_id: &str, op: Op) -> MoteResult<EventEnvelope> {
     let event_id = op.op_id().to_string();
     let event_type = event_type(&op).to_string();
     let category = event_category(&op).to_string();

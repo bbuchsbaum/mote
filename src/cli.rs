@@ -72,13 +72,17 @@ impl TextInput {
     }
 }
 
-fn resolve_optional_text(value: Option<String>) -> MoteResult<Option<String>> {
+pub(crate) fn resolve_optional_text(value: Option<String>) -> MoteResult<Option<String>> {
     value
         .map(|value| TextInput::option(value).read())
         .transpose()
 }
 
-fn resolve_positional_text(value: Option<String>, stdin: bool, what: &str) -> MoteResult<String> {
+pub(crate) fn resolve_positional_text(
+    value: Option<String>,
+    stdin: bool,
+    what: &str,
+) -> MoteResult<String> {
     TextInput::positional(value, stdin, what)?.read()
 }
 
@@ -385,7 +389,7 @@ pub enum Command {
         /// Message kind (note | request | handoff | blocked | fyi)
         #[arg(long = "kind", default_value = "note")]
         msg_kind: String,
-        /// Sender-scoped retry key; an identical retry returns the first msg-id
+        /// Sender-scoped key; Git authority retries use `authority retry <request-id>`
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Reject unless the recipient has a valid session lease at send time
@@ -494,7 +498,7 @@ pub enum Command {
         paths: Vec<String>,
     },
 
-    /// Compound: optional reserve_open + claim + status=doing + optional progress note. Compensates on partial failure.
+    /// Claim/start with optional paths and note. Git authority commits supported effects atomically; local mode compensates on failure.
     Begin {
         id: String,
         /// Paths to reserve; omit to claim and start the bead without a reservation
@@ -505,7 +509,7 @@ pub enum Command {
         note: Option<String>,
         #[arg(long, value_parser = parse_duration_seconds)]
         ttl: Option<u32>,
-        /// Also post a one-line claim to this discussion topic
+        /// Also post a one-line claim; atomic on an announcement-capable Git authority
         #[arg(long)]
         announce: Option<String>,
     },
@@ -932,8 +936,8 @@ pub enum SessionCmd {
         #[arg(long = "as")]
         as_actor: Option<String>,
         /// Lease duration in seconds
-        #[arg(long, default_value = "4h", value_parser = parse_duration_seconds)]
-        ttl: u32,
+        #[arg(long, value_parser = parse_duration_seconds)]
+        ttl: Option<u32>,
         /// Free-text description of what this session is doing
         #[arg(long)]
         label: Option<String>,
@@ -1111,6 +1115,8 @@ pub enum ActorCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthorityCmd {
+    /// Report this executable's Git profiles and evidence without opening a store.
+    Capabilities,
     /// Validate and print the authority contract without modifying the store
     Status,
     /// Acquire the shared writer lock and activate authority if needed
@@ -1122,6 +1128,75 @@ pub enum AuthorityCmd {
         /// genesis (for example one committed elsewhere and pulled through Git)
         #[arg(long)]
         discard_foreign_format: bool,
+    },
+    /// Bootstrap an empty local store on a dedicated Git authority branch.
+    InitGit {
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long, default_value = "mote-state")]
+        branch: String,
+    },
+    /// Migrate one stopped local history with a verified private full backup.
+    MigrateGit {
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long, default_value = "mote-state")]
+        branch: String,
+        /// New private directory outside this project's tree.
+        #[arg(long)]
+        backup: PathBuf,
+        #[arg(long)]
+        cleanup_start: Option<u64>,
+    },
+    /// Retire an unused migrated authority and restore its stopped backup into a new local store.
+    RollbackGit {
+        /// New .mote directory beneath an existing parent outside this project.
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Connect this empty local store to an existing Git authority branch.
+    Connect {
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long, default_value = "mote-state")]
+        branch: String,
+    },
+    /// Resume a durable interrupted Git authority setup.
+    Resume {
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long, default_value = "mote-state")]
+        branch: String,
+    },
+    /// Read and validate the current remote authority state.
+    Refresh,
+    /// Show the explicitly stale, cache-only authority view.
+    Cached,
+    /// Retry a durably retained canonical request.
+    Retry { request_id: String },
+    /// Look up a request receipt after a fresh remote validation.
+    Receipt { request_id: String },
+    /// Identify the exact retained development binary's legacy replay profile.
+    LegacyProfile,
+    /// Export a stopped local history without modifying or activating it.
+    ExportLegacy {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        cleanup_start: Option<u64>,
+    },
+    /// Explicitly recover an abandoned remote session using its observed token.
+    RecoverSession {
+        source_session: String,
+        #[arg(long)]
+        expect_session: String,
+        #[arg(long)]
+        reason: String,
+        /// Transfer holdings to this active session instead of releasing them.
+        #[arg(long)]
+        to_session: Option<String>,
     },
 }
 
@@ -1190,7 +1265,7 @@ pub enum MsgCmd {
         /// Message kind (note | request | handoff | blocked | fyi)
         #[arg(long = "kind", default_value = "note")]
         msg_kind: String,
-        /// Sender-scoped retry key; an identical retry returns the first msg-id
+        /// Sender-scoped key; Git authority retries use `authority retry <request-id>`
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Reject unless the recipient has a valid session lease at send time
@@ -1213,7 +1288,7 @@ pub enum MsgCmd {
         /// Reply kind (response | decline)
         #[arg(long = "kind", default_value = "response")]
         msg_kind: String,
-        /// Sender-scoped retry key; an identical retry returns the first msg-id
+        /// Sender-scoped key; Git authority retries use `authority retry <request-id>`
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Body text (positional)
@@ -1268,7 +1343,7 @@ pub enum DiscussCmd {
         /// Explicit notification recipient; repeatable
         #[arg(long = "notify")]
         notify: Vec<String>,
-        /// Author-scoped retry key for identical post content and routing
+        /// Author-scoped key; Git authority retries use `authority retry <request-id>`
         #[arg(long)]
         idempotency_key: Option<String>,
         /// Body text; pass - to read literal UTF-8 from stdin
@@ -1720,6 +1795,9 @@ fn warn_stale_requests_for_stateful_invocation(cli: &Cli) -> MoteResult<()> {
 }
 
 pub fn run(cli: Cli) -> MoteResult<i32> {
+    if let Some(code) = crate::git_authority::cli::run_if_remote(&cli)? {
+        return Ok(code);
+    }
     guard_concurrent_local_identity(&cli)?;
     warn_stale_requests_for_stateful_invocation(&cli)?;
     // Activation is per replica; detect it here so every activating command
@@ -4256,6 +4334,23 @@ fn cmd_authority(store_flag: Option<&Path>, cmd: AuthorityCmd) -> MoteResult<i32
             value["foreign_format_binding_discarded"] = serde_json::Value::Bool(discarded);
             println!("{}", serde_json::to_string(&value)?);
             return Ok(0);
+        }
+        AuthorityCmd::InitGit { .. }
+        | AuthorityCmd::MigrateGit { .. }
+        | AuthorityCmd::RollbackGit { .. }
+        | AuthorityCmd::Connect { .. }
+        | AuthorityCmd::Resume { .. }
+        | AuthorityCmd::Refresh
+        | AuthorityCmd::Cached
+        | AuthorityCmd::Retry { .. }
+        | AuthorityCmd::Receipt { .. }
+        | AuthorityCmd::RecoverSession { .. }
+        | AuthorityCmd::Capabilities
+        | AuthorityCmd::LegacyProfile
+        | AuthorityCmd::ExportLegacy { .. } => {
+            return Err(MoteError::Invalid(
+                "Git authority commands must be handled by the Git authority adapter".into(),
+            ));
         }
     };
     let mut value = serde_json::to_value(status)?;
@@ -7850,7 +7945,11 @@ fn print_discussion_publish_result(
     Ok(())
 }
 
-fn require_post_text(text: Option<String>, body: Option<String>, what: &str) -> MoteResult<String> {
+pub(crate) fn require_post_text(
+    text: Option<String>,
+    body: Option<String>,
+    what: &str,
+) -> MoteResult<String> {
     let input = match (text, body) {
         (Some(_), Some(_)) => {
             return Err(MoteError::Invalid(format!(
@@ -7951,7 +8050,10 @@ fn parse_discussion_reference(raw: &str) -> MoteResult<crate::op::DiscussionRefe
     }
 }
 
-fn resolve_decision_body(text: Option<String>, body: Option<String>) -> MoteResult<String> {
+pub(crate) fn resolve_decision_body(
+    text: Option<String>,
+    body: Option<String>,
+) -> MoteResult<String> {
     let value = match (text, body) {
         (Some(_), Some(_)) => {
             return Err(MoteError::Invalid(
@@ -8880,7 +8982,7 @@ fn cmd_discuss_promote(
 }
 
 /// First non-empty line of a post body, truncated to a usable bead title.
-fn first_line_title(body: &str) -> String {
+pub(crate) fn first_line_title(body: &str) -> String {
     let line = body
         .lines()
         .map(str::trim)
@@ -10367,7 +10469,7 @@ fn cmd_who_has(store_flag: Option<&Path>, json_mode: bool, path: String) -> Mote
 /// Wrap a value in single quotes for safe `eval` in a POSIX shell. The actor
 /// name can come from `.mote/local/actor`, which travels with a checkout, so
 /// this output is not trusted input even though it is normally self-authored.
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
@@ -11260,6 +11362,7 @@ fn cmd_session(
                 Some(name) => normalize_actor(name)?,
                 None => normalize_actor(&store.resolve_actor(actor_flag)?)?,
             };
+            let ttl = ttl.unwrap_or(4 * 60 * 60);
             if ttl == 0 {
                 return Err(MoteError::Invalid("--ttl must be > 0".into()));
             }
@@ -12890,7 +12993,7 @@ pub fn unresolved_actor_hint(override_path: Option<&Path>) -> Option<String> {
     ))
 }
 
-fn open_store(override_path: Option<&Path>) -> MoteResult<Store> {
+pub(crate) fn open_store(override_path: Option<&Path>) -> MoteResult<Store> {
     let env_path = std::env::var_os("MOTE_STORE")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);

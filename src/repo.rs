@@ -242,6 +242,21 @@ impl Store {
         Ok(serde_json::from_slice(&data)?)
     }
 
+    /// A remote-mode marker is deliberately incompatible with local writers.
+    /// All local publication and replay entry points consult this boundary.
+    pub fn require_local_authority(&self) -> MoteResult<()> {
+        if self.read_format()?.schema_version != 1
+            || self.root.join("remote.json").exists()
+            || self.local_dir().join("git-setup.json").exists()
+            || self.local_dir().join("git-rollback.json").exists()
+        {
+            return Err(MoteError::Invalid(
+                "Git-authority, pending Git setup, or unsupported store: local publication/replay is refused; finish setup or use the remote client".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolve actor identity per spec, in order:
     ///   1. `flag` (the value passed via `--actor`), if non-empty
     ///   2. `MOTE_ACTOR` environment variable, if non-empty
@@ -273,6 +288,7 @@ impl Store {
     /// List admitted op filenames in replay order (legacy filename order or
     /// the durable shared-store admission order once authority is enabled).
     pub fn list_op_filenames(&self) -> MoteResult<Vec<String>> {
+        self.require_local_authority()?;
         crate::authority::ordered_names(self, raw_op_filenames(self)?)
     }
 }
